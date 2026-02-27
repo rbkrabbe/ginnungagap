@@ -176,3 +176,68 @@ fn now_ns() -> i64 {
         .unwrap_or_default()
         .as_nanos() as i64
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+    use super::*;
+
+    #[tokio::test]
+    async fn test_stub_raft_node() {
+        let node = StubRaftNode::new();
+        assert_eq!(node.shard_id(), 0);
+
+        // Test Put
+        let resp = node.propose(KvCommand::Put { key: "foo".into(), value: "bar".into(), ttl_ns: None, expect_version: 0 }, WriteMode::Majority).await.unwrap();
+        assert!(matches!(resp, KvResponse::Written { version: 1 }));
+
+        // Test Read
+        let entry = node.read("foo", 0, ReadMode::Linearizable).await.unwrap().unwrap();
+        assert_eq!(entry.key, "foo");
+        assert_eq!(entry.value, vec![b'b', b'a', b'r']);
+        assert_eq!(entry.version, 1);
+
+        // Test Cas success
+        let cas_resp = node.propose(KvCommand::Cas { key: "foo".into(), expected: "bar".into(), new_value: "baz".into(), ttl_ns: None }, WriteMode::Majority).await.unwrap();
+        assert!(matches!(cas_resp, KvResponse::CasResult { success: true, .. }));
+
+        // Test Cas failure
+        let cas_fail_resp = node.propose(KvCommand::Cas { key: "foo".into(), expected: "bar".into(), new_value: "qux".into(), ttl_ns: None }, WriteMode::Majority).await.unwrap();
+        assert!(matches!(cas_fail_resp, KvResponse::CasResult { success: false, .. }));
+
+        // Test Delete
+        let del_resp = node.propose(KvCommand::Delete { key: "foo".into() }, WriteMode::Majority).await.unwrap();
+        assert!(matches!(del_resp, KvResponse::Deleted { found: true }));
+
+        // Test Read after Delete
+        let read_after_del = node.read("foo", 0, ReadMode::Linearizable).await.unwrap();
+        assert!(read_after_del.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stub_raft_node_parallel_propose() {
+        let node = Arc::new(StubRaftNode::new());
+        assert_eq!(node.shard_id(), 0);
+
+        let (send, mut recv) = mpsc::unbounded_channel();
+        for _n in 1..1001 {
+            let send_clone = send.clone();
+            let node_clone = node.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(rand::random::<u64>() % 100)).await;
+                let resp = node_clone.propose(KvCommand::Put { key: "foo".into(), value: "bar".into(), ttl_ns: None, expect_version: 0 }, WriteMode::Majority).await.unwrap();
+                let _ = send_clone.send(resp);
+            });
+        }
+
+        drop(send);
+        let mut versions = Vec::new();
+        while let Some(answer) = recv.recv().await {
+            if let KvResponse::Written { version } = answer {
+                versions.push(version);
+            }
+        }
+        versions.sort_unstable();
+        assert_eq!(versions, (1..1001).collect::<Vec<u64>>());
+    }
+}
