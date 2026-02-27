@@ -20,7 +20,7 @@ prost = "0.13"
 openraft = { version = "0.9", features = ["serde"] }
 fjall = "3"
 serde = { version = "1", features = ["derive"] }
-bincode = "2"
+bincode = { version = "2", features = ["serde"] }
 thiserror = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
