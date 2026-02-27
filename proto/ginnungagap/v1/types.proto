@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package ginnungagap.v1;
+
+message KeyValue {
+  string key = 1;
+  bytes value = 2;
+  uint64 version = 3;
+  int64 created_at_ns = 4;
+  int64 modified_at_ns = 5;
+  int64 expires_at_ns = 6;
+}
+
+message NodeInfo {
+  uint64 node_id = 1;
+  string client_addr = 2;
+  string cluster_addr = 3;
+}
+
+message ResponseHeader {
+  uint64 cluster_id = 1;
+  uint64 node_id = 2;
+  uint64 raft_index = 3;
+  uint64 raft_term = 4;
+}
+
+enum ReadConsistency {
+  LINEARIZABLE = 0;
+  SEQUENTIAL = 1;
+  EVENTUAL = 2;
+}
+
+enum WriteQuorum {
+  MAJORITY = 0;
+  ALL = 1;
+}

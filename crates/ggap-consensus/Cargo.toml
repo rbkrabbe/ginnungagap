@@ -1,0 +1,16 @@
+[package]
+name = "ggap-consensus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ggap-types = { path = "../ggap-types" }
+ggap-storage = { path = "../ggap-storage" }
+ggap-proto = { path = "../ggap-proto" }
+openraft = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+tonic = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ggap-proto",
+    "crates/ggap-types",
+    "crates/ggap-storage",
+    "crates/ggap-consensus",
+    "crates/ggap-server",
+    "crates/ggap-node",
+]
+
+[workspace.dependencies]
+tokio        = { version = "1", features = ["full"] }
+async-trait  = "0.1"
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["tls", "transport"] }
+tonic-build = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+openraft = { version = "0.9", features = ["serde"] }
+fjall = "3"
+serde = { version = "1", features = ["derive"] }
+bincode = "2"
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tower = "0.4"
+bytes = "1"
+dashmap = "5"
+tokio-util = { version = "0.7", features = ["time"] }
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+uuid = { version = "1", features = ["v4"] }

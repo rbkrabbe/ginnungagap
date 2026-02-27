@@ -1,0 +1,17 @@
+[package]
+name = "ggap-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ggap-types     = { path = "../ggap-types" }
+ggap-consensus = { path = "../ggap-consensus" }
+ggap-proto     = { path = "../ggap-proto" }
+tonic             = { workspace = true }
+tonic-reflection  = { workspace = true }
+tokio          = { workspace = true }
+tokio-stream   = { workspace = true }
+tower          = { workspace = true }
+async-trait    = { workspace = true }
+tracing        = { workspace = true }
+anyhow         = { workspace = true }

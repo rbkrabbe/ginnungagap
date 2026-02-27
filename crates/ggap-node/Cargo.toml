@@ -1,0 +1,22 @@
+[package]
+name = "ggap-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ggap-node"
+path = "src/main.rs"
+
+[dependencies]
+ggap-types = { path = "../ggap-types" }
+ggap-storage = { path = "../ggap-storage" }
+ggap-consensus = { path = "../ggap-consensus" }
+ggap-server = { path = "../ggap-server" }
+clap = { workspace = true }
+figment = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }

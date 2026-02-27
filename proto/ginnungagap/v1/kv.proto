@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package ginnungagap.v1;
+
+import "ginnungagap/v1/types.proto";
+
+service KvService {
+  rpc Get            (GetRequest)          returns (GetResponse);
+  rpc Put            (PutRequest)          returns (PutResponse);
+  rpc Delete         (DeleteRequest)       returns (DeleteResponse);
+  rpc Scan           (ScanRequest)         returns (ScanResponse);
+  rpc Watch          (stream WatchRequest) returns (stream WatchEvent);
+  rpc CompareAndSwap (CasRequest)          returns (CasResponse);
+}
+
+message GetRequest {
+  string key = 1;
+  uint64 at_version = 2;
+  ReadConsistency consistency = 3;
+}
+
+message GetResponse {
+  ResponseHeader header = 1;
+  KeyValue kv = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  uint64 expect_version = 3;
+  uint64 ttl_secs = 4;
+  WriteQuorum quorum = 5;
+}
+
+message PutResponse {
+  ResponseHeader header = 1;
+  uint64 new_version = 2;
+}
+
+message DeleteRequest {
+  string key = 1;
+  WriteQuorum quorum = 2;
+}
+
+message DeleteResponse {
+  ResponseHeader header = 1;
+  bool found = 2;
+}
+
+message ScanRequest {
+  string start_key = 1;
+  string end_key = 2;
+  uint32 limit = 3;
+  bytes page_token = 4;
+  ReadConsistency consistency = 5;
+}
+
+message ScanResponse {
+  ResponseHeader header = 1;
+  repeated KeyValue kvs = 2;
+  bytes next_page_token = 3;
+}
+
+message WatchCreateRequest {
+  string start_key = 1;
+  string end_key = 2;
+  uint64 start_index = 3;
+}
+
+message WatchCancelRequest {
+  uint64 watch_id = 1;
+}
+
+message WatchRequest {
+  oneof request {
+    WatchCreateRequest create = 1;
+    WatchCancelRequest cancel = 2;
+  }
+}
+
+enum EventType {
+  PUT = 0;
+  DELETE = 1;
+  EXPIRE = 2;
+}
+
+message WatchEvent {
+  ResponseHeader header = 1;
+  EventType type = 2;
+  KeyValue kv = 3;
+  bool canceled = 4;
+  uint64 watch_id = 5;
+}
+
+message CasRequest {
+  string key = 1;
+  bytes expected_value = 2;
+  bytes new_value = 3;
+  uint64 ttl_secs = 4;
+  WriteQuorum quorum = 5;
+}
+
+message CasResponse {
+  ResponseHeader header = 1;
+  bool success = 2;
+  KeyValue current = 3;
+}

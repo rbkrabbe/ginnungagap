@@ -1,0 +1,28 @@
+[storage]
+data_dir             = "/var/lib/ginnungagap"
+max_key_bytes        = 4096
+max_value_bytes      = 1048576
+max_history_versions = 10
+ttl_gc_interval_secs = 30
+
+[raft]
+heartbeat_interval_ms   = 150
+election_timeout_min_ms = 500
+election_timeout_max_ms = 1000
+snapshot_threshold      = 50000
+
+[consistency]
+default_read_mode    = "linearizable"
+default_write_quorum = "majority"
+lease_enabled        = true
+lease_duration_ms    = 4000
+
+[server]
+watch_broadcast_capacity = 1024
+request_timeout_ms       = 5000
+
+[observability]
+log_level             = "info"
+log_format            = "json"
+metrics_addr          = "0.0.0.0:9090"
+tracing_otlp_endpoint = ""
