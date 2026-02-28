@@ -102,7 +102,7 @@ Fjall partition layout:
 |------------|-----------------------------------------------|---------------------|-------------------------------|
 | `raft_log` | `be_u64(shard_id) ++ be_u64(index)`           | `bincode(LogEntry)` | Raft log entries               |
 | `data`     | `be_u64(shard_id) ++ key_bytes`               | `bincode(KvEntry)`  | Current value per key          |
-| `history`  | `be_u64(shard_id) ++ key_bytes ++ be_u64(ver)`| `bincode(KvEntry)`  | Per-key version history (MVCC) |
+| `history`  | `be_u64(shard_id) ++ key_bytes ++ \x00 ++ be_u64(ver)`| `bincode(KvEntry)`  | Per-key version history (MVCC) |
 | `ttl_index`| `be_u64(shard_id) ++ be_i64(expires_at_ns) ++ key` | empty          | Expiry scan by timestamp       |
 | `meta`     | `be_u64(shard_id) ++ string literal`          | bincode             | vote, last_applied, membership |
 
@@ -110,7 +110,7 @@ All partitions are prefixed with `be_u64(shard_id)`. In Phase 1–6 this is alwa
 
 Traits: `LogStorage`, `StateMachineStore` (also `MemLogStorage` / `MemStateMachine` for tests).
 
-`TtlGcTask`: tokio background task using `tokio_util::time::DelayQueue`, wakes on next expiry and routes a `KvCommand::Delete` through Raft (so TTL expiry is committed, replicated, and watched).
+`TtlGcTask`: tokio background task that scans the `ttl_index` partition, sleeps until the next expiry, then routes a `KvCommand::Delete` through Raft (so TTL expiry is committed, replicated, and watched). The Raft channel is wired in Phase 4.
 
 History compaction: after each write, if depth > `max_history_versions`, delete the oldest `history` entry.
 
@@ -234,10 +234,10 @@ tokio                       = { version = "1", features = ["full"] }
 tonic                       = { version = "0.12", features = ["tls", "transport"] }
 tonic-build                 = "0.12"
 prost                       = "0.13"
-openraft                    = { version = "0.9", features = ["tokio-rt"] }
+openraft                    = { version = "0.9", features = ["serde"] }
 fjall                       = "3"
 serde                       = { version = "1", features = ["derive"] }
-bincode                     = "2"
+bincode                     = { version = "2", features = ["serde"] }
 thiserror                   = "1"
 anyhow                      = "1"
 clap                        = { version = "4", features = ["derive"] }
@@ -273,13 +273,13 @@ uuid                        = { version = "1", features = ["v4"] }
 - [x] `ggap-node` starts both servers; single-node `grpcurl` Get/Put/Delete works end-to-end
 - [x] gRPC server reflection (`tonic-reflection`) registered on both servers
 
-### Phase 3 — Storage Layer
-- [ ] `MemLogStorage` + `MemStateMachine` (test-only implementations)
-- [ ] `FjallLogStorage`: append, truncate, get, purge
-- [ ] `FjallStateMachine`: apply, get (with `at_version`), scan, snapshot
-- [ ] Partition key encoding helpers, history write + compaction
-- [ ] `TtlGcTask` (DelayQueue-based background expiry)
-- [ ] Unit tests: log append/truncate, SM apply, snapshot round-trip
+### Phase 3 — Storage Layer ✅
+- [x] `MemLogStorage` + `MemStateMachine` (test-only implementations)
+- [x] `FjallLogStorage`: append, truncate, get, purge
+- [x] `FjallStateMachine`: apply, get (with `at_version`), scan, snapshot
+- [x] Partition key encoding helpers, history write + compaction
+- [x] `TtlGcTask` (sleep-loop-based background expiry skeleton; wired to Raft in Phase 4)
+- [x] Unit tests: log append/truncate, SM apply, snapshot round-trip
 
 ### Phase 4 — Consensus Layer
 - [ ] `GgapTypeConfig`, `GgapNetworkFactory`, `GgapRaftClient`
