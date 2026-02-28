@@ -8,6 +8,7 @@ Decisions anchored here to avoid re-discussion. Full rationale in PLAN.md.
 - **`ggap-types` has no gRPC dependency** — all crates import domain types from here; proto types never leak inward.
 - **All storage keys are prefixed with `be_u64(shard_id)`** — always `ShardId(0)` in Phases 1–6. Never remove this prefix "for simplicity"; it makes Phase 7 multi-raft additive.
 - **`RaftNode` always carries `ShardId`** — multi-raft is `HashMap<ShardId, RaftNode>`, not a rewrite.
+- **Use `tokio::time` everywhere, never `std::time::Instant`** — `tokio::time` can be paused and advanced by simulation harnesses. Direct use of `std::time` breaks deterministic simulation testing (Phase 6). Applies to `TtlGcTask`, `LeaseManager`, timeouts, and any other time-dependent code.
 
 ## Tech Stack (settled)
 

@@ -252,6 +252,7 @@ tokio-util                  = { version = "0.7", features = ["time"] }
 metrics                     = "0.22"
 metrics-exporter-prometheus = "0.13"
 uuid                        = { version = "1", features = ["v4"] }
+turmoil                     = "0.6"   # dev-dependency; simulation harness (Phase 6)
 ```
 
 ---
@@ -287,6 +288,7 @@ uuid                        = { version = "1", features = ["v4"] }
 - [ ] `LeaseManager`
 - [ ] Swap `StubRaftNode` for real `RaftNode` in `ggap-node`
 - [ ] Integration test: 3-node cluster, leader election, basic CRUD
+- [ ] **DST discipline**: use `tokio::time` (not `std::time::Instant`) in all time-dependent code (`LeaseManager`, `TtlGcTask`, timeouts) — prerequisite for the Phase 6 simulation harness
 
 ### Phase 5 — Advanced Features
 - [ ] Watch fan-out (`WatchManager`, broadcast channel, TTL `EXPIRE` events)
@@ -295,6 +297,7 @@ uuid                        = { version = "1", features = ["v4"] }
 - [ ] Sequential + eventual read paths tested end-to-end
 
 ### Phase 6 — Hardening
+- [ ] **Deterministic simulation testing (DST)**: `turmoil`-based harness — spawn N nodes in one process, inject message drops/reorders/delays via simulated network, seed a PRNG for reproducible fault sequences, verify linearizability. Uses `MemLogStorage` + `MemStateMachine` (already built); `RaftNetwork` is injected through openraft's trait. A failing seed reproduces the exact bug.
 - [ ] Chaos tests: kill leader, isolate follower, restart, linearizability check
 - [ ] Prometheus metrics: request rate/latency p50/p99, Raft term, commit lag, match index
 - [ ] OpenTelemetry trace propagation (client → server → consensus)
