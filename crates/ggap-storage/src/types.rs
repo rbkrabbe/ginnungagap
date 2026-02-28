@@ -1,4 +1,4 @@
-use ggap_types::KvCommand;
+use ggap_types::{KvCommand, KvEntry};
 
 /// A single entry in the Raft log.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -51,10 +51,26 @@ pub struct SnapshotMeta {
     pub snapshot_id: String,
 }
 
+/// Internal serialized format stored in [`Snapshot::data`].
+///
+/// Both the current-value (`data`) partition and the MVCC history (`history`)
+/// partition are captured so that `at_version` reads survive a snapshot
+/// round-trip on the node that built it, and remain available on a follower
+/// that receives and installs the snapshot.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct SnapshotContents {
+    /// Current value per key (mirrors the `data` partition).
+    pub data: Vec<(String, KvEntry)>,
+    /// All retained history entries (mirrors the `history` partition),
+    /// keyed by `(user_key, version)`.
+    pub history: Vec<((String, u64), KvEntry)>,
+}
+
 /// A full state-machine snapshot for a shard.
 ///
-/// `data` is a `bincode`-serialized `Vec<(String, KvEntry)>` — a complete
-/// dump of the `data` partition for the shard at the time of the snapshot.
+/// `data` is a `bincode`-serialized [`SnapshotContents`] — a complete dump of
+/// both the `data` and `history` partitions for the shard at the time of the
+/// snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub meta: SnapshotMeta,

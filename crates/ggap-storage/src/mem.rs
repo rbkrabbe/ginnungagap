@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ShardId};
 
 use crate::traits::{LogStorage, StateMachineStore};
-use crate::types::{LogEntry, LogState, Snapshot, SnapshotMeta, Vote};
+use crate::types::{LogEntry, LogState, Snapshot, SnapshotContents, SnapshotMeta, Vote};
 
 /// Maximum MVCC history versions retained per key before compaction.
 const MAX_HISTORY: usize = 10;
@@ -309,16 +309,17 @@ impl StateMachineStore for MemStateMachine {
 
     async fn build_snapshot(&self, _shard_id: ShardId) -> Result<Snapshot, GgapError> {
         let g = self.inner.read().await;
-        let pairs: Vec<(String, KvEntry)> =
-            g.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let data = encode(&pairs)?;
+        let contents = SnapshotContents {
+            data: g.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            history: g.history.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        };
         Ok(Snapshot {
             meta: SnapshotMeta {
                 last_log_index: g.last_applied.unwrap_or(0),
                 last_log_term: 0,
                 snapshot_id: uuid::Uuid::new_v4().to_string(),
             },
-            data,
+            data: encode(&contents)?,
         })
     }
 
@@ -327,10 +328,10 @@ impl StateMachineStore for MemStateMachine {
         _shard_id: ShardId,
         snapshot: Snapshot,
     ) -> Result<(), GgapError> {
-        let pairs: Vec<(String, KvEntry)> = decode(&snapshot.data)?;
+        let contents: SnapshotContents = decode(&snapshot.data)?;
         let mut g = self.inner.write().await;
-        g.data = pairs.into_iter().collect();
-        g.history.clear();
+        g.data = contents.data.into_iter().collect();
+        g.history = contents.history.into_iter().collect();
         g.last_applied = Some(snapshot.meta.last_log_index);
         Ok(())
     }

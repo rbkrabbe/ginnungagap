@@ -9,7 +9,7 @@ use crate::keys::{
     ttl_index_key,
 };
 use crate::traits::{LogStorage, StateMachineStore};
-use crate::types::{LogEntry, LogState, Snapshot, SnapshotMeta, Vote};
+use crate::types::{LogEntry, LogState, Snapshot, SnapshotContents, SnapshotMeta, Vote};
 
 /// Maximum MVCC history versions retained per key before compaction.
 pub const DEFAULT_MAX_HISTORY: u64 = 10;
@@ -537,18 +537,39 @@ impl StateMachineStore for FjallStateMachine {
     async fn build_snapshot(&self, shard_id: ShardId) -> Result<Snapshot, GgapError> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || -> Result<Snapshot, GgapError> {
-            let start = shard_id.to_be_bytes().to_vec();
-            let end = data_shard_end(shard_id).to_vec();
+            let shard_start = shard_id.to_be_bytes().to_vec();
+            let shard_end = data_shard_end(shard_id).to_vec();
 
-            let pairs: Vec<(String, KvEntry)> = store
+            let data: Vec<(String, KvEntry)> = store
                 .data
-                .range(start..end)
+                .range(shard_start.clone()..shard_end.clone())
                 .map(|g| {
                     g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
                         let user_key = String::from_utf8(k[8..].to_vec())
                             .map_err(|e| GgapError::Storage(e.to_string()))?;
-                        let entry = decode::<KvEntry>(&v)?;
-                        Ok((user_key, entry))
+                        Ok((user_key, decode::<KvEntry>(&v)?))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            // Key layout: shard(8) ++ key_utf8 ++ \x00 ++ version_be(8)
+            let history: Vec<((String, u64), KvEntry)> = store
+                .history
+                .range(shard_start..shard_end)
+                .map(|g| {
+                    g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
+                        let raw = &k[8..]; // strip shard prefix
+                        let null_pos = raw.iter().position(|&b| b == 0).ok_or_else(|| {
+                            GgapError::Storage("malformed history key: missing null byte".into())
+                        })?;
+                        let user_key = String::from_utf8(raw[..null_pos].to_vec())
+                            .map_err(|e| GgapError::Storage(e.to_string()))?;
+                        let version = u64::from_be_bytes(
+                            raw[null_pos + 1..null_pos + 9].try_into().map_err(|_| {
+                                GgapError::Storage("malformed history key: short version".into())
+                            })?,
+                        );
+                        Ok(((user_key, version), decode::<KvEntry>(&v)?))
                     })
                 })
                 .collect::<Result<_, _>>()?;
@@ -568,7 +589,7 @@ impl StateMachineStore for FjallStateMachine {
                     last_log_term: 0,
                     snapshot_id: uuid::Uuid::new_v4().to_string(),
                 },
-                data: encode(&pairs)?,
+                data: encode(&SnapshotContents { data, history })?,
             })
         })
         .await
@@ -582,7 +603,7 @@ impl StateMachineStore for FjallStateMachine {
     ) -> Result<(), GgapError> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
-            let pairs: Vec<(String, KvEntry)> = decode(&snapshot.data)?;
+            let contents: SnapshotContents = decode(&snapshot.data)?;
 
             let shard_start = shard_id.to_be_bytes().to_vec();
             let shard_end = data_shard_end(shard_id).to_vec();
@@ -614,8 +635,22 @@ impl StateMachineStore for FjallStateMachine {
             for k in ttl_keys {
                 batch.remove(&store.ttl_index, k);
             }
-            for (user_key, entry) in &pairs {
+            for (user_key, entry) in &contents.data {
                 batch.insert(&store.data, data_key(shard_id, user_key), encode(entry)?);
+                if let Some(expires_at_ns) = entry.expires_at_ns {
+                    batch.insert(
+                        &store.ttl_index,
+                        ttl_index_key(shard_id, expires_at_ns, user_key),
+                        b"",
+                    );
+                }
+            }
+            for ((user_key, version), entry) in &contents.history {
+                batch.insert(
+                    &store.history,
+                    history_key(shard_id, user_key, *version),
+                    encode(entry)?,
+                );
             }
             batch.insert(
                 &store.meta,
