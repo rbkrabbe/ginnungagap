@@ -972,4 +972,78 @@ mod tests {
             assert_eq!(e.value, vec![i as u8]);
         }
     }
+
+    #[tokio::test]
+    async fn sm_last_applied_version_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = Arc::new(FjallStateMachine::new(open_store(dir.path())));
+
+        let mut last_applied = sm.last_applied(0).await.unwrap();
+        assert!(last_applied.is_none());
+
+        sm.apply(0, 42, KvCommand::Put {
+                    key: "k1".into(),
+                    value: vec![1u8],
+                    ttl_ns: None,
+                    expect_version: 0,
+                })
+                .await
+                .unwrap();
+        last_applied = sm.last_applied(0).await.unwrap();
+        assert_eq!(last_applied, Some(42));
+        
+        sm.apply(0, 43, KvCommand::Put {
+                    key: "k1".into(),
+                    value: vec![1u8],
+                    ttl_ns: None,
+                    expect_version: 1,
+                })
+                .await
+                .unwrap_err();        
+        last_applied = sm.last_applied(0).await.unwrap();
+        assert_eq!(last_applied, Some(42));
+
+    }
+
+    #[tokio::test]
+    async fn sm_snapshot_roundtrip_history_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = Arc::new(FjallStateMachine::new(open_store(dir.path())));
+
+
+        sm.apply(0, 1, KvCommand::Put {
+                    key: "k1".into(),
+                    value: vec![1u8],
+                    ttl_ns: None,
+                    expect_version: 0,
+                })
+                .await
+                .unwrap();
+        
+        sm.apply(0, 2, KvCommand::Put {
+                    key: "k1".into(),
+                    value: vec![2u8],
+                    ttl_ns: None,
+                    expect_version: 0,
+                })
+                .await
+                .unwrap();        
+        
+        let v1 = sm.get(0, "k1".into(), 1).await.unwrap().unwrap();
+        let v2 = sm.get(0, "k1".into(), 2).await.unwrap().unwrap();
+        assert_eq!(v1.value, vec![1u8]);
+        assert_eq!(v2.value, vec![2u8]);
+
+        let snap = sm.build_snapshot(0).await.unwrap();
+        sm.install_snapshot(0, snap).await.unwrap();
+
+
+        let v0_post = sm.get(0, "k1".into(), 0).await.unwrap().unwrap();
+        let v1_post = sm.get(0, "k1".into(), 1).await.unwrap().unwrap();
+        let v2_post = sm.get(0, "k1".into(), 2).await.unwrap().unwrap();
+        assert_eq!(v0_post.value, vec![2u8]);
+        assert_eq!(v1_post.value, vec![1u8]);
+        assert_eq!(v2_post.value, vec![2u8]);
+
+    }
 }
