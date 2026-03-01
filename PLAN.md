@@ -89,7 +89,9 @@ service AdminService  { ClusterStatus, AddLearner, ChangeMembership, TransferLea
 ### `ggap-types`
 Pure domain types with no network dependency. Other crates import from here to avoid circular deps through gRPC types.
 - `KvCommand`: `Put { key, value, ttl_ns, expect_version }` | `Delete { key }` | `Cas { key, expected, new_value, ttl_ns }`
-- `KvResponse`: `Written { version }` | `Deleted { found }` | `CasResult { success, current }`
+- `KvResponse`: `Written { version }` | `Deleted { found }` | `CasResult { success, current }` | `Conflict { expected, actual }` | `NoOp`
+  - `Conflict` is returned (not errored) when a conditional Put's `expect_version` mismatches; mapped to `Status::aborted` at the gRPC layer. This prevents openraft from treating a business-logic conflict as a fatal storage failure.
+  - `NoOp` is returned for Raft-internal entries (Blank, Membership); guarded by `unreachable!()` in `ggap-server`.
 - `ReadMode`, `WriteMode` enums
 - `GgapError` (thiserror): `NotFound`, `NotLeader { leader }`, `VersionConflict`, `Timeout`, `Storage`, `Consensus`, ...
 
@@ -282,13 +284,23 @@ turmoil                     = "0.6"   # dev-dependency; simulation harness (Phas
 - [x] `TtlGcTask` (sleep-loop-based background expiry skeleton; wired to Raft in Phase 4)
 - [x] Unit tests: log append/truncate, SM apply, snapshot round-trip
 
-### Phase 4 — Consensus Layer
-- [ ] `GgapTypeConfig`, `GgapNetworkFactory`, `GgapRaftClient`
-- [ ] `RaftNode` impl: `propose`, `linearizable_read`, `sequential_read`, `eventual_read`
-- [ ] `LeaseManager`
-- [ ] Swap `StubRaftNode` for real `RaftNode` in `ggap-node`
-- [ ] Integration test: 3-node cluster, leader election, basic CRUD
-- [ ] **DST discipline**: use `tokio::time` (not `std::time::Instant`) in all time-dependent code (`LeaseManager`, `TtlGcTask`, timeouts) — prerequisite for the Phase 6 simulation harness
+### Phase 4 — Consensus Layer ✅
+- [x] `GgapTypeConfig` (`openraft::RaftTypeConfig` impl), `GgapNetworkFactory` + `GgapNetwork` (outbound tonic calls to peer `RaftService`)
+- [x] `GgapLogStorage` (`RaftLogStorage` + `RaftLogReader` v2 trait impls over `FjallLogStorage`)
+- [x] `GgapStateMachine` (`RaftStateMachine` v2 impl): apply, snapshot build/install, `applied_state`
+- [x] `OpenRaftNode` (`RaftNode` trait): `propose` via `raft.client_write()`, linearizable/sequential/eventual reads
+- [x] `LeaseManager` stub (`is_valid()` always false; full lease optimisation is Phase 5)
+- [x] `OpenRaftCluster` (`ClusterNode` trait): `append_entries`, `vote`, `install_snapshot` as bytes-in/bytes-out handlers keeping openraft types out of `ggap-server`
+- [x] Swap `StubRaftNode` → `OpenRaftNode` in `ggap-node`; `TtlGcTask` wired through `raft.client_write()`
+- [x] `ggap-node` initialises a real single-shard Raft cluster; single-node smoke-test passes
+- [x] **DST discipline**: `tokio::time` used throughout (`LeaseManager`, `TtlGcTask`, all timeouts)
+- [x] 33/33 tests pass, zero clippy warnings
+- [ ] 3-node cluster integration test — deferred to Phase 5
+
+**Post-phase bug fixes (same commit):**
+- `install_snapshot` and `apply` now both encode `or_last_applied` as `Option<LogId<u64>>`; all readers decode the same type (was a crash-on-restart deserialization mismatch)
+- `KvResponse::Conflict` added; `GgapStateMachine::apply` catches `VersionConflict` and returns `Ok(Conflict)` instead of mapping to `StorageError` (openraft treats any `Err` from `apply` as fatal — node would halt on every stale conditional Put)
+- `kv_service.rs` match arms made explicit: `Conflict → Status::aborted`, `NoOp → unreachable!()`
 
 ### Phase 5 — Advanced Features
 - [ ] Watch fan-out (`WatchManager`, broadcast channel, TTL `EXPIRE` events)

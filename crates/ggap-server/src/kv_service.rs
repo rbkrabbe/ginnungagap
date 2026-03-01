@@ -77,6 +77,10 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
                 header: Some(stub_header(self.node_id)),
                 new_version: version,
             })),
+            ggap_types::KvResponse::Conflict { expected, actual } => Err(Status::aborted(
+                format!("version conflict: expected {expected}, got {actual}"),
+            )),
+            ggap_types::KvResponse::NoOp => unreachable!("Put returned NoOp"),
             _ => Err(Status::internal("unexpected response variant")),
         }
     }
@@ -97,6 +101,7 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
                 header: Some(stub_header(self.node_id)),
                 found,
             })),
+            ggap_types::KvResponse::NoOp => unreachable!("Delete returned NoOp"),
             _ => Err(Status::internal("unexpected response variant")),
         }
     }
@@ -161,6 +166,7 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
                     current: current.map(kv_entry_to_proto),
                 }))
             }
+            ggap_types::KvResponse::NoOp => unreachable!("CAS returned NoOp"),
             _ => Err(Status::internal("unexpected response variant")),
         }
     }

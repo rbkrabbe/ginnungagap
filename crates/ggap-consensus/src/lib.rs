@@ -1,3 +1,10 @@
+pub mod config;
+pub mod convert;
+pub mod log_store;
+pub mod network;
+pub mod node;
+pub mod state_machine;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,6 +12,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, WriteMode};
+
+// ---------------------------------------------------------------------------
+// Public re-exports
+// ---------------------------------------------------------------------------
+
+pub use config::{build_raft_config, GgapTypeConfig};
+pub use log_store::GgapLogStorage;
+pub use network::{GgapNetworkFactory, GgapNetwork};
+pub use node::{ClusterNode, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
+pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};
 
 // ---------------------------------------------------------------------------
 // RaftNode trait

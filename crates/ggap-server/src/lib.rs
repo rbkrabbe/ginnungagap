@@ -6,7 +6,7 @@ mod raft_service;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ggap_consensus::RaftNode;
+use ggap_consensus::{ClusterNode, RaftNode};
 use ggap_proto::v1::{
     admin_service_server::AdminServiceServer, kv_service_server::KvServiceServer,
     raft_service_server::RaftServiceServer,
@@ -35,14 +35,17 @@ pub async fn serve_client<R: RaftNode>(
         .map_err(Into::into)
 }
 
-pub async fn serve_cluster(addr: SocketAddr) -> anyhow::Result<()> {
+pub async fn serve_cluster<CN: ClusterNode>(
+    addr: SocketAddr,
+    cluster: Arc<CN>,
+) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
     tracing::info!(%addr, "cluster gRPC server starting");
     tonic::transport::Server::builder()
-        .add_service(RaftServiceServer::new(RaftServiceImpl))
+        .add_service(RaftServiceServer::new(RaftServiceImpl::new(cluster)))
         .add_service(AdminServiceServer::new(AdminServiceImpl))
         .add_service(reflection)
         .serve(addr)

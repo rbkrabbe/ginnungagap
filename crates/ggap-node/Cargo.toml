@@ -12,6 +12,7 @@ ggap-types = { path = "../ggap-types" }
 ggap-storage = { path = "../ggap-storage" }
 ggap-consensus = { path = "../ggap-consensus" }
 ggap-server = { path = "../ggap-server" }
+openraft = { workspace = true }
 clap = { workspace = true }
 figment = { workspace = true }
 toml = { workspace = true }

@@ -762,7 +762,9 @@ dependencies = [
  "openraft",
  "rand 0.10.0",
  "serde",
+ "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -777,6 +779,7 @@ dependencies = [
  "ggap-server",
  "ggap-storage",
  "ggap-types",
+ "openraft",
  "serde",
  "tokio",
  "toml",

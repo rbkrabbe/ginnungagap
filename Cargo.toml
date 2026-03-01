@@ -17,7 +17,7 @@ tonic = { version = "0.12", features = ["tls", "transport"] }
 tonic-build = "0.12"
 tonic-reflection = "0.12"
 prost = "0.13"
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 fjall = "3"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
