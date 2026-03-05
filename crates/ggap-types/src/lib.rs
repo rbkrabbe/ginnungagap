@@ -1,6 +1,14 @@
 pub type NodeId = u64;
 pub type ShardId = u64; // always 0 in phases 1-6
 
+/// Stored in last_applied metadata
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LogId {
+    pub term: u64,
+    pub leader_id: u64,
+    pub index: u64,
+}
+
 /// Stored per key (current value and history entries)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KvEntry {

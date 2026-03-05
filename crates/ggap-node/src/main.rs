@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
     // 2. Create FSM and log store.
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
     let log_store = GgapLogStorage::new(store.clone(), 0);
-    let sm = GgapStateMachine::new(fsm.clone(), store.clone(), 0);
+    let sm = GgapStateMachine::new(fsm.clone(),  0);
 
     // 3. Build Raft config from file config.
     let raft_cfg = build_raft_config(

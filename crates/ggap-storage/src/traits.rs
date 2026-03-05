@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ShardId};
+use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, LogId, ShardId};
 
 use crate::types::{LogEntry, LogState, Snapshot, Vote};
 
@@ -55,12 +55,12 @@ pub trait StateMachineStore: Send + Sync + 'static {
     /// Return the Raft log index of the last applied entry, or `None` if the
     /// state machine is empty.
     fn last_applied(&self, shard_id: ShardId)
-        -> impl Future<Output = Result<Option<u64>, GgapError>> + Send;
+        -> impl Future<Output = Result<(Option<LogId>, Option<Vec<u8>>), GgapError>> + Send;
 
     /// Apply a committed `KvCommand` at the given Raft log `index`.
     ///
-    /// `index` is used as both the MVCC version and the `last_applied` cursor.
-    fn apply(&self, shard_id: ShardId, index: u64, cmd: KvCommand)
+    /// `log_id` is used as both the MVCC version and the `last_applied` cursor.
+    fn apply(&self, shard_id: ShardId, log_id: LogId, cmd: Option<KvCommand>, membership_bytes: Option<Vec<u8>>)
         -> impl Future<Output = Result<KvResponse, GgapError>> + Send;
 
     /// Read a key.

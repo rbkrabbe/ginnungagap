@@ -165,7 +165,7 @@ impl RaftLogStorage<GgapTypeConfig> for GgapLogStorage {
             }
 
             // If the log is empty, last_log_id falls back to last_purged_log_id.
-            let last_log_id = last_log_id.or(last_purged_log_id);
+            let last_log_id = last_log_id.or_else(|| last_purged_log_id.clone());
 
             Ok(LogState { last_purged_log_id, last_log_id })
         })

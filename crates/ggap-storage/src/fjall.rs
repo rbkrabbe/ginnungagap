@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ShardId};
+use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, LogId, ShardId};
 
 use crate::keys::{
     data_key, data_shard_end, history_key, history_prefix, meta_key, raft_log_key,
@@ -257,8 +257,8 @@ impl LogStorage for FjallLogStorage {
 
 /// `StateMachineStore` backed by fjall.
 pub struct FjallStateMachine {
-    pub store: Arc<FjallStore>,
-    pub max_history_versions: u64,
+    pub(crate) store: Arc<FjallStore>,
+    max_history_versions: u64,
 }
 
 impl FjallStateMachine {
@@ -272,13 +272,19 @@ impl FjallStateMachine {
 }
 
 impl StateMachineStore for FjallStateMachine {
-    async fn last_applied(&self, shard_id: ShardId) -> Result<Option<u64>, GgapError> {
+    async fn last_applied(&self, shard_id: ShardId) -> Result<(Option<LogId>, Option<Vec<u8>>), GgapError> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<u64>, GgapError> {
-            match store.meta.get(meta_key(shard_id, "last_applied")).map_err(fjall_err)? {
-                Some(b) => Ok(Some(decode::<u64>(&b)?)),
-                None => Ok(None),
-            }
+        tokio::task::spawn_blocking(move || -> Result<(Option<LogId>, Option<Vec<u8>>), GgapError> {
+            let last_applied = match store.meta.get(meta_key(shard_id, "last_applied")).map_err(fjall_err)? {
+                Some(b) => Some(decode::<LogId>(&b)?),
+                None =>None,
+            };
+
+            let membership_bytes = match store.meta.get(meta_key(shard_id, "membership")).map_err(fjall_err)? {
+                Some(b) => Some(b.to_vec()),
+                None => None,
+            };
+            Ok((last_applied, membership_bytes))
         })
         .await
         .map_err(|e| GgapError::Storage(e.to_string()))?
@@ -287,15 +293,16 @@ impl StateMachineStore for FjallStateMachine {
     async fn apply(
         &self,
         shard_id: ShardId,
-        index: u64,
-        cmd: KvCommand,
+        log_id: LogId,
+        cmd: Option<KvCommand>,
+        membership_bytes: Option<Vec<u8>>,
     ) -> Result<KvResponse, GgapError> {
         let store = self.store.clone();
         let max_history = self.max_history_versions;
         tokio::task::spawn_blocking(move || -> Result<KvResponse, GgapError> {
             let now = now_ns();
             match cmd {
-                KvCommand::Put { key, value, ttl_ns, expect_version } => {
+                Some(KvCommand::Put { key, value, ttl_ns, expect_version }) => {
                     let current = store
                         .data
                         .get(data_key(shard_id, &key))
@@ -317,7 +324,7 @@ impl StateMachineStore for FjallStateMachine {
                     let entry = KvEntry {
                         key: key.clone(),
                         value,
-                        version: index,
+                        version: log_id.index,
                         created_at_ns,
                         modified_at_ns: now,
                         expires_at_ns,
@@ -327,7 +334,7 @@ impl StateMachineStore for FjallStateMachine {
                     batch.insert(&store.data, data_key(shard_id, &key), encode(&entry)?);
                     batch.insert(
                         &store.history,
-                        history_key(shard_id, &key, index),
+                        history_key(shard_id, &key, log_id.index),
                         encode(&entry)?,
                     );
                     if let Some(exp) = expires_at_ns {
@@ -349,15 +356,15 @@ impl StateMachineStore for FjallStateMachine {
                     batch.insert(
                         &store.meta,
                         meta_key(shard_id, "last_applied"),
-                        encode(&index)?,
+                        encode(&log_id)?,
                     );
                     batch.commit().map_err(fjall_err)?;
 
                     compact_history(&store, shard_id, &key, max_history)?;
-                    Ok(KvResponse::Written { version: index })
+                    Ok(KvResponse::Written { version: log_id.index })
                 }
 
-                KvCommand::Delete { key } => {
+                Some(KvCommand::Delete { key }) => {
                     let current = store
                         .data
                         .get(data_key(shard_id, &key))
@@ -379,13 +386,13 @@ impl StateMachineStore for FjallStateMachine {
                     batch.insert(
                         &store.meta,
                         meta_key(shard_id, "last_applied"),
-                        encode(&index)?,
+                        encode(&log_id)?,
                     );
                     batch.commit().map_err(fjall_err)?;
                     Ok(KvResponse::Deleted { found })
                 }
 
-                KvCommand::Cas { key, expected, new_value, ttl_ns } => {
+                Some(KvCommand::Cas { key, expected, new_value, ttl_ns }) => {
                     let current = store
                         .data
                         .get(data_key(shard_id, &key))
@@ -403,7 +410,7 @@ impl StateMachineStore for FjallStateMachine {
                         let entry = KvEntry {
                             key: key.clone(),
                             value: new_value,
-                            version: index,
+                            version: log_id.index,
                             created_at_ns,
                             modified_at_ns: now,
                             expires_at_ns,
@@ -412,7 +419,7 @@ impl StateMachineStore for FjallStateMachine {
                         batch.insert(&store.data, data_key(shard_id, &key), encode(&entry)?);
                         batch.insert(
                             &store.history,
-                            history_key(shard_id, &key, index),
+                            history_key(shard_id, &key, log_id.index),
                             encode(&entry)?,
                         );
                         if let Some(exp) = expires_at_ns {
@@ -433,7 +440,7 @@ impl StateMachineStore for FjallStateMachine {
                         batch.insert(
                             &store.meta,
                             meta_key(shard_id, "last_applied"),
-                            encode(&index)?,
+                            encode(&log_id)?,
                         );
                         batch.commit().map_err(fjall_err)?;
                         compact_history(&store, shard_id, &key, max_history)?;
@@ -441,11 +448,31 @@ impl StateMachineStore for FjallStateMachine {
                         // Still advance last_applied on CAS failure.
                         store
                             .meta
-                            .insert(meta_key(shard_id, "last_applied"), encode(&index)?)
+                            .insert(meta_key(shard_id, "last_applied"), encode(&log_id)?)
                             .map_err(fjall_err)?;
                     }
 
                     Ok(KvResponse::CasResult { success: matches, current })
+                }
+                None => {
+                    let mut batch = store.db.batch();
+                    match membership_bytes {
+                        Some(bytes) => {
+                            batch.insert(
+                                &store.meta,
+                                meta_key(shard_id, "membership"), 
+                                bytes,
+                            );
+                        }
+                        None => {}
+                    }
+                    batch.insert(
+                        &store.meta,
+                        meta_key(shard_id, "last_applied"), 
+                        encode(&log_id)?
+                    );
+                    batch.commit().map_err(fjall_err)?;
+                    Ok(KvResponse::NoOp)
                 }
             }
         })
@@ -579,14 +606,19 @@ impl StateMachineStore for FjallStateMachine {
                 .get(meta_key(shard_id, "last_applied"))
                 .map_err(fjall_err)?
             {
-                Some(b) => decode::<u64>(&b)?,
-                None => 0,
+                Some(b) => Some(decode::<LogId>(&b)?),
+                None => None,
+            };
+
+            let mb = match store.meta.get(meta_key(shard_id, "membership")).map_err(fjall_err)? {
+                Some(bytes) => bytes.to_vec(),
+                None => fjall::Slice::new(&[]).to_vec(), // Return empty slice if no membership info is found.
             };
 
             Ok(Snapshot {
                 meta: SnapshotMeta {
-                    last_log_index: last_applied,
-                    last_log_term: 0,
+                    last_log_id: last_applied,
+                    membership_bytes: mb,
                     snapshot_id: uuid::Uuid::new_v4().to_string(),
                 },
                 data: encode(&SnapshotContents { data, history })?,
@@ -652,11 +684,24 @@ impl StateMachineStore for FjallStateMachine {
                     encode(entry)?,
                 );
             }
-            batch.insert(
-                &store.meta,
-                meta_key(shard_id, "last_applied"),
-                encode(&snapshot.meta.last_log_index)?,
-            );
+            match snapshot.meta.last_log_id {
+                Some(log_id) => {
+                    batch.insert(
+                        &store.meta,
+                        meta_key(shard_id, "last_applied"),
+                        encode(&log_id)?,
+                    );
+                }
+                None => {}
+            }
+
+            if !snapshot.meta.membership_bytes.is_empty() {
+                batch.insert(
+                    &store.meta,
+                    meta_key(shard_id, "membership"),
+                    encode(&snapshot.meta.membership_bytes)?,
+                );
+            }
             batch.commit().map_err(fjall_err)
         })
         .await
@@ -772,20 +817,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sm = FjallStateMachine::new(open_store(dir.path()));
         let shard = 0u64;
-
-        sm.apply(shard, 1, KvCommand::Put {
+        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
+        sm.apply(shard, log_id, KvCommand::Put {
             key: "k".into(),
             value: b"v1".to_vec(),
             ttl_ns: None,
             expect_version: 0,
-        })
+        }.into(), None)
         .await
         .unwrap();
 
         let e = sm.get(shard, "k", 0).await.unwrap().unwrap();
         assert_eq!(e.value, b"v1");
         assert_eq!(e.version, 1);
-        assert_eq!(sm.last_applied(shard).await.unwrap(), Some(1));
+        assert_eq!(sm.last_applied(shard).await.unwrap(), (Some(log_id), None));
     }
 
     #[tokio::test]
@@ -795,12 +840,13 @@ mod tests {
         let shard = 0u64;
 
         for i in 1u64..=3 {
-            sm.apply(shard, i, KvCommand::Put {
+            let log_id = LogId { index: i, term: 1, leader_id: 1 };
+            sm.apply(shard, log_id, KvCommand::Put {
                 key: "k".into(),
                 value: format!("v{i}").into_bytes(),
                 ttl_ns: None,
                 expect_version: 0,
-            })
+            }.into(), None)
             .await
             .unwrap();
         }
@@ -823,12 +869,13 @@ mod tests {
         let shard = 0u64;
 
         for i in 1u64..=(max_history + 1) {
-            sm.apply(shard, i, KvCommand::Put {
+            let log_id = LogId { index: i, term: 1, leader_id: 1 };
+            sm.apply(shard, log_id, KvCommand::Put {
                 key: "k".into(),
                 value: i.to_be_bytes().to_vec(),
                 ttl_ns: None,
                 expect_version: 0,
-            })
+            }.into(), None)
             .await
             .unwrap();
         }
@@ -844,15 +891,18 @@ mod tests {
         let sm = FjallStateMachine::new(open_store(dir.path()));
         let shard = 0u64;
 
-        sm.apply(shard, 1, KvCommand::Put {
+        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
+        sm.apply(shard, log_id, KvCommand::Put {
             key: "k".into(),
             value: b"v".to_vec(),
             ttl_ns: None,
             expect_version: 0,
-        })
+        }.into(), None)
         .await
         .unwrap();
-        sm.apply(shard, 2, KvCommand::Delete { key: "k".into() }).await.unwrap();
+
+        let log_id2 = LogId { index: 2, term: 1, leader_id: 1 };
+        sm.apply(shard, log_id2, KvCommand::Delete { key: "k".into() }.into(), None).await.unwrap();
 
         assert!(sm.get(shard, "k", 0).await.unwrap().is_none());
         assert!(sm.get(shard, "k", 1).await.unwrap().is_some());
@@ -864,33 +914,36 @@ mod tests {
         let sm = FjallStateMachine::new(open_store(dir.path()));
         let shard = 0u64;
 
-        sm.apply(shard, 1, KvCommand::Put {
+        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
+        sm.apply(shard, log_id, KvCommand::Put {
             key: "k".into(),
             value: b"old".to_vec(),
             ttl_ns: None,
             expect_version: 0,
-        })
+        }.into(), None)
         .await
         .unwrap();
 
+        let log_id2 = LogId { index: 2, term: 1, leader_id: 1 };
         let resp = sm
-            .apply(shard, 2, KvCommand::Cas {
+            .apply(shard, log_id2, KvCommand::Cas {
                 key: "k".into(),
                 expected: b"old".to_vec(),
                 new_value: b"new".to_vec(),
                 ttl_ns: None,
-            })
+            }.into(), None)
             .await
             .unwrap();
         assert!(matches!(resp, KvResponse::CasResult { success: true, .. }));
 
+        let log_id3 = LogId { index: 3, term: 1, leader_id: 1 };
         let resp = sm
-            .apply(shard, 3, KvCommand::Cas {
+            .apply(shard, log_id3, KvCommand::Cas {
                 key: "k".into(),
                 expected: b"old".to_vec(),
                 new_value: b"other".to_vec(),
                 ttl_ns: None,
-            })
+            }.into(), None)
             .await
             .unwrap();
         assert!(matches!(resp, KvResponse::CasResult { success: false, .. }));
@@ -903,12 +956,13 @@ mod tests {
         let shard = 0u64;
 
         for i in 0u64..10 {
-            sm.apply(shard, i + 1, KvCommand::Put {
+            let log_id = LogId { index: i + 1, term: 1, leader_id: 1 };
+            sm.apply(shard, log_id, KvCommand::Put {
                 key: format!("key{i:02}"),
                 value: vec![i as u8],
                 ttl_ns: None,
                 expect_version: 0,
-            })
+            }.into(), None)
             .await
             .unwrap();
         }
@@ -929,25 +983,30 @@ mod tests {
         let sm = FjallStateMachine::new(open_store(dir.path()));
         let shard = 0u64;
 
-        sm.apply(shard, 1, KvCommand::Put {
+        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
+        sm.apply(shard, log_id, KvCommand::Put {
             key: "a".into(),
             value: b"1".to_vec(),
             ttl_ns: None,
             expect_version: 0,
-        })
+        }.into(), None)
         .await
         .unwrap();
-        sm.apply(shard, 2, KvCommand::Put {
+
+        let log_id2 = LogId { index: 2, term: 1, leader_id: 1 };
+        sm.apply(shard, log_id2, KvCommand::Put {
             key: "b".into(),
             value: b"2".to_vec(),
             ttl_ns: None,
             expect_version: 0,
-        })
+        }.into(), None)
         .await
         .unwrap();
 
         let snap = sm.build_snapshot(shard).await.unwrap();
-        assert_eq!(snap.meta.last_log_index, 2);
+        assert_eq!(snap.meta.last_log_id.unwrap().index, 2);
+        assert_eq!(snap.meta.last_log_id.unwrap().term, 1);
+        assert_eq!(snap.meta.last_log_id.unwrap().leader_id, 1);
 
         let dir2 = tempfile::tempdir().unwrap();
         let sm2 = FjallStateMachine::new(open_store(dir2.path()));
@@ -955,20 +1014,21 @@ mod tests {
 
         assert_eq!(sm2.get(shard, "a", 0).await.unwrap().unwrap().value, b"1");
         assert_eq!(sm2.get(shard, "b", 0).await.unwrap().unwrap().value, b"2");
-        assert_eq!(sm2.last_applied(shard).await.unwrap(), Some(2));
+        assert_eq!(sm2.last_applied(shard).await.unwrap(), (Some(log_id2), None));
     }
 
     #[tokio::test]
     async fn sm_durability() {
+        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
         let dir = tempfile::tempdir().unwrap();
         {
             let sm = FjallStateMachine::new(open_store(dir.path()));
-            sm.apply(0, 1, KvCommand::Put {
+            sm.apply(0, log_id, KvCommand::Put {
                 key: "x".into(),
                 value: b"persist".to_vec(),
                 ttl_ns: None,
                 expect_version: 0,
-            })
+            }.into(), None)
             .await
             .unwrap();
         }
@@ -976,7 +1036,7 @@ mod tests {
         let sm2 = FjallStateMachine::new(open_store(dir.path()));
         let e = sm2.get(0, "x", 0).await.unwrap().unwrap();
         assert_eq!(e.value, b"persist");
-        assert_eq!(sm2.last_applied(0).await.unwrap(), Some(1));
+        assert_eq!(sm2.last_applied(0).await.unwrap(), (Some(log_id), None));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -988,12 +1048,13 @@ mod tests {
         for i in 0u64..20 {
             let sm = sm.clone();
             handles.push(tokio::spawn(async move {
-                sm.apply(0, i + 1, KvCommand::Put {
+                let log_id = LogId { index:i + 1, term: 1, leader_id: 1 };
+                sm.apply(0, log_id, KvCommand::Put {
                     key: format!("k{i}"),
                     value: vec![i as u8],
                     ttl_ns: None,
                     expect_version: 0,
-                })
+                }.into(), None)
                 .await
                 .unwrap();
             }));
@@ -1014,29 +1075,31 @@ mod tests {
         let sm = Arc::new(FjallStateMachine::new(open_store(dir.path())));
 
         let mut last_applied = sm.last_applied(0).await.unwrap();
-        assert!(last_applied.is_none());
+        assert!(last_applied.0.is_none());
 
-        sm.apply(0, 42, KvCommand::Put {
+        let log_id = LogId { index: 42, term: 1, leader_id: 1 };
+        sm.apply(0, log_id, KvCommand::Put {
                     key: "k1".into(),
                     value: vec![1u8],
                     ttl_ns: None,
                     expect_version: 0,
-                })
+                }.into(), None)
                 .await
                 .unwrap();
         last_applied = sm.last_applied(0).await.unwrap();
-        assert_eq!(last_applied, Some(42));
+        assert_eq!(last_applied, (Some(log_id), None));
         
-        sm.apply(0, 43, KvCommand::Put {
+        let log_id2 = LogId { index: 43, term: 1, leader_id: 1 };
+        sm.apply(0, log_id2, KvCommand::Put {
                     key: "k1".into(),
                     value: vec![1u8],
                     ttl_ns: None,
                     expect_version: 1,
-                })
+                }.into(), None)
                 .await
                 .unwrap_err();        
         last_applied = sm.last_applied(0).await.unwrap();
-        assert_eq!(last_applied, Some(42));
+        assert_eq!(last_applied, (Some(log_id), None));
 
     }
 
@@ -1046,21 +1109,23 @@ mod tests {
         let sm = Arc::new(FjallStateMachine::new(open_store(dir.path())));
 
 
-        sm.apply(0, 1, KvCommand::Put {
+        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
+        sm.apply(0, log_id, KvCommand::Put {
                     key: "k1".into(),
                     value: vec![1u8],
                     ttl_ns: None,
                     expect_version: 0,
-                })
+                }.into(), None)
                 .await
                 .unwrap();
         
-        sm.apply(0, 2, KvCommand::Put {
+        let log_id2 = LogId { index: 2, term: 1, leader_id: 1 };
+        sm.apply(0, log_id2, KvCommand::Put {
                     key: "k1".into(),
                     value: vec![2u8],
                     ttl_ns: None,
                     expect_version: 0,
-                })
+                }.into(), None)
                 .await
                 .unwrap();        
         

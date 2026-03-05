@@ -1,4 +1,4 @@
-use ggap_types::{KvCommand, KvEntry};
+use ggap_types::{KvCommand, KvEntry, LogId};
 
 /// A single entry in the Raft log.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,8 +45,8 @@ pub struct LogState {
 /// Metadata identifying a snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotMeta {
-    pub last_log_index: u64,
-    pub last_log_term: u64,
+    pub last_log_id: Option<LogId>,
+    pub membership_bytes: Vec<u8>, 
     /// UUID v4 string identifying this snapshot.
     pub snapshot_id: String,
 }
