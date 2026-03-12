@@ -151,18 +151,24 @@ impl RaftLogStorage<GgapTypeConfig> for GgapLogStorage {
                     }
                 };
 
-            // Scan for the last log entry.
+            // Read only the last log entry (iterator is DoubleEndedIterator).
             let start_key = raft_log_key(shard_id, 0).to_vec();
             let end_key = raft_log_key(shard_id, u64::MAX).to_vec();
 
-            let mut last_log_id: Option<LogId<u64>> = None;
-
-            for guard in store.raft_log.range(start_key..=end_key) {
-                let (_, v) = guard.into_inner().map_err(|e| sto_err(e.to_string()))?;
-                let entry = decode::<<GgapTypeConfig as RaftTypeConfig>::Entry>(&v)
-                    .map_err(|e| sto_err(e.to_string()))?;
-                last_log_id = Some(entry.log_id);
-            }
+            let last_log_id = store
+                .raft_log
+                .range(start_key..=end_key)
+                .next_back()
+                .map(|g| {
+                    g.into_inner()
+                        .map_err(|e| sto_err(e.to_string()))
+                        .and_then(|(_, v)| {
+                            decode::<<GgapTypeConfig as RaftTypeConfig>::Entry>(&v)
+                                .map_err(|e| sto_err(e.to_string()))
+                                .map(|entry| entry.log_id)
+                        })
+                })
+                .transpose()?;
 
             // If the log is empty, last_log_id falls back to last_purged_log_id.
             let last_log_id = last_log_id.or_else(|| last_purged_log_id.clone());
