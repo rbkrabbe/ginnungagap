@@ -803,11 +803,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "ggap-consensus",
  "ggap-proto",
  "ggap-storage",
  "ggap-types",
  "openraft",
+ "rand 0.10.0",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -815,6 +817,7 @@ dependencies = [
  "tonic-reflection",
  "tower 0.4.13",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
