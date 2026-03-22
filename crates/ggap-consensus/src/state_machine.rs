@@ -38,6 +38,7 @@ impl GgapStateMachine {
     }
 }
 
+#[allow(clippy::result_large_err)]
 impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
     type SnapshotBuilder = GgapSnapshotBuilder;
 
@@ -209,6 +210,7 @@ pub struct GgapSnapshotBuilder {
     shard_id: ShardId,
 }
 
+#[allow(clippy::result_large_err)]
 impl RaftSnapshotBuilder<GgapTypeConfig> for GgapSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<GgapTypeConfig>, StorageError<u64>> {
         let shard_id = self.shard_id;

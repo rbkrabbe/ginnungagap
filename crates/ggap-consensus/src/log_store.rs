@@ -58,6 +58,7 @@ impl Clone for GgapLogStorage {
 // RaftLogReader
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::result_large_err)]
 impl RaftLogReader<GgapTypeConfig> for GgapLogStorage {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
@@ -107,6 +108,7 @@ impl RaftLogReader<GgapTypeConfig> for GgapLogStorage {
 // RaftLogStorage
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::result_large_err)]
 impl RaftLogStorage<GgapTypeConfig> for GgapLogStorage {
     type LogReader = GgapLogStorage;
 

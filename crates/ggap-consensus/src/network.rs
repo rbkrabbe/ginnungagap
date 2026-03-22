@@ -72,6 +72,7 @@ impl GgapNetwork {
     }
 }
 
+#[allow(clippy::result_large_err)]
 impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
     async fn append_entries(
         &mut self,
