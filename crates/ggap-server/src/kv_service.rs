@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ggap_consensus::RaftNode;
+use ggap_consensus::{RaftNode, ShardRouter};
 use ggap_proto::v1::{
     kv_service_server::KvService, CasRequest, CasResponse, DeleteRequest, DeleteResponse,
     GetRequest, GetResponse, PutRequest, PutResponse, ScanRequest, ScanResponse, WatchEvent,
@@ -14,27 +14,27 @@ use crate::convert::{
     ggap_to_status, kv_entry_to_proto, proto_read_consistency, proto_write_quorum, stub_header,
 };
 
-pub struct KvServiceImpl<R> {
-    raft: Arc<R>,
+pub struct KvServiceImpl {
+    router: Arc<ShardRouter>,
     node_id: u64,
 }
 
-impl<R: RaftNode> KvServiceImpl<R> {
-    pub fn new(raft: Arc<R>, node_id: u64) -> Self {
-        KvServiceImpl { raft, node_id }
+impl KvServiceImpl {
+    pub fn new(router: Arc<ShardRouter>, node_id: u64) -> Self {
+        KvServiceImpl { router, node_id }
     }
 }
 
 #[tonic::async_trait]
-impl<R: RaftNode> KvService for KvServiceImpl<R> {
+impl KvService for KvServiceImpl {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
         }
         let mode = proto_read_consistency(req.consistency);
-        let entry = self
-            .raft
+        let node = self.router.route_read(&req.key).await.map_err(ggap_to_status)?;
+        let entry = node
             .read(&req.key, req.at_version, mode)
             .await
             .map_err(ggap_to_status)?;
@@ -59,13 +59,14 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
         } else {
             Some(req.ttl_secs as i64 * 1_000_000_000)
         };
+        let node = self.router.route_write(&req.key).await.map_err(ggap_to_status)?;
         let cmd = KvCommand::Put {
             key: req.key,
             value: req.value,
             ttl_ns,
             expect_version: req.expect_version,
         };
-        let resp = self.raft.propose(cmd, mode).await.map_err(ggap_to_status)?;
+        let resp = node.propose(cmd, mode).await.map_err(ggap_to_status)?;
         match resp {
             ggap_types::KvResponse::Written { version } => Ok(Response::new(PutResponse {
                 header: Some(stub_header(self.node_id)),
@@ -88,8 +89,9 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
             return Err(Status::invalid_argument("key must not be empty"));
         }
         let mode = proto_write_quorum(req.quorum);
+        let node = self.router.route_write(&req.key).await.map_err(ggap_to_status)?;
         let cmd = KvCommand::Delete { key: req.key };
-        let resp = self.raft.propose(cmd, mode).await.map_err(ggap_to_status)?;
+        let resp = node.propose(cmd, mode).await.map_err(ggap_to_status)?;
         match resp {
             ggap_types::KvResponse::Deleted { found } => Ok(Response::new(DeleteResponse {
                 header: Some(stub_header(self.node_id)),
@@ -102,7 +104,6 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
 
     async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
         let req = request.into_inner();
-        // page_token bytes are the UTF-8 continuation key from the previous page.
         let start_key = if req.page_token.is_empty() {
             req.start_key.clone()
         } else {
@@ -110,8 +111,12 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
                 .map_err(|_| Status::invalid_argument("invalid page_token: not valid UTF-8"))?
         };
         let mode = proto_read_consistency(req.consistency);
-        let (entries, continuation) = self
-            .raft
+        let node = self
+            .router
+            .route_scan(&start_key, &req.end_key)
+            .await
+            .map_err(ggap_to_status)?;
+        let (entries, continuation) = node
             .scan(&start_key, &req.end_key, req.limit, mode)
             .await
             .map_err(ggap_to_status)?;
@@ -140,13 +145,14 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
         } else {
             Some(req.ttl_secs as i64 * 1_000_000_000)
         };
+        let node = self.router.route_write(&req.key).await.map_err(ggap_to_status)?;
         let cmd = KvCommand::Cas {
             key: req.key,
             expected: req.expected_value,
             new_value: req.new_value,
             ttl_ns,
         };
-        let resp = self.raft.propose(cmd, mode).await.map_err(ggap_to_status)?;
+        let resp = node.propose(cmd, mode).await.map_err(ggap_to_status)?;
         match resp {
             ggap_types::KvResponse::CasResult { success, current } => {
                 Ok(Response::new(CasResponse {

@@ -1,40 +1,55 @@
 use std::sync::Arc;
 
-use ggap_consensus::ClusterNode;
+use ggap_consensus::{ClusterNode, ShardRouter};
 use ggap_proto::v1::{raft_service_server::RaftService, RaftMessage};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::convert::ggap_to_status;
 
-pub struct RaftServiceImpl<CN> {
-    cluster: Arc<CN>,
+pub struct RaftServiceImpl {
+    router: Arc<ShardRouter>,
 }
 
-impl<CN: ClusterNode> RaftServiceImpl<CN> {
-    pub fn new(cluster: Arc<CN>) -> Self {
-        RaftServiceImpl { cluster }
+impl RaftServiceImpl {
+    pub fn new(router: Arc<ShardRouter>) -> Self {
+        RaftServiceImpl { router }
     }
 }
 
 #[tonic::async_trait]
-impl<CN: ClusterNode> RaftService for RaftServiceImpl<CN> {
+impl RaftService for RaftServiceImpl {
     async fn append_entries(
         &self,
         request: Request<RaftMessage>,
     ) -> Result<Response<RaftMessage>, Status> {
-        let payload = request.into_inner().data;
-        let out = self
-            .cluster
-            .append_entries(payload)
+        let msg = request.into_inner();
+        let cluster = self
+            .router
+            .get_cluster(msg.shard_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("shard {} not found", msg.shard_id)))?;
+        let out = cluster
+            .append_entries(msg.data)
             .await
             .map_err(ggap_to_status)?;
-        Ok(Response::new(RaftMessage { data: out }))
+        Ok(Response::new(RaftMessage {
+            shard_id: msg.shard_id,
+            data: out,
+        }))
     }
 
     async fn vote(&self, request: Request<RaftMessage>) -> Result<Response<RaftMessage>, Status> {
-        let payload = request.into_inner().data;
-        let out = self.cluster.vote(payload).await.map_err(ggap_to_status)?;
-        Ok(Response::new(RaftMessage { data: out }))
+        let msg = request.into_inner();
+        let cluster = self
+            .router
+            .get_cluster(msg.shard_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("shard {} not found", msg.shard_id)))?;
+        let out = cluster.vote(msg.data).await.map_err(ggap_to_status)?;
+        Ok(Response::new(RaftMessage {
+            shard_id: msg.shard_id,
+            data: out,
+        }))
     }
 
     async fn install_snapshot(
@@ -43,10 +58,16 @@ impl<CN: ClusterNode> RaftService for RaftServiceImpl<CN> {
     ) -> Result<Response<RaftMessage>, Status> {
         let mut stream = request.into_inner();
         let mut last_resp: Option<Vec<u8>> = None;
+        let mut shard_id = 0u64;
 
         while let Some(msg) = stream.message().await? {
-            let out = self
-                .cluster
+            shard_id = msg.shard_id;
+            let cluster = self
+                .router
+                .get_cluster(msg.shard_id)
+                .await
+                .ok_or_else(|| Status::not_found(format!("shard {} not found", msg.shard_id)))?;
+            let out = cluster
                 .install_snapshot(msg.data)
                 .await
                 .map_err(ggap_to_status)?;
@@ -54,6 +75,6 @@ impl<CN: ClusterNode> RaftService for RaftServiceImpl<CN> {
         }
 
         let data = last_resp.unwrap_or_default();
-        Ok(Response::new(RaftMessage { data }))
+        Ok(Response::new(RaftMessage { shard_id, data }))
     }
 }

@@ -12,12 +12,13 @@ use serde::Deserialize;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode,
+    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator,
 };
 use ggap_server::{serve_client, serve_cluster};
 use ggap_storage::{
     fjall::{FjallStateMachine, FjallStore},
     ttl::TtlGcTask,
+    ShardMap,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -154,62 +155,99 @@ async fn main() -> anyhow::Result<()> {
     let store = FjallStore::open(&data_dir)
         .with_context(|| format!("failed to open FjallStore at {}", data_dir.display()))?;
 
-    // 2. Create FSM and log store.
-    let fsm = Arc::new(FjallStateMachine::new(store.clone()));
-    let log_store = GgapLogStorage::new(store.clone(), 0);
-    let sm = GgapStateMachine::new(fsm.clone(), 0);
+    // 2. Load or initialize ShardMap.
+    let shard_map = Arc::new(
+        ShardMap::load(store.clone()).context("failed to load shard map")?,
+    );
+    shard_map
+        .initialize_default()
+        .await
+        .context("failed to initialize default shard")?;
 
-    // 3. Build Raft config from file config.
+    // 3. Create FSM (shared across all shards).
+    let fsm = Arc::new(FjallStateMachine::new(store.clone()));
+
+    // 4. Create ShardRouter.
+    let router = Arc::new(ShardRouter::new(shard_map.clone()));
+
+    // 5. Start a Raft group for each shard in the ShardMap.
+    let shards = shard_map.all_shards().await;
     let raft_cfg = build_raft_config(
         config.raft.heartbeat_interval_ms,
         config.raft.election_timeout_min_ms,
         config.raft.election_timeout_max_ms,
     );
 
-    // 4. Create the Raft instance.
-    let net = GgapNetworkFactory;
-    let raft = Arc::new(
-        GgapRaft::new(cli.node_id, raft_cfg, net, log_store, sm)
-            .await
-            .context("failed to create Raft instance")?,
-    );
+    for shard_info in &shards {
+        let shard_id = shard_info.shard_id;
+        let log_store = GgapLogStorage::new(store.clone(), shard_id);
+        let sm = GgapStateMachine::new(fsm.clone(), shard_id);
+        let net = GgapNetworkFactory::new(shard_id);
 
-    // 5. Initialize as single-node cluster on first boot.
-    if !raft
-        .is_initialized()
-        .await
-        .context("raft.is_initialized failed")?
-    {
-        let mut members = BTreeMap::new();
-        members.insert(
-            cli.node_id,
-            BasicNode {
-                addr: cluster_addr.to_string(),
-            },
+        let raft = Arc::new(
+            GgapRaft::new(cli.node_id, raft_cfg.clone(), net, log_store, sm)
+                .await
+                .with_context(|| format!("failed to create Raft for shard {shard_id}"))?,
         );
-        raft.initialize(members)
+
+        // Initialize as single-node cluster on first boot (only for shard 0 initially).
+        if !raft
+            .is_initialized()
             .await
-            .map_err(|e| anyhow::anyhow!("raft.initialize failed: {}", e))?;
+            .with_context(|| format!("raft.is_initialized failed for shard {shard_id}"))?
+        {
+            let mut members = BTreeMap::new();
+            members.insert(
+                cli.node_id,
+                BasicNode {
+                    addr: cluster_addr.to_string(),
+                },
+            );
+            raft.initialize(members)
+                .await
+                .map_err(|e| anyhow::anyhow!("raft.initialize failed for shard {shard_id}: {e}"))?;
+        }
+
+        let node = Arc::new(OpenRaftNode::new(
+            raft.clone(),
+            fsm.clone(),
+            shard_id,
+            cli.node_id,
+        ));
+        let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
+
+        router.add_shard(shard_id, node, cluster).await;
+
+        // Spawn TTL GC task for this shard.
+        let (ttl_tx, mut ttl_rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(TtlGcTask::new(fsm.clone(), shard_id, ttl_tx).run());
+        let raft2 = raft.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = ttl_rx.recv().await {
+                let _ = raft2.client_write(cmd).await;
+            }
+        });
+
+        tracing::info!(shard_id, "started Raft group");
     }
 
-    // 6. Build the node and cluster handles.
-    let node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, cli.node_id));
-    let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
+    // 6. Create the SplitCoordinator.
+    let split_coordinator = Arc::new(SplitCoordinator::new(
+        router.clone(),
+        shard_map.clone(),
+        store.clone(),
+        fsm.clone(),
+        cli.node_id,
+        cluster_addr.to_string(),
+        config.raft.heartbeat_interval_ms,
+        config.raft.election_timeout_min_ms,
+        config.raft.election_timeout_max_ms,
+    ));
 
-    // 7. Spawn TTL GC task, wired through Raft.
-    let (ttl_tx, mut ttl_rx) = tokio::sync::mpsc::channel(256);
-    tokio::spawn(TtlGcTask::new(fsm.clone(), 0, ttl_tx).run());
-    let raft2 = raft.clone();
-    tokio::spawn(async move {
-        while let Some(cmd) = ttl_rx.recv().await {
-            let _ = raft2.client_write(cmd).await;
-        }
-    });
-
-    // 8. Serve.
+    // 7. Serve.
     tokio::try_join!(
-        serve_client(client_addr, node, cli.node_id),
-        serve_cluster(cluster_addr, cluster),
+        serve_client(client_addr, router.clone(), cli.node_id),
+        serve_cluster(cluster_addr, router, split_coordinator, shard_map),
     )?;
 
     Ok(())

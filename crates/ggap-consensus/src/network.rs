@@ -1,5 +1,5 @@
 use ggap_proto::v1::{raft_service_client::RaftServiceClient, RaftMessage};
-use ggap_types::GgapError;
+use ggap_types::{GgapError, ShardId};
 use openraft::{
     error::{NetworkError, RPCError, RaftError, Unreachable},
     network::RPCOption,
@@ -15,7 +15,15 @@ use crate::convert::{decode, encode};
 // GgapNetworkFactory
 // ---------------------------------------------------------------------------
 
-pub struct GgapNetworkFactory;
+pub struct GgapNetworkFactory {
+    pub shard_id: ShardId,
+}
+
+impl GgapNetworkFactory {
+    pub fn new(shard_id: ShardId) -> Self {
+        GgapNetworkFactory { shard_id }
+    }
+}
 
 impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
     type Network = GgapNetwork;
@@ -24,6 +32,7 @@ impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
         GgapNetwork {
             addr: node.addr.clone(),
             channel: None,
+            shard_id: self.shard_id,
         }
     }
 }
@@ -35,6 +44,7 @@ impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
 pub struct GgapNetwork {
     addr: String,
     channel: Option<RaftServiceClient<Channel>>,
+    shard_id: ShardId,
 }
 
 impl GgapNetwork {
@@ -85,7 +95,10 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         let client = self.channel.as_mut().unwrap();
 
         let resp = client
-            .append_entries(RaftMessage { data: payload })
+            .append_entries(RaftMessage {
+                shard_id: self.shard_id,
+                data: payload,
+            })
             .await
             .map_err(Self::to_unreachable)?
             .into_inner();
@@ -104,7 +117,10 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         let client = self.channel.as_mut().unwrap();
 
         let resp = client
-            .vote(RaftMessage { data: payload })
+            .vote(RaftMessage {
+                shard_id: self.shard_id,
+                data: payload,
+            })
             .await
             .map_err(Self::to_unreachable)?
             .into_inner();
@@ -121,7 +137,10 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
     > {
         let payload = encode(&rpc).map_err(Self::to_iss_net_err)?;
-        let msgs = vec![RaftMessage { data: payload }];
+        let msgs = vec![RaftMessage {
+            shard_id: self.shard_id,
+            data: payload,
+        }];
         let stream = tokio_stream::iter(msgs);
 
         self.connect().await.map_err(Self::to_iss_unreachable)?;

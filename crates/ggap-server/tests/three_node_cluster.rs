@@ -7,9 +7,6 @@
 //!
 //! Run with:
 //!   cargo test -p ggap-server --test three_node_cluster -- --nocapture
-//!
-//! Benchmark with (once a bench harness is added):
-//!   cargo bench -p ggap-server
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -22,11 +19,12 @@ use tokio::net::TcpListener;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, RaftNode,
+    OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator,
 };
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener};
 use ggap_storage::fjall::{FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
+use ggap_storage::ShardMap;
 use ggap_types::{KvCommand, KvResponse, ReadMode};
 
 // ---------------------------------------------------------------------------
@@ -54,7 +52,7 @@ async fn start_node(id: u64) -> TestNode {
     // Fast timeouts so tests finish quickly.
     let cfg = build_raft_config(50, 150, 300);
     let raft = Arc::new(
-        GgapRaft::new(id, cfg, GgapNetworkFactory, log_store, sm)
+        GgapRaft::new(id, cfg, GgapNetworkFactory::new(0), log_store, sm)
             .await
             .unwrap_or_else(|e| panic!("node {id}: raft init failed: {e}")),
     );
@@ -64,22 +62,41 @@ async fn start_node(id: u64) -> TestNode {
     let cluster_addr = cluster_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
     let raft_node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, id));
+    let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
+
+    // Build a single-shard router for this node.
+    let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
+    shard_map.initialize_default().await.unwrap();
+    let router = Arc::new(ShardRouter::new(shard_map.clone()));
+    router.add_shard(0, raft_node.clone(), cluster).await;
+
+    let split_coordinator = Arc::new(SplitCoordinator::new(
+        router.clone(),
+        shard_map.clone(),
+        store,
+        fsm.clone(),
+        id,
+        cluster_addr.to_string(),
+        50,
+        150,
+        300,
+    ));
 
     let mut handles = Vec::new();
 
-    let c = cluster.clone();
+    let r = router.clone();
+    let sc = split_coordinator.clone();
+    let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, c).await {
-            // Server exits when the listener is closed — log only genuine errors.
+        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2).await {
             eprintln!("node {id} cluster server: {e}");
         }
     }));
 
-    let n = raft_node.clone();
+    let r = router.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_client_with_listener(client_listener, n, id).await {
+        if let Err(e) = serve_client_with_listener(client_listener, r, id).await {
             eprintln!("node {id} client server: {e}");
         }
     }));
@@ -232,8 +249,7 @@ async fn three_node_leader_election_and_basic_ops() {
     assert_eq!(entry.value, b"world");
 
     // Verify replication: all nodes (including followers) carry the data in
-    // their FSMs.  Lease-based linearizable reads from followers are Phase 5;
-    // for now read directly from the FSM after confirmed convergence.
+    // their FSMs.
     for node in &cluster.nodes {
         let entry = node
             .fsm

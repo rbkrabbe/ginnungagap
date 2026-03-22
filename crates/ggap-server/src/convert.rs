@@ -55,5 +55,14 @@ pub fn ggap_to_status(err: GgapError) -> Status {
         GgapError::Timeout => Status::deadline_exceeded(err.to_string()),
         GgapError::Storage(_) | GgapError::Consensus(_) => Status::internal(err.to_string()),
         GgapError::InvalidArgument(_) => Status::invalid_argument(err.to_string()),
+        GgapError::WrongShard { shard_id, .. } => {
+            let mut status = Status::failed_precondition(err.to_string());
+            if let Ok(val) = MetadataValue::try_from(shard_id.to_string().as_str()) {
+                status.metadata_mut().insert("ggap-shard-id", val);
+            }
+            status
+        }
+        GgapError::ShardSplitting => Status::unavailable(err.to_string()),
+        GgapError::ShardNotFound(_) => Status::not_found(err.to_string()),
     }
 }

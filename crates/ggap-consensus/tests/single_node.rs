@@ -19,7 +19,7 @@ async fn single_node_leader_write_read() {
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
     let log_store = GgapLogStorage::new(store.clone(), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
-    let net = GgapNetworkFactory;
+    let net = GgapNetworkFactory::new(0);
     let cfg = build_raft_config(50, 150, 300);
 
     let raft = Arc::new(GgapRaft::new(1, cfg, net, log_store, sm).await.unwrap());

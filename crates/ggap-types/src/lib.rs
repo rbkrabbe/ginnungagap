@@ -1,5 +1,38 @@
 pub type NodeId = u64;
-pub type ShardId = u64; // always 0 in phases 1-6
+pub type ShardId = u64;
+
+/// Key range owned by a shard: [start, end). Empty end means unbounded.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct KeyRange {
+    /// Inclusive lower bound. Empty string means the minimum possible key.
+    pub start: String,
+    /// Exclusive upper bound. Empty string means unbounded (no upper limit).
+    pub end: String,
+}
+
+impl KeyRange {
+    /// Returns `true` if `key` falls within this range.
+    pub fn contains(&self, key: &str) -> bool {
+        let after_start = self.start.is_empty() || key >= self.start.as_str();
+        let before_end = self.end.is_empty() || key < self.end.as_str();
+        after_start && before_end
+    }
+}
+
+/// State of a shard in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ShardState {
+    Active,
+    Splitting,
+}
+
+/// Metadata for a single shard.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ShardInfo {
+    pub shard_id: ShardId,
+    pub range: KeyRange,
+    pub state: ShardState,
+}
 
 /// Stored in last_applied metadata
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -93,4 +126,10 @@ pub enum GgapError {
     Consensus(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("wrong shard for key; try shard {shard_id}")]
+    WrongShard { shard_id: ShardId, range: KeyRange },
+    #[error("shard is splitting, retry later")]
+    ShardSplitting,
+    #[error("shard not found: {0}")]
+    ShardNotFound(ShardId),
 }
