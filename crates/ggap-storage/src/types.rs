@@ -58,7 +58,7 @@ pub struct SnapshotMeta {
 /// round-trip on the node that built it, and remain available on a follower
 /// that receives and installs the snapshot.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct SnapshotContents {
+pub struct SnapshotContents {
     /// Current value per key (mirrors the `data` partition).
     pub data: Vec<(String, KvEntry)>,
     /// All retained history entries (mirrors the `history` partition),

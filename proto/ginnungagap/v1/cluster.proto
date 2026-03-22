@@ -15,10 +15,13 @@ service AdminService {
   rpc AddLearner       (AddLearnerRequest)        returns (AddLearnerResponse);
   rpc ChangeMembership (ChangeMembershipRequest)  returns (ChangeMembershipResponse);
   rpc TransferLeader   (TransferLeaderRequest)    returns (TransferLeaderResponse);
+  rpc SplitShard       (SplitShardRequest)        returns (SplitShardResponse);
+  rpc ListShards       (ListShardsRequest)        returns (ListShardsResponse);
 }
 
 message RaftMessage {
-  bytes data = 1;
+  uint64 shard_id = 1;
+  bytes data = 2;
 }
 
 message ClusterStatusRequest {}
@@ -55,4 +58,28 @@ message TransferLeaderRequest {
 message TransferLeaderResponse {
   bool ok = 1;
   string error = 2;
+}
+
+message SplitShardRequest {
+  uint64 shard_id = 1;
+  string split_key = 2;
+}
+
+message SplitShardResponse {
+  bool ok = 1;
+  uint64 new_shard_id = 2;
+  string error = 3;
+}
+
+message ListShardsRequest {}
+
+message ShardInfoProto {
+  uint64 shard_id = 1;
+  string range_start = 2;
+  string range_end = 3;
+  string state = 4;
+}
+
+message ListShardsResponse {
+  repeated ShardInfoProto shards = 1;
 }

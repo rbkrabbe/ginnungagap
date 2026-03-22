@@ -64,6 +64,11 @@ impl OpenRaftNode {
             node_id,
         }
     }
+
+    /// Access the underlying Raft instance (e.g. for ensure_linearizable).
+    pub fn raft(&self) -> &Arc<GgapRaft> {
+        &self.raft
+    }
 }
 
 impl RaftNode for OpenRaftNode {

@@ -759,6 +759,186 @@ impl StateMachineStore for FjallStateMachine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Split helpers on FjallStateMachine
+// ---------------------------------------------------------------------------
+
+impl FjallStateMachine {
+    /// Build a snapshot containing only keys `>= split_key` within the shard.
+    /// Used during range splitting to extract the upper half of a shard.
+    pub async fn build_partial_snapshot(
+        &self,
+        shard_id: ShardId,
+        split_key: &str,
+    ) -> Result<SnapshotContents, GgapError> {
+        let store = self.store.clone();
+        let split_key = split_key.to_string();
+        tokio::task::spawn_blocking(move || -> Result<SnapshotContents, GgapError> {
+            let start = data_key(shard_id, &split_key);
+            let shard_end = data_shard_end(shard_id).to_vec();
+
+            let data: Vec<(String, KvEntry)> = store
+                .data
+                .range(start..shard_end.clone())
+                .map(|g| {
+                    g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
+                        let user_key = String::from_utf8(k[8..].to_vec())
+                            .map_err(|e| GgapError::Storage(e.to_string()))?;
+                        Ok((user_key, decode::<KvEntry>(&v)?))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            // History: scan entire shard and filter by user key >= split_key
+            let shard_start = shard_id.to_be_bytes().to_vec();
+            let history: Vec<((String, u64), KvEntry)> = store
+                .history
+                .range(shard_start..shard_end)
+                .map(|g| {
+                    g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
+                        let raw = &k[8..];
+                        let null_pos = raw.iter().position(|&b| b == 0).ok_or_else(|| {
+                            GgapError::Storage("malformed history key: missing null byte".into())
+                        })?;
+                        let user_key = String::from_utf8(raw[..null_pos].to_vec())
+                            .map_err(|e| GgapError::Storage(e.to_string()))?;
+                        let version = u64::from_be_bytes(
+                            raw[null_pos + 1..null_pos + 9].try_into().map_err(|_| {
+                                GgapError::Storage("malformed history key: short version".into())
+                            })?,
+                        );
+                        Ok(((user_key, version), decode::<KvEntry>(&v)?))
+                    })
+                })
+                .filter(|r| match r {
+                    Ok(((ref user_key, _), _)) => user_key.as_str() >= split_key.as_str(),
+                    Err(_) => true, // propagate errors
+                })
+                .collect::<Result<_, _>>()?;
+
+            Ok(SnapshotContents { data, history })
+        })
+        .await
+        .map_err(|e| GgapError::Storage(e.to_string()))?
+    }
+
+    /// Install a partial snapshot into a new shard, writing keys with the
+    /// new shard_id prefix. Also copies TTL index entries.
+    pub async fn install_partial_snapshot(
+        &self,
+        new_shard_id: ShardId,
+        contents: &SnapshotContents,
+    ) -> Result<(), GgapError> {
+        let store = self.store.clone();
+        let data = contents.data.clone();
+        let history = contents.history.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
+            let mut batch = store.db.batch();
+            for (user_key, entry) in &data {
+                batch.insert(
+                    &store.data,
+                    data_key(new_shard_id, user_key),
+                    encode(entry)?,
+                );
+                if let Some(expires_at_ns) = entry.expires_at_ns {
+                    batch.insert(
+                        &store.ttl_index,
+                        ttl_index_key(new_shard_id, expires_at_ns, user_key),
+                        Vec::new(),
+                    );
+                }
+            }
+            for ((user_key, version), entry) in &history {
+                batch.insert(
+                    &store.history,
+                    history_key(new_shard_id, user_key, *version),
+                    encode(entry)?,
+                );
+            }
+            batch.commit().map_err(fjall_err)
+        })
+        .await
+        .map_err(|e| GgapError::Storage(e.to_string()))?
+    }
+
+    /// Delete all keys `>= from_key` from a shard's data, history, and
+    /// ttl_index partitions. Used after a split to remove the upper half
+    /// from the source shard.
+    pub async fn delete_range_from(
+        &self,
+        shard_id: ShardId,
+        from_key: &str,
+    ) -> Result<(), GgapError> {
+        let store = self.store.clone();
+        let from_key = from_key.to_string();
+        tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
+            let start = data_key(shard_id, &from_key);
+            let shard_end = data_shard_end(shard_id).to_vec();
+
+            // Collect data keys to delete
+            let data_keys: Vec<Vec<u8>> = store
+                .data
+                .range(start..shard_end.clone())
+                .map(|g| g.into_inner().map(|(k, _)| k.to_vec()).map_err(fjall_err))
+                .collect::<Result<_, _>>()?;
+
+            // Collect history keys to delete (filter by user key)
+            let shard_start = shard_id.to_be_bytes().to_vec();
+            let history_keys: Vec<Vec<u8>> = store
+                .history
+                .range(shard_start.clone()..shard_end.clone())
+                .filter_map(|g| match g.into_inner().map_err(fjall_err) {
+                    Ok((k, _)) => {
+                        let raw = &k[8..];
+                        if let Some(null_pos) = raw.iter().position(|&b| b == 0) {
+                            let user_key_bytes = &raw[..null_pos];
+                            if user_key_bytes >= from_key.as_bytes() {
+                                return Some(Ok(k.to_vec()));
+                            }
+                        }
+                        None
+                    }
+                    Err(e) => Some(Err(e)),
+                })
+                .collect::<Result<_, _>>()?;
+
+            // Collect TTL index keys to delete (filter by user key)
+            let ttl_keys: Vec<Vec<u8>> = store
+                .ttl_index
+                .range(shard_start..shard_end)
+                .filter_map(|g| {
+                    match g.into_inner().map_err(fjall_err) {
+                        Ok((k, _)) => {
+                            // TTL key: shard(8) ++ expires_at_ns(8) ++ key_utf8
+                            let user_key_bytes = &k[16..];
+                            if user_key_bytes >= from_key.as_bytes() {
+                                Some(Ok(k.to_vec()))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                })
+                .collect::<Result<_, _>>()?;
+
+            let mut batch = store.db.batch();
+            for k in data_keys {
+                batch.remove(&store.data, k);
+            }
+            for k in history_keys {
+                batch.remove(&store.history, k);
+            }
+            for k in ttl_keys {
+                batch.remove(&store.ttl_index, k);
+            }
+            batch.commit().map_err(fjall_err)
+        })
+        .await
+        .map_err(|e| GgapError::Storage(e.to_string()))?
+    }
+}
+
 /// Compact history for `key`: if there are more than `max_history` versions,
 /// delete the oldest ones. The prefix iterator returns versions in ascending
 /// order (big-endian u64), so the first entries are the oldest.

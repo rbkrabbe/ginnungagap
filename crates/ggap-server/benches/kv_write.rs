@@ -4,10 +4,6 @@
 //! then drives Put RPCs through the KV gRPC service with UUID keys and
 //! 1–2 KB random values.
 //!
-//! Leader redirects (Code::Unavailable + ggap-leader-addr header) are
-//! followed automatically, so the measurement is not sensitive to the
-//! rare leader changes that may occur under heavy load.
-//!
 //! Run with:
 //!   cargo bench -p ggap-server --bench kv_write
 
@@ -25,31 +21,23 @@ use uuid::Uuid;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode,
+    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{kv_service_client::KvServiceClient, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener};
 use ggap_storage::fjall::{FjallStateMachine, FjallStore};
+use ggap_storage::ShardMap;
 
 // ---------------------------------------------------------------------------
 // Tuning knobs
 // ---------------------------------------------------------------------------
 
 const TOTAL_WRITES: usize = 1_000_000;
-
-/// Maximum number of in-flight gRPC calls. HTTP/2 multiplexes them over
-/// a single connection.
 const CONCURRENCY: usize = 512;
-
-/// Conservative timeouts — keeps the leader stable under write pressure.
-/// (heartbeat, election_min, election_max) in milliseconds.
 const HEARTBEAT_MS: u64 = 500;
 const ELECTION_MIN_MS: u64 = 1_500;
 const ELECTION_MAX_MS: u64 = 3_000;
-
-/// Pre-generated random buffer; value slices are cut from it.
 const RAND_BUF_SIZE: usize = 4 * 1024 * 1024;
-
 const REPORT_INTERVAL: usize = 100_000;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +61,7 @@ async fn start_node(id: u64) -> BenchNode {
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     let cfg = build_raft_config(HEARTBEAT_MS, ELECTION_MIN_MS, ELECTION_MAX_MS);
     let raft = Arc::new(
-        GgapRaft::new(id, cfg, GgapNetworkFactory, log_store, sm)
+        GgapRaft::new(id, cfg, GgapNetworkFactory::new(0), log_store, sm)
             .await
             .unwrap_or_else(|e| panic!("node {id} init: {e}")),
     );
@@ -83,21 +71,40 @@ async fn start_node(id: u64) -> BenchNode {
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_addr = client_listener.local_addr().unwrap();
 
-    let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
     let raft_node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, id));
+    let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
+
+    let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
+    shard_map.initialize_default().await.unwrap();
+    let router = Arc::new(ShardRouter::new(shard_map.clone()));
+    router.add_shard(0, raft_node, cluster).await;
+
+    let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
+        router: router.clone(),
+        shard_map: shard_map.clone(),
+        store,
+        fsm,
+        node_id: id,
+        cluster_addr: cluster_addr.to_string(),
+        heartbeat_ms: HEARTBEAT_MS,
+        election_min_ms: ELECTION_MIN_MS,
+        election_max_ms: ELECTION_MAX_MS,
+    }));
 
     let mut handles = Vec::new();
 
-    let c = cluster.clone();
+    let r = router.clone();
+    let sc = split_coordinator.clone();
+    let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, c).await {
+        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2).await {
             eprintln!("node {id} cluster: {e}");
         }
     }));
 
-    let n = raft_node.clone();
+    let r = router.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_client_with_listener(client_listener, n, id).await {
+        if let Err(e) = serve_client_with_listener(client_listener, r, id).await {
             eprintln!("node {id} client: {e}");
         }
     }));
@@ -186,7 +193,6 @@ async fn connect(addr: SocketAddr) -> KvServiceClient<tonic::transport::Channel>
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    // ── Cluster setup ─────────────────────────────────────────────────────
     eprint!("Starting 3-node cluster … ");
     let cluster = BenchCluster::start(3).await;
     let leader_idx = cluster.wait_for_leader().await;
@@ -196,7 +202,6 @@ async fn main() {
         cluster.nodes[leader_idx].id, leader_addr
     );
 
-    // Snapshot of (raft, client_addr) pairs for leader re-discovery on redirect.
     let nodes_info: Arc<Vec<(Arc<GgapRaft>, SocketAddr)>> = Arc::new(
         cluster
             .nodes
@@ -205,24 +210,19 @@ async fn main() {
             .collect(),
     );
 
-    // Shared gRPC client — swapped out whenever a leader redirect is received.
     let shared_client: Arc<RwLock<KvServiceClient<tonic::transport::Channel>>> =
         Arc::new(RwLock::new(connect(leader_addr).await));
 
-    // ── Random value buffer ────────────────────────────────────────────────
     let rand_buf: Arc<Vec<u8>> =
         Arc::new((0..RAND_BUF_SIZE).map(|_| rand::random::<u8>()).collect());
 
-    // ── Benchmark ─────────────────────────────────────────────────────────
     eprintln!("\nWriting {TOTAL_WRITES} keys ({CONCURRENCY} in-flight, 1–2 KB values) …\n");
     let start = Instant::now();
 
     let stream = futures::stream::iter(0..TOTAL_WRITES)
         .map(|i| {
-            // Generate key / value parameters synchronously to avoid Send
-            // issues with thread-local RNGs inside async blocks.
             let key = Uuid::new_v4().to_string();
-            let value_len = 1024 + rand::random::<u64>() as usize % 1025; // [1024, 2048]
+            let value_len = 1024 + rand::random::<u64>() as usize % 1025;
             let offset = rand::random::<u64>() as usize % (RAND_BUF_SIZE - value_len + 1);
 
             let shared_client = shared_client.clone();
@@ -243,21 +243,17 @@ async fn main() {
                     {
                         Ok(_) => return,
                         Err(status) if status.code() == tonic::Code::Unavailable => {
-                            // The server returned NotLeader. Follow the hint
-                            // (ggap-leader-addr header) or poll cluster metrics.
                             let new_addr = status
                                 .metadata()
                                 .get("ggap-leader-addr")
                                 .and_then(|v| v.to_str().ok())
                                 .and_then(|s| s.parse::<SocketAddr>().ok());
 
-                            // Back off briefly so the new leader can stabilise.
                             tokio::time::sleep(Duration::from_millis(200)).await;
 
                             let addr = match new_addr {
                                 Some(a) => a,
                                 None => {
-                                    // No hint — scan raft metrics directly.
                                     let deadline = Instant::now() + Duration::from_secs(5);
                                     loop {
                                         let found = nodes_info.iter().find_map(|(raft, addr)| {
@@ -303,7 +299,6 @@ async fn main() {
 
     let elapsed = start.elapsed();
     let wps = TOTAL_WRITES as f64 / elapsed.as_secs_f64();
-    // Average value size ≈ 1.5 KB
     let mbs = TOTAL_WRITES as f64 * 1536.0 / (1u64 << 20) as f64 / elapsed.as_secs_f64();
 
     println!("\n── Results ────────────────────────────────────────────────");

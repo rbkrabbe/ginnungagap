@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ggap-types     = { path = "../ggap-types" }
 ggap-consensus = { path = "../ggap-consensus" }
+ggap-storage   = { path = "../ggap-storage" }
 ggap-proto     = { path = "../ggap-proto" }
 tonic             = { workspace = true }
 tonic-reflection  = { workspace = true }

@@ -3,6 +3,8 @@ pub mod convert;
 pub mod log_store;
 pub mod network;
 pub mod node;
+pub mod router;
+pub mod split;
 pub mod state_machine;
 
 use std::collections::BTreeMap;
@@ -21,6 +23,8 @@ pub use config::{build_raft_config, GgapTypeConfig};
 pub use log_store::GgapLogStorage;
 pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
+pub use router::ShardRouter;
+pub use split::{SplitCoordinator, SplitCoordinatorConfig};
 pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};
 
 // ---------------------------------------------------------------------------
