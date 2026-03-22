@@ -288,13 +288,10 @@ impl StateMachineStore for MemStateMachine {
             }
         };
 
-        match membership_bytes {
-            Some(bytes) => {
-                // For simplicity, we ignore membership_bytes in this in-memory implementation.
-                // In a real implementation, you would deserialize and apply the membership change here.
-                let _ = bytes;
-            }
-            None => {}
+        if let Some(bytes) = membership_bytes {
+            // For simplicity, we ignore membership_bytes in this in-memory implementation.
+            // In a real implementation, you would deserialize and apply the membership change here.
+            let _ = bytes;
         }
 
         g.last_applied = Some(log_id);
@@ -361,10 +358,7 @@ impl StateMachineStore for MemStateMachine {
                 .collect(),
         };
 
-        let last_applied = match g.last_applied {
-            Some(b) => Some(b),
-            None => None,
-        };
+        let last_applied = g.last_applied;
 
         Ok(Snapshot {
             meta: SnapshotMeta {

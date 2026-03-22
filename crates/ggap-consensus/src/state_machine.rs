@@ -2,7 +2,6 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use ggap_storage::fjall::FjallStateMachine;
-use ggap_storage::fjall::FjallStore;
 use ggap_storage::traits::StateMachineStore;
 use ggap_types::{GgapError, KvResponse, ShardId};
 use openraft::storage::RaftStateMachine;
@@ -52,10 +51,7 @@ impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
             .last_applied(shard_id)
             .await
             .map_err(|e| sto_err(e.to_string()))?;
-        let log_id = match last_applied.0 {
-            None => None,
-            Some(id) => Some(log_id_to_or_log_id(id)),
-        };
+        let log_id = last_applied.0.map(log_id_to_or_log_id);
         let membership = match last_applied.1 {
             Some(bytes) => decode::<StoredMembership<u64, BasicNode>>(&bytes)
                 .map_err(|e| sto_err(e.to_string()))?,
@@ -148,14 +144,11 @@ impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
         let shard_id = self.shard_id;
         let bytes = snapshot.into_inner();
 
-        let last_log_id = match meta.last_log_id {
-            None => None,
-            Some(id) => Some(convert::or_log_id_to_log_id(id)),
-        };
+        let last_log_id = meta.last_log_id.map(convert::or_log_id_to_log_id);
 
         let our_snap = ggap_storage::types::Snapshot {
             meta: ggap_storage::types::SnapshotMeta {
-                last_log_id: last_log_id,
+                last_log_id,
                 membership_bytes: encode(&meta.last_membership)
                     .map_err(|e| sto_err(e.to_string()))?,
                 snapshot_id: meta.snapshot_id.clone(),

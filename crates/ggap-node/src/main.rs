@@ -39,6 +39,7 @@ struct Cli {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct StorageConfig {
     data_dir: String,
     max_key_bytes: usize,
@@ -48,6 +49,7 @@ struct StorageConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RaftConfig {
     heartbeat_interval_ms: u64,
     election_timeout_min_ms: u64,
@@ -56,6 +58,7 @@ struct RaftConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ConsistencyConfig {
     default_read_mode: String,
     default_write_quorum: String,
@@ -64,12 +67,14 @@ struct ConsistencyConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ServerConfig {
     watch_broadcast_capacity: usize,
     request_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ObservabilityConfig {
     log_level: String,
     log_format: String,
@@ -78,6 +83,7 @@ struct ObservabilityConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Config {
     storage: StorageConfig,
     raft: RaftConfig,

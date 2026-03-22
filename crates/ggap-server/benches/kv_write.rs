@@ -291,7 +291,7 @@ async fn main() {
     let mut done = 0usize;
     while let Some(()) = stream.next().await {
         done += 1;
-        if done % REPORT_INTERVAL == 0 {
+        if done.is_multiple_of(REPORT_INTERVAL) {
             let secs = start.elapsed().as_secs_f64();
             eprintln!(
                 "  {:>9} / {TOTAL_WRITES}  {:.0} writes/s",

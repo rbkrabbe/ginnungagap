@@ -317,14 +317,11 @@ impl StateMachineStore for FjallStateMachine {
                     None => None,
                 };
 
-                let membership_bytes = match store
+                let membership_bytes = store
                     .meta
                     .get(meta_key(shard_id, "membership"))
                     .map_err(fjall_err)?
-                {
-                    Some(b) => Some(b.to_vec()),
-                    None => None,
-                };
+                    .map(|b| b.to_vec());
                 Ok((last_applied, membership_bytes))
             },
         )
@@ -508,11 +505,8 @@ impl StateMachineStore for FjallStateMachine {
                 }
                 None => {
                     let mut batch = store.db.batch();
-                    match membership_bytes {
-                        Some(bytes) => {
-                            batch.insert(&store.meta, meta_key(shard_id, "membership"), bytes);
-                        }
-                        None => {}
+                    if let Some(bytes) = membership_bytes {
+                        batch.insert(&store.meta, meta_key(shard_id, "membership"), bytes);
                     }
                     batch.insert(
                         &store.meta,
@@ -743,15 +737,12 @@ impl StateMachineStore for FjallStateMachine {
                     encode(entry)?,
                 );
             }
-            match snapshot.meta.last_log_id {
-                Some(log_id) => {
-                    batch.insert(
-                        &store.meta,
-                        meta_key(shard_id, "last_applied"),
-                        encode(&log_id)?,
-                    );
-                }
-                None => {}
+            if let Some(log_id) = snapshot.meta.last_log_id {
+                batch.insert(
+                    &store.meta,
+                    meta_key(shard_id, "last_applied"),
+                    encode(&log_id)?,
+                );
             }
 
             if !snapshot.meta.membership_bytes.is_empty() {
@@ -1370,17 +1361,17 @@ mod tests {
         .await
         .unwrap();
 
-        let v1 = sm.get(0, "k1".into(), 1).await.unwrap().unwrap();
-        let v2 = sm.get(0, "k1".into(), 2).await.unwrap().unwrap();
+        let v1 = sm.get(0, "k1", 1).await.unwrap().unwrap();
+        let v2 = sm.get(0, "k1", 2).await.unwrap().unwrap();
         assert_eq!(v1.value, vec![1u8]);
         assert_eq!(v2.value, vec![2u8]);
 
         let snap = sm.build_snapshot(0).await.unwrap();
         sm.install_snapshot(0, snap).await.unwrap();
 
-        let v0_post = sm.get(0, "k1".into(), 0).await.unwrap().unwrap();
-        let v1_post = sm.get(0, "k1".into(), 1).await.unwrap().unwrap();
-        let v2_post = sm.get(0, "k1".into(), 2).await.unwrap().unwrap();
+        let v0_post = sm.get(0, "k1", 0).await.unwrap().unwrap();
+        let v1_post = sm.get(0, "k1", 1).await.unwrap().unwrap();
+        let v2_post = sm.get(0, "k1", 2).await.unwrap().unwrap();
         assert_eq!(v0_post.value, vec![2u8]);
         assert_eq!(v1_post.value, vec![1u8]);
         assert_eq!(v2_post.value, vec![2u8]);
