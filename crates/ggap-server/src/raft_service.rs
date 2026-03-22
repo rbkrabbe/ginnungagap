@@ -23,14 +23,15 @@ impl<CN: ClusterNode> RaftService for RaftServiceImpl<CN> {
         request: Request<RaftMessage>,
     ) -> Result<Response<RaftMessage>, Status> {
         let payload = request.into_inner().data;
-        let out = self.cluster.append_entries(payload).await.map_err(ggap_to_status)?;
+        let out = self
+            .cluster
+            .append_entries(payload)
+            .await
+            .map_err(ggap_to_status)?;
         Ok(Response::new(RaftMessage { data: out }))
     }
 
-    async fn vote(
-        &self,
-        request: Request<RaftMessage>,
-    ) -> Result<Response<RaftMessage>, Status> {
+    async fn vote(&self, request: Request<RaftMessage>) -> Result<Response<RaftMessage>, Status> {
         let payload = request.into_inner().data;
         let out = self.cluster.vote(payload).await.map_err(ggap_to_status)?;
         Ok(Response::new(RaftMessage { data: out }))

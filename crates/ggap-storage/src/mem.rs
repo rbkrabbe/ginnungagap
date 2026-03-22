@@ -75,7 +75,11 @@ impl LogStorage for MemLogStorage {
         })
     }
 
-    async fn get_entry(&self, _shard_id: ShardId, index: u64) -> Result<Option<LogEntry>, GgapError> {
+    async fn get_entry(
+        &self,
+        _shard_id: ShardId,
+        index: u64,
+    ) -> Result<Option<LogEntry>, GgapError> {
         Ok(self.inner.read().await.entries.get(&index).cloned())
     }
 
@@ -160,7 +164,10 @@ impl Default for MemStateMachine {
 }
 
 impl StateMachineStore for MemStateMachine {
-    async fn last_applied(&self, _shard_id: ShardId) -> Result<(Option<LogId>, Option<Vec<u8>>), GgapError> {
+    async fn last_applied(
+        &self,
+        _shard_id: ShardId,
+    ) -> Result<(Option<LogId>, Option<Vec<u8>>), GgapError> {
         Ok((self.inner.read().await.last_applied, None))
     }
 
@@ -175,7 +182,12 @@ impl StateMachineStore for MemStateMachine {
         let now = now_ns();
 
         let response = match cmd {
-            Some(KvCommand::Put { key, value, ttl_ns, expect_version }) => {
+            Some(KvCommand::Put {
+                key,
+                value,
+                ttl_ns,
+                expect_version,
+            }) => {
                 let current_ver = g.data.get(&key).map(|e| e.version).unwrap_or(0);
                 if expect_version != 0 && current_ver != expect_version {
                     return Err(GgapError::VersionConflict {
@@ -213,18 +225,28 @@ impl StateMachineStore for MemStateMachine {
                     }
                 }
 
-                KvResponse::Written { version: log_id.index }
+                KvResponse::Written {
+                    version: log_id.index,
+                }
             }
 
-            Some(KvCommand::Delete { key })=> {
+            Some(KvCommand::Delete { key }) => {
                 let found = g.data.remove(&key).is_some();
                 // History entries are preserved so MVCC reads at old versions still work.
                 KvResponse::Deleted { found }
             }
 
-            Some(KvCommand::Cas { key, expected, new_value, ttl_ns })=> {
+            Some(KvCommand::Cas {
+                key,
+                expected,
+                new_value,
+                ttl_ns,
+            }) => {
                 let current = g.data.get(&key).cloned();
-                let matches = current.as_ref().map(|e| e.value == expected).unwrap_or(false);
+                let matches = current
+                    .as_ref()
+                    .map(|e| e.value == expected)
+                    .unwrap_or(false);
                 if matches {
                     let created_at_ns = current.as_ref().unwrap().created_at_ns;
                     let entry = KvEntry {
@@ -255,7 +277,10 @@ impl StateMachineStore for MemStateMachine {
                         }
                     }
                 }
-                KvResponse::CasResult { success: matches, current }
+                KvResponse::CasResult {
+                    success: matches,
+                    current,
+                }
             }
             None => {
                 // Raft-internal entry (Blank, Membership). No state change; return NoOp.
@@ -317,7 +342,11 @@ impl StateMachineStore for MemStateMachine {
 
         let has_more = raw.len() > effective_limit;
         let mut entries = raw;
-        let continuation = if has_more { entries.pop().map(|e| e.key) } else { None };
+        let continuation = if has_more {
+            entries.pop().map(|e| e.key)
+        } else {
+            None
+        };
         Ok((entries, continuation))
     }
 
@@ -325,14 +354,17 @@ impl StateMachineStore for MemStateMachine {
         let g = self.inner.read().await;
         let contents = SnapshotContents {
             data: g.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            history: g.history.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            history: g
+                .history
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
 
-        let last_applied = match g.last_applied
-            {
-                Some(b) => Some(b),
-                None => None,
-            };
+        let last_applied = match g.last_applied {
+            Some(b) => Some(b),
+            None => None,
+        };
 
         Ok(Snapshot {
             meta: SnapshotMeta {
@@ -368,7 +400,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_entry(index: u64, term: u64) -> LogEntry {
-        LogEntry { index, term, payload: LogPayload::Blank }
+        LogEntry {
+            index,
+            term,
+            payload: LogPayload::Blank,
+        }
     }
 
     #[tokio::test]
@@ -384,7 +420,10 @@ mod tests {
 
         // Append entries 1..=3
         store
-            .append(shard, vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)])
+            .append(
+                shard,
+                vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)],
+            )
             .await
             .unwrap();
 
@@ -419,7 +458,11 @@ mod tests {
 
         assert!(store.read_vote(shard).await.unwrap().is_none());
 
-        let vote = Vote { term: 5, voted_for: Some(3), committed: false };
+        let vote = Vote {
+            term: 5,
+            voted_for: Some(3),
+            committed: false,
+        };
         store.save_vote(shard, vote.clone()).await.unwrap();
 
         let loaded = store.read_vote(shard).await.unwrap().unwrap();
@@ -436,10 +479,25 @@ mod tests {
         let sm = MemStateMachine::new();
         let shard = 0;
 
-        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
-        sm.apply(shard, log_id, KvCommand::Put {
-            key: "k".into(), value: b"v1".to_vec(), ttl_ns: None, expect_version: 0,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            KvCommand::Put {
+                key: "k".into(),
+                value: b"v1".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
 
         let entry = sm.get(shard, "k", 0).await.unwrap().unwrap();
         assert_eq!(entry.value, b"v1");
@@ -452,13 +510,25 @@ mod tests {
         let shard = 0;
 
         for i in 1u64..=3 {
-            let log_id = LogId { index: i, term: 1, leader_id: 1 };
-            sm.apply(shard, log_id, KvCommand::Put {
-                key: "k".into(),
-                value: format!("v{i}").into_bytes(),
-                ttl_ns: None,
-                expect_version: 0,
-            }.into(), None).await.unwrap();
+            let log_id = LogId {
+                index: i,
+                term: 1,
+                leader_id: 1,
+            };
+            sm.apply(
+                shard,
+                log_id,
+                KvCommand::Put {
+                    key: "k".into(),
+                    value: format!("v{i}").into_bytes(),
+                    ttl_ns: None,
+                    expect_version: 0,
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // Latest
@@ -479,19 +549,35 @@ mod tests {
 
         // Write MAX_HISTORY + 1 versions — oldest should be evicted.
         for i in 1u64..=(MAX_HISTORY as u64 + 1) {
-            let log_id = LogId { index: i, term: 1, leader_id: 1 };
-            sm.apply(shard, log_id, KvCommand::Put {
-                key: "k".into(),
-                value: i.to_be_bytes().to_vec(),
-                ttl_ns: None,
-                expect_version: 0,
-            }.into(), None).await.unwrap();
+            let log_id = LogId {
+                index: i,
+                term: 1,
+                leader_id: 1,
+            };
+            sm.apply(
+                shard,
+                log_id,
+                KvCommand::Put {
+                    key: "k".into(),
+                    value: i.to_be_bytes().to_vec(),
+                    ttl_ns: None,
+                    expect_version: 0,
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // Version 1 should be gone (compacted).
         assert!(sm.get(shard, "k", 1).await.unwrap().is_none());
         // Version MAX_HISTORY + 1 should still be there.
-        assert!(sm.get(shard, "k", MAX_HISTORY as u64 + 1).await.unwrap().is_some());
+        assert!(sm
+            .get(shard, "k", MAX_HISTORY as u64 + 1)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -499,13 +585,39 @@ mod tests {
         let sm = MemStateMachine::new();
         let shard = 0;
 
-        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
-        sm.apply(shard, log_id, KvCommand::Put {
-            key: "k".into(), value: b"v".to_vec(), ttl_ns: None, expect_version: 0,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            KvCommand::Put {
+                key: "k".into(),
+                value: b"v".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
 
-        let log_id = LogId { index: 2, term: 1, leader_id: 1 };
-        sm.apply(shard, log_id, KvCommand::Delete { key: "k".into() }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 2,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            KvCommand::Delete { key: "k".into() }.into(),
+            None,
+        )
+        .await
+        .unwrap();
 
         // Latest read returns None (deleted).
         assert!(sm.get(shard, "k", 0).await.unwrap().is_none());
@@ -518,29 +630,70 @@ mod tests {
         let sm = MemStateMachine::new();
         let shard = 0;
 
-        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
-        sm.apply(shard, log_id, KvCommand::Put {
-            key: "k".into(), value: b"old".to_vec(), ttl_ns: None, expect_version: 0,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            KvCommand::Put {
+                key: "k".into(),
+                value: b"old".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
 
         // CAS success
-        let log_id = LogId { index: 2, term: 1, leader_id: 1 };
-        let resp = sm.apply(shard, log_id, KvCommand::Cas {
-            key: "k".into(),
-            expected: b"old".to_vec(),
-            new_value: b"new".to_vec(),
-            ttl_ns: None,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 2,
+            term: 1,
+            leader_id: 1,
+        };
+        let resp = sm
+            .apply(
+                shard,
+                log_id,
+                KvCommand::Cas {
+                    key: "k".into(),
+                    expected: b"old".to_vec(),
+                    new_value: b"new".to_vec(),
+                    ttl_ns: None,
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(matches!(resp, KvResponse::CasResult { success: true, .. }));
 
         // CAS failure (wrong expected value)
-        let log_id = LogId { index: 3, term: 1, leader_id: 1 };
-        let resp = sm.apply(shard, log_id, KvCommand::Cas {
-            key: "k".into(),
-            expected: b"old".to_vec(),
-            new_value: b"other".to_vec(),
-            ttl_ns: None,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 3,
+            term: 1,
+            leader_id: 1,
+        };
+        let resp = sm
+            .apply(
+                shard,
+                log_id,
+                KvCommand::Cas {
+                    key: "k".into(),
+                    expected: b"old".to_vec(),
+                    new_value: b"other".to_vec(),
+                    ttl_ns: None,
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(matches!(resp, KvResponse::CasResult { success: false, .. }));
     }
 
@@ -550,13 +703,25 @@ mod tests {
         let shard = 0;
 
         for i in 0u64..10 {
-            let log_id = LogId { index: i + 1, term: 1, leader_id: 1 };
-            sm.apply(shard, log_id, KvCommand::Put {
-                key: format!("key{i:02}"),
-                value: vec![i as u8],
-                ttl_ns: None,
-                expect_version: 0,
-            }.into(), None).await.unwrap();
+            let log_id = LogId {
+                index: i + 1,
+                term: 1,
+                leader_id: 1,
+            };
+            sm.apply(
+                shard,
+                log_id,
+                KvCommand::Put {
+                    key: format!("key{i:02}"),
+                    value: vec![i as u8],
+                    ttl_ns: None,
+                    expect_version: 0,
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // First page: limit=5
@@ -576,15 +741,45 @@ mod tests {
         let sm = MemStateMachine::new();
         let shard = 0;
 
-        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
-        sm.apply(shard, log_id, KvCommand::Put {
-            key: "a".into(), value: b"1".to_vec(), ttl_ns: None, expect_version: 0,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            KvCommand::Put {
+                key: "a".into(),
+                value: b"1".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
 
-        let log_id = LogId { index: 2, term: 1, leader_id: 1 };
-        sm.apply(shard, log_id, KvCommand::Put {
-            key: "b".into(), value: b"2".to_vec(), ttl_ns: None, expect_version: 0,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 2,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            KvCommand::Put {
+                key: "b".into(),
+                value: b"2".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
 
         let snapshot = sm.build_snapshot(shard).await.unwrap();
         assert_eq!(snapshot.meta.last_log_id, Some(log_id));
@@ -603,20 +798,53 @@ mod tests {
         let sm = MemStateMachine::new();
         let shard = 0;
 
-        let log_id = LogId { index: 1, term: 1, leader_id: 1 };
-        sm.apply(shard, log_id, KvCommand::Put {
-            key: "k".into(), value: b"v".to_vec(), ttl_ns: None, expect_version: 0,
-        }.into(), None).await.unwrap();
+        let log_id = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            KvCommand::Put {
+                key: "k".into(),
+                value: b"v".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
 
+        let log_id = LogId {
+            index: 2,
+            term: 1,
+            leader_id: 1,
+        };
+        let err = sm
+            .apply(
+                shard,
+                log_id,
+                KvCommand::Put {
+                    key: "k".into(),
+                    value: b"v2".to_vec(),
+                    ttl_ns: None,
+                    expect_version: 999, // wrong version
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap_err();
 
-        let log_id = LogId { index: 2, term: 1, leader_id: 1 };
-        let err = sm.apply(shard, log_id, KvCommand::Put {
-            key: "k".into(),
-            value: b"v2".to_vec(),
-            ttl_ns: None,
-            expect_version: 999, // wrong version
-        }.into(), None).await.unwrap_err();
-
-        assert!(matches!(err, GgapError::VersionConflict { expected: 999, actual: 1 }));
+        assert!(matches!(
+            err,
+            GgapError::VersionConflict {
+                expected: 999,
+                actual: 1
+            }
+        ));
     }
 }

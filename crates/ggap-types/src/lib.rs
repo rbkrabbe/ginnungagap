@@ -43,12 +43,22 @@ pub enum KvCommand {
 /// Responses returned from state machine apply
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum KvResponse {
-    Written { version: u64 },
-    Deleted { found: bool },
-    CasResult { success: bool, current: Option<KvEntry> },
+    Written {
+        version: u64,
+    },
+    Deleted {
+        found: bool,
+    },
+    CasResult {
+        success: bool,
+        current: Option<KvEntry>,
+    },
     /// Conditional Put whose expect_version didn't match. Returned to the
     /// client as Status::aborted; never a fatal storage error.
-    Conflict { expected: u64, actual: u64 },
+    Conflict {
+        expected: u64,
+        actual: u64,
+    },
     /// Returned for Raft-internal entries (Blank, Membership).
     /// Never sent to clients; guarded by unreachable!() in ggap-server.
     NoOp,

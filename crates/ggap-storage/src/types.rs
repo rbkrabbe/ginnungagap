@@ -46,7 +46,7 @@ pub struct LogState {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotMeta {
     pub last_log_id: Option<LogId>,
-    pub membership_bytes: Vec<u8>, 
+    pub membership_bytes: Vec<u8>,
     /// UUID v4 string identifying this snapshot.
     pub snapshot_id: String,
 }

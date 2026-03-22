@@ -21,7 +21,10 @@ impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
     type Network = GgapNetwork;
 
     async fn new_client(&mut self, _target_id: u64, node: &BasicNode) -> GgapNetwork {
-        GgapNetwork { addr: node.addr.clone(), channel: None }
+        GgapNetwork {
+            addr: node.addr.clone(),
+            channel: None,
+        }
     }
 }
 

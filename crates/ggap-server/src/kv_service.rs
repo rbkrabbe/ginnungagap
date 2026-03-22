@@ -27,10 +27,7 @@ impl<R: RaftNode> KvServiceImpl<R> {
 
 #[tonic::async_trait]
 impl<R: RaftNode> KvService for KvServiceImpl<R> {
-    async fn get(
-        &self,
-        request: Request<GetRequest>,
-    ) -> Result<Response<GetResponse>, Status> {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
@@ -51,10 +48,7 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
         }
     }
 
-    async fn put(
-        &self,
-        request: Request<PutRequest>,
-    ) -> Result<Response<PutResponse>, Status> {
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
@@ -77,9 +71,9 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
                 header: Some(stub_header(self.node_id)),
                 new_version: version,
             })),
-            ggap_types::KvResponse::Conflict { expected, actual } => Err(Status::aborted(
-                format!("version conflict: expected {expected}, got {actual}"),
-            )),
+            ggap_types::KvResponse::Conflict { expected, actual } => Err(Status::aborted(format!(
+                "version conflict: expected {expected}, got {actual}"
+            ))),
             ggap_types::KvResponse::NoOp => unreachable!("Put returned NoOp"),
             _ => Err(Status::internal("unexpected response variant")),
         }
@@ -106,10 +100,7 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
         }
     }
 
-    async fn scan(
-        &self,
-        request: Request<ScanRequest>,
-    ) -> Result<Response<ScanResponse>, Status> {
+    async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
         let req = request.into_inner();
         // page_token bytes are the UTF-8 continuation key from the previous page.
         let start_key = if req.page_token.is_empty() {
@@ -126,9 +117,7 @@ impl<R: RaftNode> KvService for KvServiceImpl<R> {
             .map_err(ggap_to_status)?;
 
         let kvs = entries.into_iter().map(kv_entry_to_proto).collect();
-        let next_page_token = continuation
-            .map(|k| k.into_bytes())
-            .unwrap_or_default();
+        let next_page_token = continuation.map(|k| k.into_bytes()).unwrap_or_default();
 
         Ok(Response::new(ScanResponse {
             header: Some(stub_header(self.node_id)),
