@@ -887,20 +887,18 @@ impl FjallStateMachine {
             let history_keys: Vec<Vec<u8>> = store
                 .history
                 .range(shard_start.clone()..shard_end.clone())
-                .filter_map(|g| {
-                    match g.into_inner().map_err(fjall_err) {
-                        Ok((k, _)) => {
-                            let raw = &k[8..];
-                            if let Some(null_pos) = raw.iter().position(|&b| b == 0) {
-                                let user_key_bytes = &raw[..null_pos];
-                                if user_key_bytes >= from_key.as_bytes() {
-                                    return Some(Ok(k.to_vec()));
-                                }
+                .filter_map(|g| match g.into_inner().map_err(fjall_err) {
+                    Ok((k, _)) => {
+                        let raw = &k[8..];
+                        if let Some(null_pos) = raw.iter().position(|&b| b == 0) {
+                            let user_key_bytes = &raw[..null_pos];
+                            if user_key_bytes >= from_key.as_bytes() {
+                                return Some(Ok(k.to_vec()));
                             }
-                            None
                         }
-                        Err(e) => Some(Err(e)),
+                        None
                     }
+                    Err(e) => Some(Err(e)),
                 })
                 .collect::<Result<_, _>>()?;
 

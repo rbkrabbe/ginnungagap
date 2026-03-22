@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator,
+    OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener};
 use ggap_storage::fjall::{FjallStateMachine, FjallStore};
@@ -71,17 +71,17 @@ async fn start_node(id: u64) -> TestNode {
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
     router.add_shard(0, raft_node.clone(), cluster).await;
 
-    let split_coordinator = Arc::new(SplitCoordinator::new(
-        router.clone(),
-        shard_map.clone(),
+    let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
+        router: router.clone(),
+        shard_map: shard_map.clone(),
         store,
-        fsm.clone(),
-        id,
-        cluster_addr.to_string(),
-        50,
-        150,
-        300,
-    ));
+        fsm: fsm.clone(),
+        node_id: id,
+        cluster_addr: cluster_addr.to_string(),
+        heartbeat_ms: 50,
+        election_min_ms: 150,
+        election_max_ms: 300,
+    }));
 
     let mut handles = Vec::new();
 

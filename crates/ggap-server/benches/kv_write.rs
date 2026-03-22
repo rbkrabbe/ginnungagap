@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator,
+    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{kv_service_client::KvServiceClient, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener};
@@ -79,17 +79,17 @@ async fn start_node(id: u64) -> BenchNode {
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
     router.add_shard(0, raft_node, cluster).await;
 
-    let split_coordinator = Arc::new(SplitCoordinator::new(
-        router.clone(),
-        shard_map.clone(),
+    let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
+        router: router.clone(),
+        shard_map: shard_map.clone(),
         store,
         fsm,
-        id,
-        cluster_addr.to_string(),
-        HEARTBEAT_MS,
-        ELECTION_MIN_MS,
-        ELECTION_MAX_MS,
-    ));
+        node_id: id,
+        cluster_addr: cluster_addr.to_string(),
+        heartbeat_ms: HEARTBEAT_MS,
+        election_min_ms: ELECTION_MIN_MS,
+        election_max_ms: ELECTION_MAX_MS,
+    }));
 
     let mut handles = Vec::new();
 

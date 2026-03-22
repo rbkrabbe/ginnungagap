@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator,
+    OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_storage::fjall::{FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
@@ -64,17 +64,17 @@ async fn setup() -> TestSetup {
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
     router.add_shard(0, node, cluster).await;
 
-    let split_coordinator = Arc::new(SplitCoordinator::new(
-        router.clone(),
-        shard_map.clone(),
+    let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
+        router: router.clone(),
+        shard_map: shard_map.clone(),
         store,
-        fsm.clone(),
-        1,
-        "127.0.0.1:0".into(), // unused for single-node
-        50,
-        150,
-        300,
-    ));
+        fsm: fsm.clone(),
+        node_id: 1,
+        cluster_addr: "127.0.0.1:0".into(), // unused for single-node
+        heartbeat_ms: 50,
+        election_min_ms: 150,
+        election_max_ms: 300,
+    }));
 
     TestSetup {
         router,

@@ -33,7 +33,11 @@ impl KvService for KvServiceImpl {
             return Err(Status::invalid_argument("key must not be empty"));
         }
         let mode = proto_read_consistency(req.consistency);
-        let node = self.router.route_read(&req.key).await.map_err(ggap_to_status)?;
+        let node = self
+            .router
+            .route_read(&req.key)
+            .await
+            .map_err(ggap_to_status)?;
         let entry = node
             .read(&req.key, req.at_version, mode)
             .await
@@ -59,7 +63,11 @@ impl KvService for KvServiceImpl {
         } else {
             Some(req.ttl_secs as i64 * 1_000_000_000)
         };
-        let node = self.router.route_write(&req.key).await.map_err(ggap_to_status)?;
+        let node = self
+            .router
+            .route_write(&req.key)
+            .await
+            .map_err(ggap_to_status)?;
         let cmd = KvCommand::Put {
             key: req.key,
             value: req.value,
@@ -89,7 +97,11 @@ impl KvService for KvServiceImpl {
             return Err(Status::invalid_argument("key must not be empty"));
         }
         let mode = proto_write_quorum(req.quorum);
-        let node = self.router.route_write(&req.key).await.map_err(ggap_to_status)?;
+        let node = self
+            .router
+            .route_write(&req.key)
+            .await
+            .map_err(ggap_to_status)?;
         let cmd = KvCommand::Delete { key: req.key };
         let resp = node.propose(cmd, mode).await.map_err(ggap_to_status)?;
         match resp {
@@ -145,7 +157,11 @@ impl KvService for KvServiceImpl {
         } else {
             Some(req.ttl_secs as i64 * 1_000_000_000)
         };
-        let node = self.router.route_write(&req.key).await.map_err(ggap_to_status)?;
+        let node = self
+            .router
+            .route_write(&req.key)
+            .await
+            .map_err(ggap_to_status)?;
         let cmd = KvCommand::Cas {
             key: req.key,
             expected: req.expected_value,

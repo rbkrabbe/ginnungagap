@@ -24,7 +24,7 @@ pub use log_store::GgapLogStorage;
 pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
 pub use router::ShardRouter;
-pub use split::SplitCoordinator;
+pub use split::{SplitCoordinator, SplitCoordinatorConfig};
 pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};
 
 // ---------------------------------------------------------------------------

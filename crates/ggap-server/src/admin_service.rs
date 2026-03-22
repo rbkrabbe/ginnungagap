@@ -3,9 +3,9 @@ use std::sync::Arc;
 use ggap_consensus::SplitCoordinator;
 use ggap_proto::v1::{
     admin_service_server::AdminService, AddLearnerRequest, AddLearnerResponse,
-    ChangeMembershipRequest, ChangeMembershipResponse, ClusterStatusRequest,
-    ClusterStatusResponse, ListShardsRequest, ListShardsResponse, ShardInfoProto,
-    SplitShardRequest, SplitShardResponse, TransferLeaderRequest, TransferLeaderResponse,
+    ChangeMembershipRequest, ChangeMembershipResponse, ClusterStatusRequest, ClusterStatusResponse,
+    ListShardsRequest, ListShardsResponse, ShardInfoProto, SplitShardRequest, SplitShardResponse,
+    TransferLeaderRequest, TransferLeaderResponse,
 };
 use ggap_storage::ShardMap;
 use tonic::{Request, Response, Status};

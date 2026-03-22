@@ -15,6 +15,19 @@ use crate::node::{GgapRaft, OpenRaftCluster, OpenRaftNode};
 use crate::router::ShardRouter;
 use crate::state_machine::GgapStateMachine;
 
+/// Parameters needed to construct a `SplitCoordinator`.
+pub struct SplitCoordinatorConfig {
+    pub router: Arc<ShardRouter>,
+    pub shard_map: Arc<ShardMap>,
+    pub store: Arc<FjallStore>,
+    pub fsm: Arc<FjallStateMachine>,
+    pub node_id: u64,
+    pub cluster_addr: String,
+    pub heartbeat_ms: u64,
+    pub election_min_ms: u64,
+    pub election_max_ms: u64,
+}
+
 /// Coordinates the split of a shard's key range into two shards.
 ///
 /// The split protocol blocks writes on the source shard during the split
@@ -36,45 +49,30 @@ pub struct SplitCoordinator {
     fsm: Arc<FjallStateMachine>,
     node_id: u64,
     cluster_addr: String,
-    /// Raft config parameters for new shard groups.
     heartbeat_ms: u64,
     election_min_ms: u64,
     election_max_ms: u64,
 }
 
 impl SplitCoordinator {
-    pub fn new(
-        router: Arc<ShardRouter>,
-        shard_map: Arc<ShardMap>,
-        store: Arc<FjallStore>,
-        fsm: Arc<FjallStateMachine>,
-        node_id: u64,
-        cluster_addr: String,
-        heartbeat_ms: u64,
-        election_min_ms: u64,
-        election_max_ms: u64,
-    ) -> Self {
+    pub fn new(cfg: SplitCoordinatorConfig) -> Self {
         SplitCoordinator {
-            router,
-            shard_map,
-            store,
-            fsm,
-            node_id,
-            cluster_addr,
-            heartbeat_ms,
-            election_min_ms,
-            election_max_ms,
+            router: cfg.router,
+            shard_map: cfg.shard_map,
+            store: cfg.store,
+            fsm: cfg.fsm,
+            node_id: cfg.node_id,
+            cluster_addr: cfg.cluster_addr,
+            heartbeat_ms: cfg.heartbeat_ms,
+            election_min_ms: cfg.election_min_ms,
+            election_max_ms: cfg.election_max_ms,
         }
     }
 
     /// Execute a shard split at the given key.
     ///
     /// Returns the new shard id on success.
-    pub async fn split(
-        &self,
-        shard_id: ShardId,
-        split_key: &str,
-    ) -> Result<ShardId, GgapError> {
+    pub async fn split(&self, shard_id: ShardId, split_key: &str) -> Result<ShardId, GgapError> {
         // 1. Validate
         let source_info = self
             .shard_map
@@ -110,9 +108,7 @@ impl SplitCoordinator {
         self.shard_map.put_shard(splitting_info).await?;
 
         // From here on, if we fail, we need to restore the source shard to Active.
-        let result = self
-            .do_split(shard_id, split_key, &source_info)
-            .await;
+        let result = self.do_split(shard_id, split_key, &source_info).await;
 
         match result {
             Ok(new_shard_id) => Ok(new_shard_id),
@@ -156,10 +152,7 @@ impl SplitCoordinator {
             .map_err(|e| GgapError::Consensus(format!("write barrier failed: {e}")))?;
 
         // 4. Build partial snapshot of keys >= split_key
-        let contents = self
-            .fsm
-            .build_partial_snapshot(shard_id, split_key)
-            .await?;
+        let contents = self.fsm.build_partial_snapshot(shard_id, split_key).await?;
 
         // 5. Allocate new shard id
         let new_shard_id = self.shard_map.next_shard_id().await;
@@ -196,12 +189,18 @@ impl SplitCoordinator {
         let log_store = GgapLogStorage::new(self.store.clone(), new_shard_id);
         let sm = GgapStateMachine::new(self.fsm.clone(), new_shard_id);
         let net = GgapNetworkFactory::new(new_shard_id);
-        let cfg = build_raft_config(self.heartbeat_ms, self.election_min_ms, self.election_max_ms);
+        let cfg = build_raft_config(
+            self.heartbeat_ms,
+            self.election_min_ms,
+            self.election_max_ms,
+        );
 
         let raft = Arc::new(
             GgapRaft::new(self.node_id, cfg, net, log_store, sm)
                 .await
-                .map_err(|e| GgapError::Consensus(format!("failed to create Raft for new shard: {e}")))?,
+                .map_err(|e| {
+                    GgapError::Consensus(format!("failed to create Raft for new shard: {e}"))
+                })?,
         );
 
         // Initialize as single-node cluster
@@ -212,9 +211,9 @@ impl SplitCoordinator {
                 addr: self.cluster_addr.clone(),
             },
         );
-        raft.initialize(members)
-            .await
-            .map_err(|e| GgapError::Consensus(format!("failed to initialize new shard Raft: {e}")))?;
+        raft.initialize(members).await.map_err(|e| {
+            GgapError::Consensus(format!("failed to initialize new shard Raft: {e}"))
+        })?;
 
         // Wait for the new shard to become leader
         raft.wait(Some(Duration::from_secs(5)))

@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator,
+    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster};
 use ggap_storage::{
@@ -156,9 +156,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to open FjallStore at {}", data_dir.display()))?;
 
     // 2. Load or initialize ShardMap.
-    let shard_map = Arc::new(
-        ShardMap::load(store.clone()).context("failed to load shard map")?,
-    );
+    let shard_map = Arc::new(ShardMap::load(store.clone()).context("failed to load shard map")?);
     shard_map
         .initialize_default()
         .await
@@ -232,17 +230,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 6. Create the SplitCoordinator.
-    let split_coordinator = Arc::new(SplitCoordinator::new(
-        router.clone(),
-        shard_map.clone(),
-        store.clone(),
-        fsm.clone(),
-        cli.node_id,
-        cluster_addr.to_string(),
-        config.raft.heartbeat_interval_ms,
-        config.raft.election_timeout_min_ms,
-        config.raft.election_timeout_max_ms,
-    ));
+    let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
+        router: router.clone(),
+        shard_map: shard_map.clone(),
+        store: store.clone(),
+        fsm: fsm.clone(),
+        node_id: cli.node_id,
+        cluster_addr: cluster_addr.to_string(),
+        heartbeat_ms: config.raft.heartbeat_interval_ms,
+        election_min_ms: config.raft.election_timeout_min_ms,
+        election_max_ms: config.raft.election_timeout_max_ms,
+    }));
 
     // 7. Serve.
     tokio::try_join!(

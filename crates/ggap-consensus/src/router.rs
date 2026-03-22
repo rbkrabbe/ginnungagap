@@ -48,11 +48,10 @@ impl ShardRouter {
 
     /// Look up the RaftNode for a read operation on the given key.
     pub async fn route_read(&self, key: &str) -> Result<Arc<OpenRaftNode>, GgapError> {
-        let info = self
-            .shard_map
-            .lookup_shard(key)
-            .await
-            .ok_or_else(|| GgapError::InvalidArgument(format!("no shard found for key '{key}'")))?;
+        let info =
+            self.shard_map.lookup_shard(key).await.ok_or_else(|| {
+                GgapError::InvalidArgument(format!("no shard found for key '{key}'"))
+            })?;
 
         let nodes = self.nodes.read().await;
         nodes
@@ -67,11 +66,10 @@ impl ShardRouter {
     /// Look up the RaftNode for a write operation on the given key.
     /// Returns `ShardSplitting` if the shard is currently being split.
     pub async fn route_write(&self, key: &str) -> Result<Arc<OpenRaftNode>, GgapError> {
-        let info = self
-            .shard_map
-            .lookup_shard(key)
-            .await
-            .ok_or_else(|| GgapError::InvalidArgument(format!("no shard found for key '{key}'")))?;
+        let info =
+            self.shard_map.lookup_shard(key).await.ok_or_else(|| {
+                GgapError::InvalidArgument(format!("no shard found for key '{key}'"))
+            })?;
 
         if info.state == ShardState::Splitting {
             return Err(GgapError::ShardSplitting);
@@ -94,9 +92,13 @@ impl ShardRouter {
         start_key: &str,
         end_key: &str,
     ) -> Result<Arc<OpenRaftNode>, GgapError> {
-        let info = self.shard_map.lookup_shard(start_key).await.ok_or_else(|| {
-            GgapError::InvalidArgument(format!("no shard found for key '{start_key}'"))
-        })?;
+        let info = self
+            .shard_map
+            .lookup_shard(start_key)
+            .await
+            .ok_or_else(|| {
+                GgapError::InvalidArgument(format!("no shard found for key '{start_key}'"))
+            })?;
 
         // If end_key is specified and falls outside this shard's range, reject
         if !end_key.is_empty() && !info.range.contains(end_key) {

@@ -62,11 +62,10 @@ impl RaftService for RaftServiceImpl {
 
         while let Some(msg) = stream.message().await? {
             shard_id = msg.shard_id;
-            let cluster = self
-                .router
-                .get_cluster(msg.shard_id)
-                .await
-                .ok_or_else(|| Status::not_found(format!("shard {} not found", msg.shard_id)))?;
+            let cluster =
+                self.router.get_cluster(msg.shard_id).await.ok_or_else(|| {
+                    Status::not_found(format!("shard {} not found", msg.shard_id))
+                })?;
             let out = cluster
                 .install_snapshot(msg.data)
                 .await
