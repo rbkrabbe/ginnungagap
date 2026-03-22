@@ -84,7 +84,15 @@ async fn start_node(id: u64) -> TestNode {
         }
     }));
 
-    TestNode { id, raft, fsm, cluster_addr, raft_node, _handles: handles, _tempdir: tempdir }
+    TestNode {
+        id,
+        raft,
+        fsm,
+        cluster_addr,
+        raft_node,
+        _handles: handles,
+        _tempdir: tempdir,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +114,14 @@ impl TestCluster {
         // Build the full member map with each node's cluster address.
         let members: BTreeMap<u64, BasicNode> = nodes
             .iter()
-            .map(|n| (n.id, BasicNode { addr: n.cluster_addr.to_string() }))
+            .map(|n| {
+                (
+                    n.id,
+                    BasicNode {
+                        addr: n.cluster_addr.to_string(),
+                    },
+                )
+            })
             .collect();
 
         // Only one node calls initialize(); the others learn about the cluster
@@ -163,7 +178,10 @@ impl TestCluster {
     /// Gracefully shutdown all nodes and abort the server tasks.
     async fn shutdown(self) {
         for node in self.nodes {
-            node.raft.shutdown().await.unwrap_or_else(|e| eprintln!("shutdown: {e}"));
+            node.raft
+                .shutdown()
+                .await
+                .unwrap_or_else(|e| eprintln!("shutdown: {e}"));
             for h in node._handles {
                 h.abort();
             }
@@ -195,7 +213,11 @@ async fn three_node_leader_election_and_basic_ops() {
         .await
         .unwrap();
     let applied_index = resp.log_id().index;
-    assert!(matches!(resp.data, KvResponse::Written { .. }), "got {:?}", resp.data);
+    assert!(
+        matches!(resp.data, KvResponse::Written { .. }),
+        "got {:?}",
+        resp.data
+    );
 
     // Wait for all followers to catch up.
     cluster.wait_for_all_applied(applied_index).await;
@@ -270,7 +292,11 @@ async fn three_node_leader_failover() {
         })
         .await
         .unwrap();
-    assert!(matches!(resp.data, KvResponse::Written { .. }), "got {:?}", resp.data);
+    assert!(
+        matches!(resp.data, KvResponse::Written { .. }),
+        "got {:?}",
+        resp.data
+    );
     let post_index = resp.log_id().index;
     cluster.wait_for_all_applied(post_index).await;
 

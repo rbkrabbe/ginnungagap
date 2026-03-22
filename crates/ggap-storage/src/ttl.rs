@@ -34,7 +34,11 @@ impl TtlGcTask {
         shard_id: ShardId,
         cmd_tx: tokio::sync::mpsc::Sender<KvCommand>,
     ) -> Self {
-        TtlGcTask { store, shard_id, cmd_tx }
+        TtlGcTask {
+            store,
+            shard_id,
+            cmd_tx,
+        }
     }
 
     /// Run the GC loop until the channel is closed or the task is cancelled.
@@ -64,9 +68,8 @@ impl TtlGcTask {
                                 if k.len() < 16 {
                                     return Ok(None);
                                 }
-                                let expires_at_ns = i64::from_be_bytes(
-                                    k[8..16].try_into().expect("16 byte key"),
-                                );
+                                let expires_at_ns =
+                                    i64::from_be_bytes(k[8..16].try_into().expect("16 byte key"));
                                 let user_key = String::from_utf8_lossy(&k[16..]).to_string();
                                 Ok(Some((expires_at_ns, user_key, k.to_vec())))
                             }
@@ -104,8 +107,8 @@ impl TtlGcTask {
 
                     // Eagerly remove the TTL index entry to avoid re-firing.
                     let store = self.store.store.clone();
-                    let _ = tokio::task::spawn_blocking(move || store.ttl_index.remove(raw_key))
-                        .await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || store.ttl_index.remove(raw_key)).await;
                 }
             }
         }

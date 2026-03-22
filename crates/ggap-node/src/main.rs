@@ -14,11 +14,11 @@ use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode,
 };
+use ggap_server::{serve_client, serve_cluster};
 use ggap_storage::{
     fjall::{FjallStateMachine, FjallStore},
     ttl::TtlGcTask,
 };
-use ggap_server::{serve_client, serve_cluster};
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "ggap-node", about = "Ginnungagap KV node")]
@@ -39,6 +39,7 @@ struct Cli {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct StorageConfig {
     data_dir: String,
     max_key_bytes: usize,
@@ -48,6 +49,7 @@ struct StorageConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RaftConfig {
     heartbeat_interval_ms: u64,
     election_timeout_min_ms: u64,
@@ -56,6 +58,7 @@ struct RaftConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ConsistencyConfig {
     default_read_mode: String,
     default_write_quorum: String,
@@ -64,12 +67,14 @@ struct ConsistencyConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ServerConfig {
     watch_broadcast_capacity: usize,
     request_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ObservabilityConfig {
     log_level: String,
     log_format: String,
@@ -78,6 +83,7 @@ struct ObservabilityConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Config {
     storage: StorageConfig,
     raft: RaftConfig,
@@ -91,8 +97,8 @@ async fn main() -> anyhow::Result<()> {
     use clap::Parser;
     let cli = Cli::parse();
 
-    let mut figment = Figment::new()
-        .merge(Toml::string(include_str!("../../../config/default.toml")));
+    let mut figment =
+        Figment::new().merge(Toml::string(include_str!("../../../config/default.toml")));
 
     if let Some(ref config_path) = cli.config {
         figment = figment.merge(Toml::file_exact(config_path));
@@ -151,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     // 2. Create FSM and log store.
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
     let log_store = GgapLogStorage::new(store.clone(), 0);
-    let sm = GgapStateMachine::new(fsm.clone(),  0);
+    let sm = GgapStateMachine::new(fsm.clone(), 0);
 
     // 3. Build Raft config from file config.
     let raft_cfg = build_raft_config(
@@ -169,11 +175,17 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 5. Initialize as single-node cluster on first boot.
-    if !raft.is_initialized().await.context("raft.is_initialized failed")? {
+    if !raft
+        .is_initialized()
+        .await
+        .context("raft.is_initialized failed")?
+    {
         let mut members = BTreeMap::new();
         members.insert(
             cli.node_id,
-            BasicNode { addr: cluster_addr.to_string() },
+            BasicNode {
+                addr: cluster_addr.to_string(),
+            },
         );
         raft.initialize(members)
             .await

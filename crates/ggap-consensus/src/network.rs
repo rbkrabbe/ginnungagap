@@ -21,7 +21,10 @@ impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
     type Network = GgapNetwork;
 
     async fn new_client(&mut self, _target_id: u64, node: &BasicNode) -> GgapNetwork {
-        GgapNetwork { addr: node.addr.clone(), channel: None }
+        GgapNetwork {
+            addr: node.addr.clone(),
+            channel: None,
+        }
     }
 }
 
@@ -69,6 +72,7 @@ impl GgapNetwork {
     }
 }
 
+#[allow(clippy::result_large_err)]
 impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
     async fn append_entries(
         &mut self,

@@ -19,7 +19,7 @@ use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, W
 
 pub use config::{build_raft_config, GgapTypeConfig};
 pub use log_store::GgapLogStorage;
-pub use network::{GgapNetworkFactory, GgapNetwork};
+pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
 pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};
 
@@ -97,7 +97,12 @@ impl RaftNode for StubRaftNode {
         let mut g = self.inner.write().await;
         let now = now_ns();
         match cmd {
-            KvCommand::Put { key, value, ttl_ns, expect_version } => {
+            KvCommand::Put {
+                key,
+                value,
+                ttl_ns,
+                expect_version,
+            } => {
                 let current_ver = g.data.get(&key).map(|e| e.version).unwrap_or(0);
                 if expect_version != 0 && current_ver != expect_version {
                     return Err(GgapError::VersionConflict {
@@ -121,12 +126,20 @@ impl RaftNode for StubRaftNode {
                 );
                 Ok(KvResponse::Written { version })
             }
-            KvCommand::Delete { key } => {
-                Ok(KvResponse::Deleted { found: g.data.remove(&key).is_some() })
-            }
-            KvCommand::Cas { key, expected, new_value, ttl_ns } => {
+            KvCommand::Delete { key } => Ok(KvResponse::Deleted {
+                found: g.data.remove(&key).is_some(),
+            }),
+            KvCommand::Cas {
+                key,
+                expected,
+                new_value,
+                ttl_ns,
+            } => {
                 let current = g.data.get(&key).cloned();
-                let matches = current.as_ref().map(|e| e.value == expected).unwrap_or(false);
+                let matches = current
+                    .as_ref()
+                    .map(|e| e.value == expected)
+                    .unwrap_or(false);
                 if matches {
                     let version = g.next_version;
                     g.next_version += 1;
@@ -143,7 +156,10 @@ impl RaftNode for StubRaftNode {
                         },
                     );
                 }
-                Ok(KvResponse::CasResult { success: matches, current })
+                Ok(KvResponse::CasResult {
+                    success: matches,
+                    current,
+                })
             }
         }
     }
@@ -182,7 +198,11 @@ impl RaftNode for StubRaftNode {
         };
         let has_more = raw.len() > effective_limit;
         let mut entries = raw;
-        let continuation = if has_more { entries.pop().map(|e| e.key) } else { None };
+        let continuation = if has_more {
+            entries.pop().map(|e| e.key)
+        } else {
+            None
+        };
         Ok((entries, continuation))
     }
 }
@@ -196,8 +216,8 @@ fn now_ns() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
     use super::*;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_stub_raft_node() {
@@ -205,25 +225,71 @@ mod tests {
         assert_eq!(node.shard_id(), 0);
 
         // Test Put
-        let resp = node.propose(KvCommand::Put { key: "foo".into(), value: "bar".into(), ttl_ns: None, expect_version: 0 }, WriteMode::Majority).await.unwrap();
+        let resp = node
+            .propose(
+                KvCommand::Put {
+                    key: "foo".into(),
+                    value: "bar".into(),
+                    ttl_ns: None,
+                    expect_version: 0,
+                },
+                WriteMode::Majority,
+            )
+            .await
+            .unwrap();
         assert!(matches!(resp, KvResponse::Written { version: 1 }));
 
         // Test Read
-        let entry = node.read("foo", 0, ReadMode::Linearizable).await.unwrap().unwrap();
+        let entry = node
+            .read("foo", 0, ReadMode::Linearizable)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.key, "foo");
         assert_eq!(entry.value, vec![b'b', b'a', b'r']);
         assert_eq!(entry.version, 1);
 
         // Test Cas success
-        let cas_resp = node.propose(KvCommand::Cas { key: "foo".into(), expected: "bar".into(), new_value: "baz".into(), ttl_ns: None }, WriteMode::Majority).await.unwrap();
-        assert!(matches!(cas_resp, KvResponse::CasResult { success: true, .. }));
+        let cas_resp = node
+            .propose(
+                KvCommand::Cas {
+                    key: "foo".into(),
+                    expected: "bar".into(),
+                    new_value: "baz".into(),
+                    ttl_ns: None,
+                },
+                WriteMode::Majority,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            cas_resp,
+            KvResponse::CasResult { success: true, .. }
+        ));
 
         // Test Cas failure
-        let cas_fail_resp = node.propose(KvCommand::Cas { key: "foo".into(), expected: "bar".into(), new_value: "qux".into(), ttl_ns: None }, WriteMode::Majority).await.unwrap();
-        assert!(matches!(cas_fail_resp, KvResponse::CasResult { success: false, .. }));
+        let cas_fail_resp = node
+            .propose(
+                KvCommand::Cas {
+                    key: "foo".into(),
+                    expected: "bar".into(),
+                    new_value: "qux".into(),
+                    ttl_ns: None,
+                },
+                WriteMode::Majority,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            cas_fail_resp,
+            KvResponse::CasResult { success: false, .. }
+        ));
 
         // Test Delete
-        let del_resp = node.propose(KvCommand::Delete { key: "foo".into() }, WriteMode::Majority).await.unwrap();
+        let del_resp = node
+            .propose(KvCommand::Delete { key: "foo".into() }, WriteMode::Majority)
+            .await
+            .unwrap();
         assert!(matches!(del_resp, KvResponse::Deleted { found: true }));
 
         // Test Read after Delete
@@ -241,8 +307,22 @@ mod tests {
             let send_clone = send.clone();
             let node_clone = node.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(rand::random::<u64>() % 100)).await;
-                let resp = node_clone.propose(KvCommand::Put { key: "foo".into(), value: "bar".into(), ttl_ns: None, expect_version: 0 }, WriteMode::Majority).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    rand::random::<u64>() % 100,
+                ))
+                .await;
+                let resp = node_clone
+                    .propose(
+                        KvCommand::Put {
+                            key: "foo".into(),
+                            value: "bar".into(),
+                            ttl_ns: None,
+                            expect_version: 0,
+                        },
+                        WriteMode::Majority,
+                    )
+                    .await
+                    .unwrap();
                 let _ = send_clone.send(resp);
             });
         }

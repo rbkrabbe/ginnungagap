@@ -102,7 +102,14 @@ async fn start_node(id: u64) -> BenchNode {
         }
     }));
 
-    BenchNode { id, raft, cluster_addr, client_addr, _tempdir: tempdir, _handles: handles }
+    BenchNode {
+        id,
+        raft,
+        cluster_addr,
+        client_addr,
+        _tempdir: tempdir,
+        _handles: handles,
+    }
 }
 
 struct BenchCluster {
@@ -117,9 +124,20 @@ impl BenchCluster {
         }
         let members: BTreeMap<u64, BasicNode> = nodes
             .iter()
-            .map(|n| (n.id, BasicNode { addr: n.cluster_addr.to_string() }))
+            .map(|n| {
+                (
+                    n.id,
+                    BasicNode {
+                        addr: n.cluster_addr.to_string(),
+                    },
+                )
+            })
             .collect();
-        nodes[0].raft.initialize(members).await.expect("cluster init failed");
+        nodes[0]
+            .raft
+            .initialize(members)
+            .await
+            .expect("cluster init failed");
         Self { nodes }
     }
 
@@ -138,7 +156,10 @@ impl BenchCluster {
 
     async fn shutdown(self) {
         for node in self.nodes {
-            node.raft.shutdown().await.unwrap_or_else(|e| eprintln!("shutdown: {e}"));
+            node.raft
+                .shutdown()
+                .await
+                .unwrap_or_else(|e| eprintln!("shutdown: {e}"));
             for h in node._handles {
                 h.abort();
             }
@@ -170,11 +191,18 @@ async fn main() {
     let cluster = BenchCluster::start(3).await;
     let leader_idx = cluster.wait_for_leader().await;
     let leader_addr = cluster.nodes[leader_idx].client_addr;
-    eprintln!("leader is node {} ({})", cluster.nodes[leader_idx].id, leader_addr);
+    eprintln!(
+        "leader is node {} ({})",
+        cluster.nodes[leader_idx].id, leader_addr
+    );
 
     // Snapshot of (raft, client_addr) pairs for leader re-discovery on redirect.
     let nodes_info: Arc<Vec<(Arc<GgapRaft>, SocketAddr)>> = Arc::new(
-        cluster.nodes.iter().map(|n| (n.raft.clone(), n.client_addr)).collect(),
+        cluster
+            .nodes
+            .iter()
+            .map(|n| (n.raft.clone(), n.client_addr))
+            .collect(),
     );
 
     // Shared gRPC client — swapped out whenever a leader redirect is received.
@@ -186,9 +214,7 @@ async fn main() {
         Arc::new((0..RAND_BUF_SIZE).map(|_| rand::random::<u8>()).collect());
 
     // ── Benchmark ─────────────────────────────────────────────────────────
-    eprintln!(
-        "\nWriting {TOTAL_WRITES} keys ({CONCURRENCY} in-flight, 1–2 KB values) …\n"
-    );
+    eprintln!("\nWriting {TOTAL_WRITES} keys ({CONCURRENCY} in-flight, 1–2 KB values) …\n");
     let start = Instant::now();
 
     let stream = futures::stream::iter(0..TOTAL_WRITES)
@@ -208,7 +234,11 @@ async fn main() {
                 loop {
                     let mut client = shared_client.read().await.clone();
                     match client
-                        .put(PutRequest { key: key.clone(), value: value.clone(), ..Default::default() })
+                        .put(PutRequest {
+                            key: key.clone(),
+                            value: value.clone(),
+                            ..Default::default()
+                        })
                         .await
                     {
                         Ok(_) => return,
@@ -237,7 +267,10 @@ async fn main() {
                                         if let Some(a) = found {
                                             break a;
                                         }
-                                        assert!(Instant::now() < deadline, "write {i}: no leader after redirect");
+                                        assert!(
+                                            Instant::now() < deadline,
+                                            "write {i}: no leader after redirect"
+                                        );
                                         tokio::time::sleep(Duration::from_millis(100)).await;
                                     }
                                 }
@@ -258,9 +291,13 @@ async fn main() {
     let mut done = 0usize;
     while let Some(()) = stream.next().await {
         done += 1;
-        if done % REPORT_INTERVAL == 0 {
+        if done.is_multiple_of(REPORT_INTERVAL) {
             let secs = start.elapsed().as_secs_f64();
-            eprintln!("  {:>9} / {TOTAL_WRITES}  {:.0} writes/s", done, done as f64 / secs);
+            eprintln!(
+                "  {:>9} / {TOTAL_WRITES}  {:.0} writes/s",
+                done,
+                done as f64 / secs
+            );
         }
     }
 

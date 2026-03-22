@@ -57,7 +57,12 @@ impl OpenRaftNode {
         shard_id: ShardId,
         node_id: u64,
     ) -> Self {
-        OpenRaftNode { raft, fsm, shard_id, node_id }
+        OpenRaftNode {
+            raft,
+            fsm,
+            shard_id,
+            node_id,
+        }
     }
 }
 
@@ -74,11 +79,10 @@ impl RaftNode for OpenRaftNode {
             .map_err(|e| {
                 // Check if it's a ForwardToLeader error.
                 if let Some(fwd) = e.forward_to_leader() {
-                    let leader_addr = fwd
-                        .leader_node
-                        .as_ref()
-                        .map(|n: &BasicNode| n.addr.clone());
-                    return GgapError::NotLeader { leader: leader_addr };
+                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                    return GgapError::NotLeader {
+                        leader: leader_addr,
+                    };
                 }
                 GgapError::Consensus(e.to_string())
             })
@@ -112,7 +116,9 @@ impl RaftNode for OpenRaftNode {
                 .await
                 .map_err(|e| GgapError::Consensus(e.to_string()))?;
         }
-        self.fsm.scan(self.shard_id, start_key, end_key, limit).await
+        self.fsm
+            .scan(self.shard_id, start_key, end_key, limit)
+            .await
     }
 }
 
@@ -152,8 +158,7 @@ impl ClusterNode for OpenRaftCluster {
     }
 
     async fn install_snapshot(&self, payload: Vec<u8>) -> Result<Vec<u8>, GgapError> {
-        let req =
-            decode::<openraft::raft::InstallSnapshotRequest<GgapTypeConfig>>(&payload)?;
+        let req = decode::<openraft::raft::InstallSnapshotRequest<GgapTypeConfig>>(&payload)?;
         let resp = self
             .raft
             .install_snapshot(req)
@@ -175,7 +180,10 @@ pub struct LeaseManager {
 
 impl LeaseManager {
     pub fn new(duration: tokio::time::Duration) -> Self {
-        LeaseManager { acquired_at: None, duration }
+        LeaseManager {
+            acquired_at: None,
+            duration,
+        }
     }
 
     /// Always returns `false` in Phase 4 — lease optimisation is Phase 5.
