@@ -79,6 +79,10 @@ grpcurl -plaintext \
 
 Configuration is layered: embedded defaults → TOML file → `GINNUNGAGAP_*` env vars → CLI flags. See [`config/default.toml`](config/default.toml) for all knobs.
 
+## CI
+
+The repository uses a GitHub Actions pipeline that runs `cargo check`, `cargo clippy`, and `cargo test` on every pull request.
+
 ## License
 
 MIT
