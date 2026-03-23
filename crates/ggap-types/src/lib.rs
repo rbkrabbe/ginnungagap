@@ -1,5 +1,23 @@
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 pub type NodeId = u64;
 pub type ShardId = u64;
+
+/// Injectable clock for wall-clock timestamps (nanoseconds since Unix epoch).
+/// Use the default `system_now_fn()` in production. In deterministic simulation
+/// tests (Phase 6), inject a mock that returns controlled time.
+pub type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Returns a `NowFn` backed by `SystemTime::now()`.
+pub fn system_now_fn() -> NowFn {
+    Arc::new(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64
+    })
+}
 
 /// Key range owned by a shard: [start, end). Empty end means unbounded.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

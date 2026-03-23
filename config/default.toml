@@ -15,7 +15,7 @@ snapshot_threshold      = 50000
 default_read_mode    = "linearizable"
 default_write_quorum = "majority"
 lease_enabled        = true
-lease_duration_ms    = 4000
+lease_duration_ms    = 300
 
 [server]
 watch_broadcast_capacity = 1024

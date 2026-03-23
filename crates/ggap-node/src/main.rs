@@ -14,7 +14,9 @@ use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
-use ggap_server::{serve_client, serve_cluster};
+use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
+use tokio_util::sync::CancellationToken;
+
 use ggap_storage::{
     fjall::{FjallStateMachine, FjallStore},
     ttl::TtlGcTask,
@@ -110,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
         .extract()
         .context("failed to load configuration")?;
 
+    validate_config(&config)?;
+
     let log_format = config.observability.log_format.as_str();
     match log_format {
         "json" => {
@@ -169,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
 
     // 5. Start a Raft group for each shard in the ShardMap.
+    let shutdown = CancellationToken::new();
     let shards = shard_map.all_shards().await;
     let raft_cfg = build_raft_config(
         config.raft.heartbeat_interval_ms,
@@ -218,11 +223,13 @@ async fn main() -> anyhow::Result<()> {
 
         // Spawn TTL GC task for this shard.
         let (ttl_tx, mut ttl_rx) = tokio::sync::mpsc::channel(256);
-        tokio::spawn(TtlGcTask::new(fsm.clone(), shard_id, ttl_tx).run());
+        tokio::spawn(TtlGcTask::new(fsm.clone(), shard_id, ttl_tx, shutdown.child_token()).run());
         let raft2 = raft.clone();
         tokio::spawn(async move {
             while let Some(cmd) = ttl_rx.recv().await {
-                let _ = raft2.client_write(cmd).await;
+                if let Err(e) = raft2.client_write(cmd).await {
+                    tracing::warn!(shard_id, error = %e, "TTL GC delete failed via Raft");
+                }
             }
         });
 
@@ -242,11 +249,68 @@ async fn main() -> anyhow::Result<()> {
         election_max_ms: config.raft.election_timeout_max_ms,
     }));
 
-    // 7. Serve.
+    // 7. Serve with graceful shutdown on SIGINT / SIGTERM.
+    let kv_config = KvServiceConfig {
+        max_key_bytes: config.storage.max_key_bytes,
+        max_value_bytes: config.storage.max_value_bytes,
+    };
+
+    let shutdown_trigger = shutdown.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM");
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+        }
+        tracing::info!("shutdown signal received, draining...");
+        shutdown_trigger.cancel();
+    });
+
     tokio::try_join!(
-        serve_client(client_addr, router.clone(), cli.node_id),
+        serve_client(client_addr, router.clone(), cli.node_id, kv_config),
         serve_cluster(cluster_addr, router, split_coordinator, shard_map),
     )?;
 
+    Ok(())
+}
+
+fn validate_config(config: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.storage.max_key_bytes > 0,
+        "max_key_bytes must be > 0"
+    );
+    anyhow::ensure!(
+        config.storage.max_value_bytes > 0,
+        "max_value_bytes must be > 0"
+    );
+    anyhow::ensure!(
+        config.raft.heartbeat_interval_ms < config.raft.election_timeout_min_ms,
+        "heartbeat_interval_ms ({}) must be < election_timeout_min_ms ({})",
+        config.raft.heartbeat_interval_ms,
+        config.raft.election_timeout_min_ms
+    );
+    anyhow::ensure!(
+        config.raft.election_timeout_min_ms < config.raft.election_timeout_max_ms,
+        "election_timeout_min_ms ({}) must be < election_timeout_max_ms ({})",
+        config.raft.election_timeout_min_ms,
+        config.raft.election_timeout_max_ms
+    );
+    if config.consistency.lease_enabled {
+        anyhow::ensure!(
+            config.consistency.lease_duration_ms < config.raft.election_timeout_min_ms,
+            "lease_duration_ms ({}) must be < election_timeout_min_ms ({}) when leases are enabled",
+            config.consistency.lease_duration_ms,
+            config.raft.election_timeout_min_ms
+        );
+    }
     Ok(())
 }

@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, LogId, ShardId};
+use ggap_types::{system_now_fn, GgapError, KvCommand, KvEntry, KvResponse, LogId, NowFn, ShardId};
+use tracing::warn;
 
 use crate::keys::{
     data_key, data_shard_end, history_key, history_prefix, meta_key, raft_log_key, ttl_index_key,
@@ -12,13 +12,6 @@ use crate::types::{LogEntry, LogState, Snapshot, SnapshotContents, SnapshotMeta,
 
 /// Maximum MVCC history versions retained per key before compaction.
 pub const DEFAULT_MAX_HISTORY: u64 = 10;
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64
-}
 
 fn encode<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, GgapError> {
     bincode::serde::encode_to_vec(val, bincode::config::standard())
@@ -282,6 +275,7 @@ impl LogStorage for FjallLogStorage {
 pub struct FjallStateMachine {
     pub(crate) store: Arc<FjallStore>,
     max_history_versions: u64,
+    now_fn: NowFn,
 }
 
 impl FjallStateMachine {
@@ -289,6 +283,7 @@ impl FjallStateMachine {
         FjallStateMachine {
             store,
             max_history_versions: DEFAULT_MAX_HISTORY,
+            now_fn: system_now_fn(),
         }
     }
 
@@ -296,7 +291,13 @@ impl FjallStateMachine {
         FjallStateMachine {
             store,
             max_history_versions,
+            now_fn: system_now_fn(),
         }
+    }
+
+    pub fn with_clock(mut self, now_fn: NowFn) -> Self {
+        self.now_fn = now_fn;
+        self
     }
 }
 
@@ -338,8 +339,9 @@ impl StateMachineStore for FjallStateMachine {
     ) -> Result<KvResponse, GgapError> {
         let store = self.store.clone();
         let max_history = self.max_history_versions;
+        let now_fn = self.now_fn.clone();
         tokio::task::spawn_blocking(move || -> Result<KvResponse, GgapError> {
-            let now = now_ns();
+            let now = now_fn();
             match cmd {
                 Some(KvCommand::Put {
                     key,
@@ -400,7 +402,9 @@ impl StateMachineStore for FjallStateMachine {
                     );
                     batch.commit().map_err(fjall_err)?;
 
-                    compact_history(&store, shard_id, &key, max_history)?;
+                    if let Err(e) = compact_history(&store, shard_id, &key, max_history) {
+                        warn!(key = %key, error = %e, "history compaction failed after committed write");
+                    }
                     Ok(KvResponse::Written {
                         version: log_id.index,
                     })
@@ -489,13 +493,26 @@ impl StateMachineStore for FjallStateMachine {
                             encode(&log_id)?,
                         );
                         batch.commit().map_err(fjall_err)?;
-                        compact_history(&store, shard_id, &key, max_history)?;
+                        if let Err(e) = compact_history(&store, shard_id, &key, max_history) {
+                            warn!(key = %key, error = %e, "history compaction failed after committed CAS");
+                        }
                     } else {
-                        // Still advance last_applied on CAS failure.
-                        store
-                            .meta
-                            .insert(meta_key(shard_id, "last_applied"), encode(&log_id)?)
-                            .map_err(fjall_err)?;
+                        // Still advance last_applied on CAS failure — use a batch
+                        // for crash-atomicity with any concurrent membership update.
+                        let mut batch = store.db.batch();
+                        if let Some(bytes) = membership_bytes.as_ref() {
+                            batch.insert(
+                                &store.meta,
+                                meta_key(shard_id, "membership"),
+                                bytes.clone(),
+                            );
+                        }
+                        batch.insert(
+                            &store.meta,
+                            meta_key(shard_id, "last_applied"),
+                            encode(&log_id)?,
+                        );
+                        batch.commit().map_err(fjall_err)?;
                     }
 
                     Ok(KvResponse::CasResult {
@@ -746,10 +763,11 @@ impl StateMachineStore for FjallStateMachine {
             }
 
             if !snapshot.meta.membership_bytes.is_empty() {
+                // membership_bytes is already serialized — store directly, don't double-encode.
                 batch.insert(
                     &store.meta,
                     meta_key(shard_id, "membership"),
-                    encode(&snapshot.meta.membership_bytes)?,
+                    snapshot.meta.membership_bytes.clone(),
                 );
             }
             batch.commit().map_err(fjall_err)

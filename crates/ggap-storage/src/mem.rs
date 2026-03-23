@@ -1,23 +1,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
-use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, LogId, ShardId};
+use ggap_types::{system_now_fn, GgapError, KvCommand, KvEntry, KvResponse, LogId, NowFn, ShardId};
 
 use crate::traits::{LogStorage, StateMachineStore};
 use crate::types::{LogEntry, LogState, Snapshot, SnapshotContents, SnapshotMeta, Vote};
 
 /// Maximum MVCC history versions retained per key before compaction.
 const MAX_HISTORY: usize = 10;
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64
-}
 
 fn encode<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, GgapError> {
     bincode::serde::encode_to_vec(val, bincode::config::standard())
@@ -143,6 +135,7 @@ struct MemSmInner {
 /// Intended for unit tests; not persisted across restarts.
 pub struct MemStateMachine {
     inner: Arc<RwLock<MemSmInner>>,
+    now_fn: NowFn,
 }
 
 impl MemStateMachine {
@@ -153,7 +146,13 @@ impl MemStateMachine {
                 history: BTreeMap::new(),
                 last_applied: None,
             })),
+            now_fn: system_now_fn(),
         }
+    }
+
+    pub fn with_clock(mut self, now_fn: NowFn) -> Self {
+        self.now_fn = now_fn;
+        self
     }
 }
 
@@ -179,7 +178,7 @@ impl StateMachineStore for MemStateMachine {
         membership_bytes: Option<Vec<u8>>,
     ) -> Result<KvResponse, GgapError> {
         let mut g = self.inner.write().await;
-        let now = now_ns();
+        let now = (self.now_fn)();
 
         let response = match cmd {
             Some(KvCommand::Put {

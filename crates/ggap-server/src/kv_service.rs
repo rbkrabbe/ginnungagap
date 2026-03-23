@@ -14,14 +14,29 @@ use crate::convert::{
     ggap_to_status, kv_entry_to_proto, proto_read_consistency, proto_write_quorum, stub_header,
 };
 
+/// Maximum scan limit to prevent resource exhaustion from unbounded scans.
+const MAX_SCAN_LIMIT: u32 = 10_000;
+
 pub struct KvServiceImpl {
     router: Arc<ShardRouter>,
     node_id: u64,
+    max_key_bytes: usize,
+    max_value_bytes: usize,
 }
 
 impl KvServiceImpl {
-    pub fn new(router: Arc<ShardRouter>, node_id: u64) -> Self {
-        KvServiceImpl { router, node_id }
+    pub fn new(
+        router: Arc<ShardRouter>,
+        node_id: u64,
+        max_key_bytes: usize,
+        max_value_bytes: usize,
+    ) -> Self {
+        KvServiceImpl {
+            router,
+            node_id,
+            max_key_bytes,
+            max_value_bytes,
+        }
     }
 }
 
@@ -56,6 +71,18 @@ impl KvService for KvServiceImpl {
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
+        }
+        if req.key.len() > self.max_key_bytes {
+            return Err(Status::invalid_argument(format!(
+                "key exceeds maximum size of {} bytes",
+                self.max_key_bytes
+            )));
+        }
+        if req.value.len() > self.max_value_bytes {
+            return Err(Status::invalid_argument(format!(
+                "value exceeds maximum size of {} bytes",
+                self.max_value_bytes
+            )));
         }
         let mode = proto_write_quorum(req.quorum);
         let ttl_ns = if req.ttl_secs == 0 {
@@ -123,13 +150,18 @@ impl KvService for KvServiceImpl {
                 .map_err(|_| Status::invalid_argument("invalid page_token: not valid UTF-8"))?
         };
         let mode = proto_read_consistency(req.consistency);
+        let limit = if req.limit == 0 {
+            MAX_SCAN_LIMIT
+        } else {
+            req.limit.min(MAX_SCAN_LIMIT)
+        };
         let node = self
             .router
             .route_scan(&start_key, &req.end_key)
             .await
             .map_err(ggap_to_status)?;
         let (entries, continuation) = node
-            .scan(&start_key, &req.end_key, req.limit, mode)
+            .scan(&start_key, &req.end_key, limit, mode)
             .await
             .map_err(ggap_to_status)?;
 
@@ -150,6 +182,18 @@ impl KvService for KvServiceImpl {
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
+        }
+        if req.key.len() > self.max_key_bytes {
+            return Err(Status::invalid_argument(format!(
+                "key exceeds maximum size of {} bytes",
+                self.max_key_bytes
+            )));
+        }
+        if req.new_value.len() > self.max_value_bytes {
+            return Err(Status::invalid_argument(format!(
+                "value exceeds maximum size of {} bytes",
+                self.max_value_bytes
+            )));
         }
         let mode = proto_write_quorum(req.quorum);
         let ttl_ns = if req.ttl_secs == 0 {
