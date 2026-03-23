@@ -30,6 +30,19 @@ ggap-proto / ggap-types / ggap-storage / ggap-consensus / ggap-server / ggap-nod
 
 See PLAN.md § Crate Responsibilities for each crate's scope.
 
+## Pre-Push Checklist
+
+Before every `git push` or PR creation, run all of the following and fix any errors:
+
+```
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all-targets
+cargo test --all
+```
+
+CI enforces all four checks — a push that skips them will fail.
+
 ## Phase Discipline
 
 Implement in phase order (1 → 6). Do not build Phase N+1 features while Phase N is incomplete. Phase 7 (multi-raft) is explicitly deferred.
