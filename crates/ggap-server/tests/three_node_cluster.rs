@@ -21,7 +21,7 @@ use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
-use ggap_server::{serve_client_with_listener, serve_cluster_with_listener};
+use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
@@ -96,7 +96,9 @@ async fn start_node(id: u64) -> TestNode {
 
     let r = router.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_client_with_listener(client_listener, r, id).await {
+        if let Err(e) =
+            serve_client_with_listener(client_listener, r, id, KvServiceConfig::default()).await
+        {
             eprintln!("node {id} client server: {e}");
         }
     }));

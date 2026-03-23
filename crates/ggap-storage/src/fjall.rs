@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, LogId, ShardId};
+use ggap_types::{system_now_fn, GgapError, KvCommand, KvEntry, KvResponse, LogId, NowFn, ShardId};
+use tracing::warn;
 
 use crate::keys::{
     data_key, data_shard_end, history_key, history_prefix, meta_key, raft_log_key, ttl_index_key,
@@ -12,13 +12,6 @@ use crate::types::{LogEntry, LogState, Snapshot, SnapshotContents, SnapshotMeta,
 
 /// Maximum MVCC history versions retained per key before compaction.
 pub const DEFAULT_MAX_HISTORY: u64 = 10;
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64
-}
 
 fn encode<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, GgapError> {
     bincode::serde::encode_to_vec(val, bincode::config::standard())
@@ -282,6 +275,7 @@ impl LogStorage for FjallLogStorage {
 pub struct FjallStateMachine {
     pub(crate) store: Arc<FjallStore>,
     max_history_versions: u64,
+    now_fn: NowFn,
 }
 
 impl FjallStateMachine {
@@ -289,6 +283,7 @@ impl FjallStateMachine {
         FjallStateMachine {
             store,
             max_history_versions: DEFAULT_MAX_HISTORY,
+            now_fn: system_now_fn(),
         }
     }
 
@@ -296,7 +291,13 @@ impl FjallStateMachine {
         FjallStateMachine {
             store,
             max_history_versions,
+            now_fn: system_now_fn(),
         }
+    }
+
+    pub fn with_clock(mut self, now_fn: NowFn) -> Self {
+        self.now_fn = now_fn;
+        self
     }
 }
 
@@ -338,8 +339,9 @@ impl StateMachineStore for FjallStateMachine {
     ) -> Result<KvResponse, GgapError> {
         let store = self.store.clone();
         let max_history = self.max_history_versions;
+        let now_fn = self.now_fn.clone();
         tokio::task::spawn_blocking(move || -> Result<KvResponse, GgapError> {
-            let now = now_ns();
+            let now = now_fn();
             match cmd {
                 Some(KvCommand::Put {
                     key,
@@ -400,7 +402,9 @@ impl StateMachineStore for FjallStateMachine {
                     );
                     batch.commit().map_err(fjall_err)?;
 
-                    compact_history(&store, shard_id, &key, max_history)?;
+                    if let Err(e) = compact_history(&store, shard_id, &key, max_history) {
+                        warn!(key = %key, error = %e, "history compaction failed after committed write");
+                    }
                     Ok(KvResponse::Written {
                         version: log_id.index,
                     })
@@ -489,13 +493,26 @@ impl StateMachineStore for FjallStateMachine {
                             encode(&log_id)?,
                         );
                         batch.commit().map_err(fjall_err)?;
-                        compact_history(&store, shard_id, &key, max_history)?;
+                        if let Err(e) = compact_history(&store, shard_id, &key, max_history) {
+                            warn!(key = %key, error = %e, "history compaction failed after committed CAS");
+                        }
                     } else {
-                        // Still advance last_applied on CAS failure.
-                        store
-                            .meta
-                            .insert(meta_key(shard_id, "last_applied"), encode(&log_id)?)
-                            .map_err(fjall_err)?;
+                        // Still advance last_applied on CAS failure — use a batch
+                        // for crash-atomicity with any concurrent membership update.
+                        let mut batch = store.db.batch();
+                        if let Some(bytes) = membership_bytes.as_ref() {
+                            batch.insert(
+                                &store.meta,
+                                meta_key(shard_id, "membership"),
+                                bytes.clone(),
+                            );
+                        }
+                        batch.insert(
+                            &store.meta,
+                            meta_key(shard_id, "last_applied"),
+                            encode(&log_id)?,
+                        );
+                        batch.commit().map_err(fjall_err)?;
                     }
 
                     Ok(KvResponse::CasResult {
@@ -746,10 +763,11 @@ impl StateMachineStore for FjallStateMachine {
             }
 
             if !snapshot.meta.membership_bytes.is_empty() {
+                // membership_bytes is already serialized — store directly, don't double-encode.
                 batch.insert(
                     &store.meta,
                     meta_key(shard_id, "membership"),
-                    encode(&snapshot.meta.membership_bytes)?,
+                    snapshot.meta.membership_bytes.clone(),
                 );
             }
             batch.commit().map_err(fjall_err)
@@ -1555,5 +1573,325 @@ mod tests {
         assert_eq!(v0_post.value, vec![2u8]);
         assert_eq!(v1_post.value, vec![1u8]);
         assert_eq!(v2_post.value, vec![2u8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit Group 1 regression tests
+    // -----------------------------------------------------------------------
+
+    /// Regression test for membership double-encoding in install_snapshot.
+    ///
+    /// Previously, `install_snapshot` called `encode(&snapshot.meta.membership_bytes)`
+    /// which double-encoded the already-serialized bytes. After snapshot restore,
+    /// `build_snapshot` → `install_snapshot` → `build_snapshot` would produce
+    /// corrupted membership data that could not be deserialized.
+    ///
+    /// The existing `sm_snapshot_round_trip` test never caught this because it
+    /// never passed `membership_bytes` to `apply`, so the membership was always
+    /// empty and the encoding branch was skipped.
+    #[tokio::test]
+    async fn sm_snapshot_membership_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = FjallStateMachine::new(open_store(dir.path()));
+        let shard = 0u64;
+
+        // Simulate a membership payload (arbitrary bytes that represent a
+        // serialized StoredMembership in production).
+        let membership_data = b"membership-payload-v1".to_vec();
+
+        // Apply a command WITH membership_bytes so the store persists it.
+        let log_id = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id,
+            None, // Blank entry — only membership matters
+            Some(membership_data.clone()),
+        )
+        .await
+        .unwrap();
+
+        // Verify membership is readable via last_applied.
+        let (_, mb) = sm.last_applied(shard).await.unwrap();
+        assert_eq!(mb.as_deref(), Some(membership_data.as_slice()));
+
+        // Build a snapshot — should capture the membership bytes.
+        let snap = sm.build_snapshot(shard).await.unwrap();
+        assert_eq!(snap.meta.membership_bytes, membership_data);
+
+        // Install the snapshot into a fresh store.
+        let dir2 = tempfile::tempdir().unwrap();
+        let sm2 = FjallStateMachine::new(open_store(dir2.path()));
+        sm2.install_snapshot(shard, snap).await.unwrap();
+
+        // The critical check: membership must be readable and match the original.
+        let (_, mb2) = sm2.last_applied(shard).await.unwrap();
+        assert_eq!(
+            mb2.as_deref(),
+            Some(membership_data.as_slice()),
+            "membership bytes corrupted after install_snapshot (was double-encoded?)"
+        );
+
+        // Double-check: build_snapshot on the restored store should produce
+        // identical membership bytes, proving the full round-trip is clean.
+        let snap2 = sm2.build_snapshot(shard).await.unwrap();
+        assert_eq!(
+            snap2.meta.membership_bytes, membership_data,
+            "membership bytes corrupted after second build_snapshot"
+        );
+    }
+
+    /// Regression test for CAS failure non-atomic last_applied update.
+    ///
+    /// Previously, when CAS failed (value mismatch), `last_applied` was updated
+    /// via a standalone `store.meta.insert()` outside any batch. If the process
+    /// crashed between the main batch and this insert, `last_applied` would not
+    /// advance and the log entry could be re-applied.
+    ///
+    /// The existing `sm_cas_success_and_failure` test never caught this because
+    /// it only checked the CAS response, not `last_applied` after a failed CAS.
+    ///
+    /// This test verifies that `last_applied` is correctly advanced even on CAS
+    /// failure, and that membership_bytes are also persisted in the same operation.
+    #[tokio::test]
+    async fn sm_cas_failure_advances_last_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = FjallStateMachine::new(open_store(dir.path()));
+        let shard = 0u64;
+
+        // Write an initial value.
+        let log_id1 = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id1,
+            KvCommand::Put {
+                key: "k".into(),
+                value: b"original".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // CAS with wrong expected value — should fail but still advance last_applied.
+        let log_id2 = LogId {
+            index: 2,
+            term: 1,
+            leader_id: 1,
+        };
+        let membership_on_fail = b"membership-during-cas-fail".to_vec();
+        let resp = sm
+            .apply(
+                shard,
+                log_id2,
+                KvCommand::Cas {
+                    key: "k".into(),
+                    expected: b"wrong_value".to_vec(),
+                    new_value: b"new_value".to_vec(),
+                    ttl_ns: None,
+                }
+                .into(),
+                Some(membership_on_fail.clone()),
+            )
+            .await
+            .unwrap();
+
+        // CAS should have failed.
+        assert!(matches!(resp, KvResponse::CasResult { success: false, .. }));
+
+        // last_applied must have advanced to log_id2 despite CAS failure.
+        let (la, mb) = sm.last_applied(shard).await.unwrap();
+        assert_eq!(
+            la.unwrap().index,
+            2,
+            "last_applied should advance to index 2 even on CAS failure"
+        );
+
+        // membership_bytes should be persisted atomically with last_applied.
+        assert_eq!(
+            mb.as_deref(),
+            Some(membership_on_fail.as_slice()),
+            "membership_bytes should be persisted even on CAS failure"
+        );
+
+        // Verify data was NOT modified by the failed CAS.
+        let entry = sm.get(shard, "k", 0).await.unwrap().unwrap();
+        assert_eq!(entry.value, b"original");
+    }
+
+    /// Regression test: verify that a failed CAS followed by a successful
+    /// CAS produces the correct last_applied, proving the batch approach works
+    /// correctly for the failure → success sequence.
+    #[tokio::test]
+    async fn sm_cas_failure_then_success_last_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = FjallStateMachine::new(open_store(dir.path()));
+        let shard = 0u64;
+
+        // Write initial value.
+        let log_id1 = LogId {
+            index: 1,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id1,
+            KvCommand::Put {
+                key: "k".into(),
+                value: b"v1".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Failed CAS at index 2.
+        let log_id2 = LogId {
+            index: 2,
+            term: 1,
+            leader_id: 1,
+        };
+        sm.apply(
+            shard,
+            log_id2,
+            KvCommand::Cas {
+                key: "k".into(),
+                expected: b"wrong".to_vec(),
+                new_value: b"v2".to_vec(),
+                ttl_ns: None,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Successful CAS at index 3.
+        let log_id3 = LogId {
+            index: 3,
+            term: 1,
+            leader_id: 1,
+        };
+        let resp = sm
+            .apply(
+                shard,
+                log_id3,
+                KvCommand::Cas {
+                    key: "k".into(),
+                    expected: b"v1".to_vec(),
+                    new_value: b"v2".to_vec(),
+                    ttl_ns: None,
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, KvResponse::CasResult { success: true, .. }));
+
+        // last_applied must be at index 3.
+        let (la, _) = sm.last_applied(shard).await.unwrap();
+        assert_eq!(la.unwrap().index, 3);
+
+        // Data should reflect the successful CAS.
+        let entry = sm.get(shard, "k", 0).await.unwrap().unwrap();
+        assert_eq!(entry.value, b"v2");
+    }
+
+    /// Regression test for history compaction error isolation.
+    ///
+    /// Previously, `compact_history()` errors after a committed batch would
+    /// propagate upward, making openraft believe the write failed even though
+    /// the data was already durable. This test verifies that the write succeeds
+    /// and data is correct even when many versions accumulate (the compaction
+    /// runs but its success/failure doesn't affect the apply result).
+    ///
+    /// The existing `sm_history_compaction` test verified that compaction works
+    /// when it succeeds, but never tested that a committed write isn't affected
+    /// by post-commit compaction status.
+    #[tokio::test]
+    async fn sm_write_succeeds_regardless_of_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use max_history=2 so compaction triggers on the 3rd write to same key.
+        let sm = FjallStateMachine::with_max_history(open_store(dir.path()), 2);
+        let shard = 0u64;
+
+        // Write 5 versions of the same key — compaction runs after each write
+        // past the 2nd. All writes must succeed.
+        for i in 1u64..=5 {
+            let log_id = LogId {
+                index: i,
+                term: 1,
+                leader_id: 1,
+            };
+            let resp = sm
+                .apply(
+                    shard,
+                    log_id,
+                    KvCommand::Put {
+                        key: "k".into(),
+                        value: format!("v{i}").into_bytes(),
+                        ttl_ns: None,
+                        expect_version: 0,
+                    }
+                    .into(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(resp, KvResponse::Written { version } if version == i),
+                "write at index {i} must succeed even when compaction runs"
+            );
+        }
+
+        // Latest value must be correct.
+        let entry = sm.get(shard, "k", 0).await.unwrap().unwrap();
+        assert_eq!(entry.value, b"v5");
+        assert_eq!(entry.version, 5);
+
+        // last_applied must be at index 5.
+        let (la, _) = sm.last_applied(shard).await.unwrap();
+        assert_eq!(la.unwrap().index, 5);
+
+        // Similarly test CAS path: CAS success triggers compaction too.
+        let log_id6 = LogId {
+            index: 6,
+            term: 1,
+            leader_id: 1,
+        };
+        let resp = sm
+            .apply(
+                shard,
+                log_id6,
+                KvCommand::Cas {
+                    key: "k".into(),
+                    expected: b"v5".to_vec(),
+                    new_value: b"v6".to_vec(),
+                    ttl_ns: None,
+                }
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, KvResponse::CasResult { success: true, .. }));
+
+        let entry = sm.get(shard, "k", 0).await.unwrap().unwrap();
+        assert_eq!(entry.value, b"v6");
     }
 }

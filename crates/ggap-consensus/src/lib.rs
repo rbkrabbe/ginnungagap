@@ -9,11 +9,12 @@ pub mod state_machine;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
-use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, WriteMode};
+use ggap_types::{
+    system_now_fn, GgapError, KvCommand, KvEntry, KvResponse, NowFn, ReadMode, ShardId, WriteMode,
+};
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -73,6 +74,7 @@ struct StubInner {
 
 pub struct StubRaftNode {
     inner: Arc<RwLock<StubInner>>,
+    now_fn: NowFn,
 }
 
 impl StubRaftNode {
@@ -82,6 +84,7 @@ impl StubRaftNode {
                 data: BTreeMap::new(),
                 next_version: 1,
             })),
+            now_fn: system_now_fn(),
         }
     }
 }
@@ -99,7 +102,7 @@ impl RaftNode for StubRaftNode {
 
     async fn propose(&self, cmd: KvCommand, _mode: WriteMode) -> Result<KvResponse, GgapError> {
         let mut g = self.inner.write().await;
-        let now = now_ns();
+        let now = (self.now_fn)();
         match cmd {
             KvCommand::Put {
                 key,
@@ -209,13 +212,6 @@ impl RaftNode for StubRaftNode {
         };
         Ok((entries, continuation))
     }
-}
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64
 }
 
 #[cfg(test)]

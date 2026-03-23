@@ -21,10 +21,27 @@ use admin_service::AdminServiceImpl;
 use kv_service::KvServiceImpl;
 use raft_service::RaftServiceImpl;
 
+/// Configuration for the client-facing KV service.
+#[derive(Clone, Debug)]
+pub struct KvServiceConfig {
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
+}
+
+impl Default for KvServiceConfig {
+    fn default() -> Self {
+        KvServiceConfig {
+            max_key_bytes: 4096,
+            max_value_bytes: 1_048_576,
+        }
+    }
+}
+
 pub async fn serve_client(
     addr: SocketAddr,
     router: Arc<ShardRouter>,
     node_id: u64,
+    config: KvServiceConfig,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
@@ -32,7 +49,12 @@ pub async fn serve_client(
         .expect("failed to build reflection service");
     tracing::info!(%addr, "client gRPC server starting");
     tonic::transport::Server::builder()
-        .add_service(KvServiceServer::new(KvServiceImpl::new(router, node_id)))
+        .add_service(KvServiceServer::new(KvServiceImpl::new(
+            router,
+            node_id,
+            config.max_key_bytes,
+            config.max_value_bytes,
+        )))
         .add_service(reflection)
         .serve(addr)
         .await
@@ -44,13 +66,19 @@ pub async fn serve_client_with_listener(
     listener: TcpListener,
     router: Arc<ShardRouter>,
     node_id: u64,
+    config: KvServiceConfig,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
     tonic::transport::Server::builder()
-        .add_service(KvServiceServer::new(KvServiceImpl::new(router, node_id)))
+        .add_service(KvServiceServer::new(KvServiceImpl::new(
+            router,
+            node_id,
+            config.max_key_bytes,
+            config.max_value_bytes,
+        )))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await

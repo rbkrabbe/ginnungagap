@@ -92,7 +92,10 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         let payload = encode(&rpc).map_err(Self::to_net_err)?;
 
         self.connect().await.map_err(Self::to_unreachable)?;
-        let client = self.channel.as_mut().unwrap();
+        let client = self
+            .channel
+            .as_mut()
+            .ok_or_else(|| Self::to_unreachable("channel not connected after connect()"))?;
 
         let resp = client
             .append_entries(RaftMessage {
@@ -114,7 +117,10 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         let payload = encode(&rpc).map_err(Self::to_net_err)?;
 
         self.connect().await.map_err(Self::to_unreachable)?;
-        let client = self.channel.as_mut().unwrap();
+        let client = self
+            .channel
+            .as_mut()
+            .ok_or_else(|| Self::to_unreachable("channel not connected after connect()"))?;
 
         let resp = client
             .vote(RaftMessage {
@@ -144,7 +150,10 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         let stream = tokio_stream::iter(msgs);
 
         self.connect().await.map_err(Self::to_iss_unreachable)?;
-        let client = self.channel.as_mut().unwrap();
+        let client = self
+            .channel
+            .as_mut()
+            .ok_or_else(|| Self::to_iss_unreachable("channel not connected after connect()"))?;
 
         let resp = client
             .install_snapshot(stream)
