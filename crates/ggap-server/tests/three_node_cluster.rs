@@ -96,7 +96,9 @@ async fn start_node(id: u64) -> TestNode {
 
     let r = router.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_client_with_listener(client_listener, r, id, KvServiceConfig::default()).await {
+        if let Err(e) =
+            serve_client_with_listener(client_listener, r, id, KvServiceConfig::default()).await
+        {
             eprintln!("node {id} client server: {e}");
         }
     }));
