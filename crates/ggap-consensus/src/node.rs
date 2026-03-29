@@ -48,6 +48,7 @@ pub struct OpenRaftNode {
     shard_id: ShardId,
     #[allow(dead_code)]
     node_id: u64,
+    lease: tokio::sync::Mutex<LeaseManager>,
 }
 
 impl OpenRaftNode {
@@ -56,18 +57,39 @@ impl OpenRaftNode {
         fsm: Arc<FjallStateMachine>,
         shard_id: ShardId,
         node_id: u64,
+        lease_duration: tokio::time::Duration,
     ) -> Self {
         OpenRaftNode {
             raft,
             fsm,
             shard_id,
             node_id,
+            lease: tokio::sync::Mutex::new(LeaseManager::new(lease_duration)),
         }
     }
 
     /// Access the underlying Raft instance (e.g. for ensure_linearizable).
     pub fn raft(&self) -> &Arc<GgapRaft> {
         &self.raft
+    }
+
+    /// Run a linearizable read, using the lease shortcut when valid.
+    ///
+    /// If this node is the current leader and the lease is still within its
+    /// validity window, skip the ReadIndex round-trip and serve from the
+    /// local FSM directly. Otherwise fall back to `ensure_linearizable()` and
+    /// renew the lease on success.
+    async fn ensure_linearizable_or_lease(&self) -> Result<(), GgapError> {
+        let is_leader = self.raft.metrics().borrow().state == openraft::ServerState::Leader;
+        if is_leader && self.lease.lock().await.is_valid() {
+            return Ok(());
+        }
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|e| GgapError::Consensus(e.to_string()))?;
+        self.lease.lock().await.renew();
+        Ok(())
     }
 }
 
@@ -100,10 +122,7 @@ impl RaftNode for OpenRaftNode {
         mode: ReadMode,
     ) -> Result<Option<KvEntry>, GgapError> {
         if mode == ReadMode::Linearizable {
-            self.raft
-                .ensure_linearizable()
-                .await
-                .map_err(|e| GgapError::Consensus(e.to_string()))?;
+            self.ensure_linearizable_or_lease().await?;
         }
         self.fsm.get(self.shard_id, key, at_version).await
     }
@@ -116,10 +135,7 @@ impl RaftNode for OpenRaftNode {
         mode: ReadMode,
     ) -> Result<(Vec<KvEntry>, Option<String>), GgapError> {
         if mode == ReadMode::Linearizable {
-            self.raft
-                .ensure_linearizable()
-                .await
-                .map_err(|e| GgapError::Consensus(e.to_string()))?;
+            self.ensure_linearizable_or_lease().await?;
         }
         self.fsm
             .scan(self.shard_id, start_key, end_key, limit)
@@ -179,7 +195,6 @@ impl ClusterNode for OpenRaftCluster {
 
 pub struct LeaseManager {
     acquired_at: Option<tokio::time::Instant>,
-    #[allow(dead_code)]
     duration: tokio::time::Duration,
 }
 
@@ -191,9 +206,11 @@ impl LeaseManager {
         }
     }
 
-    /// Always returns `false` in Phase 4 — lease optimisation is Phase 5.
+    /// Returns `true` if the lease was acquired and has not yet expired.
     pub fn is_valid(&self) -> bool {
-        false
+        self.acquired_at
+            .map(|t| tokio::time::Instant::now() < t + self.duration)
+            .unwrap_or(false)
     }
 
     pub fn renew(&mut self) {

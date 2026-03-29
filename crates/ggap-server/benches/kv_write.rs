@@ -59,7 +59,7 @@ async fn start_node(id: u64) -> BenchNode {
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
     let log_store = GgapLogStorage::new(store.clone(), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
-    let cfg = build_raft_config(HEARTBEAT_MS, ELECTION_MIN_MS, ELECTION_MAX_MS);
+    let cfg = build_raft_config(HEARTBEAT_MS, ELECTION_MIN_MS, ELECTION_MAX_MS, 50_000);
     let raft = Arc::new(
         GgapRaft::new(id, cfg, GgapNetworkFactory::new(0), log_store, sm)
             .await
@@ -71,7 +71,7 @@ async fn start_node(id: u64) -> BenchNode {
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_addr = client_listener.local_addr().unwrap();
 
-    let raft_node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, id));
+    let raft_node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, id, tokio::time::Duration::from_millis(4000)));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
 
     let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
@@ -89,6 +89,7 @@ async fn start_node(id: u64) -> BenchNode {
         heartbeat_ms: HEARTBEAT_MS,
         election_min_ms: ELECTION_MIN_MS,
         election_max_ms: ELECTION_MAX_MS,
+        snapshot_threshold: 50_000,
     }));
 
     let mut handles = Vec::new();

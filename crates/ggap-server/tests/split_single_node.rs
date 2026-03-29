@@ -38,7 +38,7 @@ async fn setup() -> TestSetup {
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
     let log_store = GgapLogStorage::new(store.clone(), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
-    let cfg = build_raft_config(50, 150, 300);
+    let cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
         GgapRaft::new(1, cfg, GgapNetworkFactory::new(0), log_store, sm)
             .await
@@ -60,7 +60,7 @@ async fn setup() -> TestSetup {
     shard_map.initialize_default().await.unwrap();
 
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
-    let node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, 1));
+    let node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, 1, tokio::time::Duration::from_millis(100)));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
     router.add_shard(0, node, cluster).await;
 
@@ -74,6 +74,7 @@ async fn setup() -> TestSetup {
         heartbeat_ms: 50,
         election_min_ms: 150,
         election_max_ms: 300,
+        snapshot_threshold: 500,
     }));
 
     TestSetup {

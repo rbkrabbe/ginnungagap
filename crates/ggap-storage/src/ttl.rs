@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ggap_types::{system_now_fn, KvCommand, NowFn, ShardId};
+use ggap_types::{system_now_fn, DomainWatchEvent, KvCommand, NowFn, ShardId, WatchEventKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::fjall::FjallStateMachine;
@@ -22,6 +22,7 @@ pub struct TtlGcTask {
     cmd_tx: tokio::sync::mpsc::Sender<KvCommand>,
     cancel: CancellationToken,
     now_fn: NowFn,
+    watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
 }
 
 impl TtlGcTask {
@@ -37,11 +38,18 @@ impl TtlGcTask {
             cmd_tx,
             cancel,
             now_fn: system_now_fn(),
+            watch_tx: None,
         }
     }
 
     pub fn with_clock(mut self, now_fn: NowFn) -> Self {
         self.now_fn = now_fn;
+        self
+    }
+
+    /// Attach a broadcast sender so that TTL expirations fan out to Watch subscribers.
+    pub fn with_watch(mut self, tx: tokio::sync::broadcast::Sender<DomainWatchEvent>) -> Self {
+        self.watch_tx = Some(tx);
         self
     }
 
@@ -111,10 +119,24 @@ impl TtlGcTask {
                     // atomically with the data deletion, so we do NOT remove it
                     // eagerly here. If Raft rejects the delete, the entry stays
                     // in the index and will be retried on the next GC cycle.
-                    let cmd = KvCommand::Delete { key: user_key };
+                    let cmd = KvCommand::Delete {
+                        key: user_key.clone(),
+                    };
                     if self.cmd_tx.send(cmd).await.is_err() {
                         // Receiver dropped — shut down.
                         break;
+                    }
+
+                    // Broadcast an EXPIRE event to any watch subscribers.
+                    if let Some(ref tx) = self.watch_tx {
+                        let _ = tx.send(DomainWatchEvent {
+                            kind: WatchEventKind::Expire,
+                            shard_id,
+                            key: user_key,
+                            entry: None,
+                            version: 0,
+                            raft_index: 0,
+                        });
                     }
 
                     // Small backoff to avoid tight re-fire loops when not leader.

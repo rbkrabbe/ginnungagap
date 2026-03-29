@@ -20,3 +20,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 rand = "0.10.0"
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
