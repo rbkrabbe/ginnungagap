@@ -22,6 +22,7 @@ use ggap_storage::{
     ttl::TtlGcTask,
     ShardMap,
 };
+use ggap_types::DomainWatchEvent;
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "ggap-node", about = "Ginnungagap KV node")]
@@ -166,8 +167,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialize default shard")?;
 
-    // 3. Create FSM (shared across all shards).
-    let fsm = Arc::new(FjallStateMachine::new(store.clone()));
+    // 3. Create watch broadcast channel and FSM (shared across all shards).
+    let (watch_tx, _watch_rx) =
+        tokio::sync::broadcast::channel::<DomainWatchEvent>(config.server.watch_broadcast_capacity);
+    let fsm = Arc::new(FjallStateMachine::new(store.clone()).with_watch(watch_tx.clone()));
 
     // 4. Create ShardRouter.
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
@@ -179,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
         config.raft.heartbeat_interval_ms,
         config.raft.election_timeout_min_ms,
         config.raft.election_timeout_max_ms,
+        config.raft.snapshot_threshold,
     );
 
     for shard_info in &shards {
@@ -216,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
             fsm.clone(),
             shard_id,
             cli.node_id,
+            tokio::time::Duration::from_millis(config.consistency.lease_duration_ms),
         ));
         let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
 
@@ -223,7 +228,11 @@ async fn main() -> anyhow::Result<()> {
 
         // Spawn TTL GC task for this shard.
         let (ttl_tx, mut ttl_rx) = tokio::sync::mpsc::channel(256);
-        tokio::spawn(TtlGcTask::new(fsm.clone(), shard_id, ttl_tx, shutdown.child_token()).run());
+        tokio::spawn(
+            TtlGcTask::new(fsm.clone(), shard_id, ttl_tx, shutdown.child_token())
+                .with_watch(watch_tx.clone())
+                .run(),
+        );
         let raft2 = raft.clone();
         tokio::spawn(async move {
             while let Some(cmd) = ttl_rx.recv().await {
@@ -247,12 +256,14 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_ms: config.raft.heartbeat_interval_ms,
         election_min_ms: config.raft.election_timeout_min_ms,
         election_max_ms: config.raft.election_timeout_max_ms,
+        snapshot_threshold: config.raft.snapshot_threshold,
     }));
 
     // 7. Serve with graceful shutdown on SIGINT / SIGTERM.
     let kv_config = KvServiceConfig {
         max_key_bytes: config.storage.max_key_bytes,
         max_value_bytes: config.storage.max_value_bytes,
+        watch_tx: Some(watch_tx),
     };
 
     let shutdown_trigger = shutdown.clone();

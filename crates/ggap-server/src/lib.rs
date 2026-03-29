@@ -26,6 +26,9 @@ use raft_service::RaftServiceImpl;
 pub struct KvServiceConfig {
     pub max_key_bytes: usize,
     pub max_value_bytes: usize,
+    /// Optional watch broadcast channel. When set, `Watch` RPCs are served;
+    /// when absent, `Watch` returns `Unimplemented`.
+    pub watch_tx: Option<tokio::sync::broadcast::Sender<ggap_types::DomainWatchEvent>>,
 }
 
 impl Default for KvServiceConfig {
@@ -33,6 +36,7 @@ impl Default for KvServiceConfig {
         KvServiceConfig {
             max_key_bytes: 4096,
             max_value_bytes: 1_048_576,
+            watch_tx: None,
         }
     }
 }
@@ -54,6 +58,7 @@ pub async fn serve_client(
             node_id,
             config.max_key_bytes,
             config.max_value_bytes,
+            config.watch_tx,
         )))
         .add_service(reflection)
         .serve(addr)
@@ -78,6 +83,7 @@ pub async fn serve_client_with_listener(
             node_id,
             config.max_key_bytes,
             config.max_value_bytes,
+            config.watch_tx,
         )))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))

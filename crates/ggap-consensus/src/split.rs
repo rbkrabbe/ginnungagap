@@ -26,6 +26,7 @@ pub struct SplitCoordinatorConfig {
     pub heartbeat_ms: u64,
     pub election_min_ms: u64,
     pub election_max_ms: u64,
+    pub snapshot_threshold: u64,
 }
 
 /// Coordinates the split of a shard's key range into two shards.
@@ -52,6 +53,7 @@ pub struct SplitCoordinator {
     heartbeat_ms: u64,
     election_min_ms: u64,
     election_max_ms: u64,
+    snapshot_threshold: u64,
 }
 
 impl SplitCoordinator {
@@ -66,6 +68,7 @@ impl SplitCoordinator {
             heartbeat_ms: cfg.heartbeat_ms,
             election_min_ms: cfg.election_min_ms,
             election_max_ms: cfg.election_max_ms,
+            snapshot_threshold: cfg.snapshot_threshold,
         }
     }
 
@@ -193,6 +196,7 @@ impl SplitCoordinator {
             self.heartbeat_ms,
             self.election_min_ms,
             self.election_max_ms,
+            self.snapshot_threshold,
         );
 
         let raft = Arc::new(
@@ -227,6 +231,7 @@ impl SplitCoordinator {
             self.fsm.clone(),
             new_shard_id,
             self.node_id,
+            tokio::time::Duration::from_millis(self.election_min_ms.saturating_sub(1)),
         ));
         let new_cluster = Arc::new(OpenRaftCluster::new(raft));
         self.router

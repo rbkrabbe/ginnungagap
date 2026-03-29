@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use ggap_consensus::{RaftNode, ShardRouter};
 use ggap_proto::v1::{
-    kv_service_server::KvService, CasRequest, CasResponse, DeleteRequest, DeleteResponse,
-    GetRequest, GetResponse, PutRequest, PutResponse, ScanRequest, ScanResponse, WatchEvent,
-    WatchRequest,
+    kv_service_server::KvService, watch_request, CasRequest, CasResponse, DeleteRequest,
+    DeleteResponse, EventType, GetRequest, GetResponse, PutRequest, PutResponse, ScanRequest,
+    ScanResponse, WatchEvent, WatchRequest,
 };
-use ggap_types::KvCommand;
+use ggap_types::{DomainWatchEvent, KvCommand, WatchEventKind};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -22,6 +22,7 @@ pub struct KvServiceImpl {
     node_id: u64,
     max_key_bytes: usize,
     max_value_bytes: usize,
+    watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
 }
 
 impl KvServiceImpl {
@@ -30,12 +31,14 @@ impl KvServiceImpl {
         node_id: u64,
         max_key_bytes: usize,
         max_value_bytes: usize,
+        watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
     ) -> Self {
         KvServiceImpl {
             router,
             node_id,
             max_key_bytes,
             max_value_bytes,
+            watch_tx,
         }
     }
 }
@@ -226,13 +229,74 @@ impl KvService for KvServiceImpl {
         }
     }
 
-    // Watch is Phase 5 — return unimplemented immediately.
     type WatchStream = ReceiverStream<Result<WatchEvent, Status>>;
 
     async fn watch(
         &self,
-        _request: Request<Streaming<WatchRequest>>,
+        request: Request<Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        Err(Status::unimplemented("watch not implemented until Phase 5"))
+        let tx = self
+            .watch_tx
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("watch not configured on this node"))?;
+        let mut domain_rx = tx.subscribe();
+
+        // Read the first message which must be a WatchCreateRequest.
+        let mut inbound = request.into_inner();
+        let create_req = match inbound.message().await? {
+            Some(WatchRequest {
+                request: Some(watch_request::Request::Create(c)),
+            }) => c,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first watch message must be WatchCreateRequest",
+                ))
+            }
+        };
+
+        let start_key = create_req.start_key;
+        let end_key = create_req.end_key;
+        let node_id = self.node_id;
+
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<WatchEvent, Status>>(128);
+
+        tokio::spawn(async move {
+            loop {
+                match domain_rx.recv().await {
+                    Ok(evt) => {
+                        // Filter by key range.
+                        let in_range = (start_key.is_empty() || evt.key >= start_key)
+                            && (end_key.is_empty() || evt.key < end_key);
+                        if !in_range {
+                            continue;
+                        }
+
+                        let event_type = match evt.kind {
+                            WatchEventKind::Put => EventType::Put as i32,
+                            WatchEventKind::Delete => EventType::Delete as i32,
+                            WatchEventKind::Expire => EventType::Expire as i32,
+                        };
+                        let kv = evt.entry.map(kv_entry_to_proto);
+                        let proto_evt = WatchEvent {
+                            header: Some(stub_header(node_id)),
+                            r#type: event_type,
+                            kv,
+                            canceled: false,
+                            watch_id: 0,
+                        };
+                        if out_tx.send(Ok(proto_evt)).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Fell behind; skip missed events and continue.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(out_rx)))
     }
 }

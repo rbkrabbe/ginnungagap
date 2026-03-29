@@ -128,6 +128,37 @@ pub enum WriteMode {
     All,
 }
 
+// ---------------------------------------------------------------------------
+// Watch domain types
+// ---------------------------------------------------------------------------
+
+/// The kind of mutation that triggered a watch event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WatchEventKind {
+    Put,
+    Delete,
+    Expire,
+}
+
+/// A domain-level watch event, free of any gRPC/proto types.
+///
+/// Placed in `ggap-types` so `ggap-storage` can broadcast events without
+/// creating an upward dependency on `ggap-proto`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DomainWatchEvent {
+    pub kind: WatchEventKind,
+    pub shard_id: ShardId,
+    pub key: String,
+    /// `None` for `Delete` and `Expire`; `Some` for `Put`.
+    pub entry: Option<KvEntry>,
+    pub version: u64,
+    pub raft_index: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
 #[derive(thiserror::Error, Debug)]
 pub enum GgapError {
     #[error("key not found")]

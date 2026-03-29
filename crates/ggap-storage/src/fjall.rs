@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ggap_types::{system_now_fn, GgapError, KvCommand, KvEntry, KvResponse, LogId, NowFn, ShardId};
+use ggap_types::{
+    system_now_fn, DomainWatchEvent, GgapError, KvCommand, KvEntry, KvResponse, LogId, NowFn,
+    ShardId, WatchEventKind,
+};
 use tracing::warn;
 
 use crate::keys::{
@@ -276,6 +279,7 @@ pub struct FjallStateMachine {
     pub(crate) store: Arc<FjallStore>,
     max_history_versions: u64,
     now_fn: NowFn,
+    watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
 }
 
 impl FjallStateMachine {
@@ -284,6 +288,7 @@ impl FjallStateMachine {
             store,
             max_history_versions: DEFAULT_MAX_HISTORY,
             now_fn: system_now_fn(),
+            watch_tx: None,
         }
     }
 
@@ -292,11 +297,18 @@ impl FjallStateMachine {
             store,
             max_history_versions,
             now_fn: system_now_fn(),
+            watch_tx: None,
         }
     }
 
     pub fn with_clock(mut self, now_fn: NowFn) -> Self {
         self.now_fn = now_fn;
+        self
+    }
+
+    /// Attach a broadcast sender so that committed writes fan out to Watch subscribers.
+    pub fn with_watch(mut self, tx: tokio::sync::broadcast::Sender<DomainWatchEvent>) -> Self {
+        self.watch_tx = Some(tx);
         self
     }
 }
@@ -340,6 +352,7 @@ impl StateMachineStore for FjallStateMachine {
         let store = self.store.clone();
         let max_history = self.max_history_versions;
         let now_fn = self.now_fn.clone();
+        let watch_tx = self.watch_tx.clone();
         tokio::task::spawn_blocking(move || -> Result<KvResponse, GgapError> {
             let now = now_fn();
             match cmd {
@@ -405,6 +418,16 @@ impl StateMachineStore for FjallStateMachine {
                     if let Err(e) = compact_history(&store, shard_id, &key, max_history) {
                         warn!(key = %key, error = %e, "history compaction failed after committed write");
                     }
+                    if let Some(ref tx) = watch_tx {
+                        let _ = tx.send(DomainWatchEvent {
+                            kind: WatchEventKind::Put,
+                            shard_id,
+                            key,
+                            entry: Some(entry.clone()),
+                            version: log_id.index,
+                            raft_index: log_id.index,
+                        });
+                    }
                     Ok(KvResponse::Written {
                         version: log_id.index,
                     })
@@ -432,6 +455,16 @@ impl StateMachineStore for FjallStateMachine {
                         encode(&log_id)?,
                     );
                     batch.commit().map_err(fjall_err)?;
+                    if let Some(ref tx) = watch_tx {
+                        let _ = tx.send(DomainWatchEvent {
+                            kind: WatchEventKind::Delete,
+                            shard_id,
+                            key,
+                            entry: None,
+                            version: log_id.index,
+                            raft_index: log_id.index,
+                        });
+                    }
                     Ok(KvResponse::Deleted { found })
                 }
 
@@ -495,6 +528,16 @@ impl StateMachineStore for FjallStateMachine {
                         batch.commit().map_err(fjall_err)?;
                         if let Err(e) = compact_history(&store, shard_id, &key, max_history) {
                             warn!(key = %key, error = %e, "history compaction failed after committed CAS");
+                        }
+                        if let Some(ref tx) = watch_tx {
+                            let _ = tx.send(DomainWatchEvent {
+                                kind: WatchEventKind::Put,
+                                shard_id,
+                                key,
+                                entry: Some(entry.clone()),
+                                version: log_id.index,
+                                raft_index: log_id.index,
+                            });
                         }
                     } else {
                         // Still advance last_applied on CAS failure — use a batch

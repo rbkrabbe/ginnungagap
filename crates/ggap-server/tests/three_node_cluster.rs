@@ -50,7 +50,7 @@ async fn start_node(id: u64) -> TestNode {
     let log_store = GgapLogStorage::new(store.clone(), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     // Fast timeouts so tests finish quickly.
-    let cfg = build_raft_config(50, 150, 300);
+    let cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
         GgapRaft::new(id, cfg, GgapNetworkFactory::new(0), log_store, sm)
             .await
@@ -62,7 +62,13 @@ async fn start_node(id: u64) -> TestNode {
     let cluster_addr = cluster_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let raft_node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, id));
+    let raft_node = Arc::new(OpenRaftNode::new(
+        raft.clone(),
+        fsm.clone(),
+        0,
+        id,
+        tokio::time::Duration::from_millis(100),
+    ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
 
     // Build a single-shard router for this node.
@@ -81,6 +87,7 @@ async fn start_node(id: u64) -> TestNode {
         heartbeat_ms: 50,
         election_min_ms: 150,
         election_max_ms: 300,
+        snapshot_threshold: 500,
     }));
 
     let mut handles = Vec::new();
@@ -335,6 +342,70 @@ async fn three_node_leader_failover() {
             .unwrap()
             .unwrap_or_else(|| panic!("node {} FSM missing 'post'", node.id));
         assert_eq!(post.value, b"elected");
+    }
+
+    cluster.shutdown().await;
+}
+
+/// Verifies that a follower can serve a sequential read after the leader has
+/// replicated the entry to all nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequential_read_from_follower() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+
+    let resp = cluster.nodes[leader_idx]
+        .raft
+        .client_write(KvCommand::Put {
+            key: "seq_key".into(),
+            value: b"seq_val".to_vec(),
+            ttl_ns: None,
+            expect_version: 0,
+        })
+        .await
+        .unwrap();
+    let applied_index = resp.log_id().index;
+    cluster.wait_for_all_applied(applied_index).await;
+
+    // Pick a follower (first node that is not the leader).
+    let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let entry = cluster.nodes[follower_idx]
+        .raft_node
+        .read("seq_key", 0, ReadMode::Sequential)
+        .await
+        .unwrap()
+        .expect("follower missing seq_key after replication");
+    assert_eq!(entry.value, b"seq_val");
+
+    cluster.shutdown().await;
+}
+
+/// Verifies that every node can serve an eventual read after replication.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eventual_read_from_any_node() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+
+    let resp = cluster.nodes[leader_idx]
+        .raft
+        .client_write(KvCommand::Put {
+            key: "evt_key".into(),
+            value: b"evt_val".to_vec(),
+            ttl_ns: None,
+            expect_version: 0,
+        })
+        .await
+        .unwrap();
+    cluster.wait_for_all_applied(resp.log_id().index).await;
+
+    for node in &cluster.nodes {
+        let entry = node
+            .raft_node
+            .read("evt_key", 0, ReadMode::Eventual)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("node {} missing evt_key", node.id));
+        assert_eq!(entry.value, b"evt_val", "node {} value mismatch", node.id);
     }
 
     cluster.shutdown().await;
