@@ -200,7 +200,7 @@ impl RaftNetwork<GgapTypeConfig> for SimNetwork {
         target
             .install_snapshot(rpc)
             .await
-            .map_err(|e| Self::iss_unreachable(e))
+            .map_err(Self::iss_unreachable)
     }
 }
 
