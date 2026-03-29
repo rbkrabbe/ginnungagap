@@ -71,7 +71,13 @@ async fn start_node(id: u64) -> BenchNode {
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_addr = client_listener.local_addr().unwrap();
 
-    let raft_node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, id, tokio::time::Duration::from_millis(4000)));
+    let raft_node = Arc::new(OpenRaftNode::new(
+        raft.clone(),
+        fsm.clone(),
+        0,
+        id,
+        tokio::time::Duration::from_millis(4000),
+    ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
 
     let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());

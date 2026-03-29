@@ -168,9 +168,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize default shard")?;
 
     // 3. Create watch broadcast channel and FSM (shared across all shards).
-    let (watch_tx, _watch_rx) = tokio::sync::broadcast::channel::<DomainWatchEvent>(
-        config.server.watch_broadcast_capacity,
-    );
+    let (watch_tx, _watch_rx) =
+        tokio::sync::broadcast::channel::<DomainWatchEvent>(config.server.watch_broadcast_capacity);
     let fsm = Arc::new(FjallStateMachine::new(store.clone()).with_watch(watch_tx.clone()));
 
     // 4. Create ShardRouter.

@@ -60,7 +60,13 @@ async fn setup() -> TestSetup {
     shard_map.initialize_default().await.unwrap();
 
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
-    let node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, 1, tokio::time::Duration::from_millis(100)));
+    let node = Arc::new(OpenRaftNode::new(
+        raft.clone(),
+        fsm.clone(),
+        0,
+        1,
+        tokio::time::Duration::from_millis(100),
+    ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
     router.add_shard(0, node, cluster).await;
 

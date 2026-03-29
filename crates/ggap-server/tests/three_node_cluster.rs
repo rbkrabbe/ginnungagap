@@ -62,7 +62,13 @@ async fn start_node(id: u64) -> TestNode {
     let cluster_addr = cluster_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let raft_node = Arc::new(OpenRaftNode::new(raft.clone(), fsm.clone(), 0, id, tokio::time::Duration::from_millis(100)));
+    let raft_node = Arc::new(OpenRaftNode::new(
+        raft.clone(),
+        fsm.clone(),
+        0,
+        id,
+        tokio::time::Duration::from_millis(100),
+    ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
 
     // Build a single-shard router for this node.

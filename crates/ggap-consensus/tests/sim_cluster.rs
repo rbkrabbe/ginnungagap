@@ -249,13 +249,22 @@ impl SimCluster {
             );
             registry.write().await.insert(id, raft.clone());
             initial_members.insert(id, BasicNode::default());
-            nodes.push(SimNode { id, raft, fsm, _tempdir: dir });
+            nodes.push(SimNode {
+                id,
+                raft,
+                fsm,
+                _tempdir: dir,
+            });
         }
 
         // Bootstrap from node 1.
         nodes[0].raft.initialize(initial_members).await.unwrap();
 
-        SimCluster { nodes, registry, fault }
+        SimCluster {
+            nodes,
+            registry,
+            fault,
+        }
     }
 
     /// Return the current leader, or `None` if no node thinks it is the leader.
@@ -517,7 +526,10 @@ async fn test_message_drop_linearizability() {
             }
         };
 
-        history.push(OpRecord { key: key.clone(), log_index });
+        history.push(OpRecord {
+            key: key.clone(),
+            log_index,
+        });
 
         // Read directly from the current leader's FSM.
         let visible = cluster.read(cur_leader, &key).await.is_some();
@@ -544,7 +556,9 @@ async fn test_snapshot_catchup() {
         if cluster.current_leader() != Some(leader) {
             leader = cluster.wait_for_leader().await;
         }
-        cluster.write(leader, &key, format!("v{i}").as_bytes()).await;
+        cluster
+            .write(leader, &key, format!("v{i}").as_bytes())
+            .await;
         // Small advance to let snapshot build tasks run.
         tokio::time::advance(Duration::from_millis(60)).await;
         drain_tasks(100).await;
