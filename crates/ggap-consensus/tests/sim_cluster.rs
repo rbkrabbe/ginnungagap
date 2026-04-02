@@ -25,7 +25,7 @@ use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapRaft, GgapStateMachine, GgapTypeConfig,
 };
 use ggap_storage::{
-    fjall::{FjallStateMachine, FjallStore},
+    fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
     traits::StateMachineStore,
 };
 use ggap_types::KvCommand;
@@ -235,7 +235,7 @@ impl SimCluster {
             let dir = tempfile::tempdir().unwrap();
             let store = FjallStore::open(dir.path()).unwrap();
             let fsm = Arc::new(FjallStateMachine::new(store.clone()));
-            let log_store = GgapLogStorage::new(store.clone(), 0);
+            let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
             let sm = GgapStateMachine::new(fsm.clone(), 0);
             let net = SimNetworkFactory {
                 from_id: id,
@@ -591,7 +591,7 @@ async fn test_snapshot_catchup() {
     let dir4 = tempfile::tempdir().unwrap();
     let store4 = FjallStore::open(dir4.path()).unwrap();
     let fsm4 = Arc::new(FjallStateMachine::new(store4.clone()));
-    let log_store4 = GgapLogStorage::new(store4.clone(), 0);
+    let log_store4 = GgapLogStorage::new(FjallLogStorage(store4.clone()), 0);
     let sm4 = GgapStateMachine::new(fsm4.clone(), 0);
     let net4 = SimNetworkFactory {
         from_id: new_id,

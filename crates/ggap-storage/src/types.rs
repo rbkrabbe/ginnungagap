@@ -5,6 +5,7 @@ use ggap_types::{KvCommand, KvEntry, LogId};
 pub struct LogEntry {
     pub index: u64,
     pub term: u64,
+    pub leader_id: u64,
     pub payload: LogPayload,
 }
 
@@ -34,12 +35,10 @@ pub struct Vote {
 /// Summary of the current log extent for a shard.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogState {
-    /// Smallest index currently in the log (`None` if log is empty).
-    pub first_index: Option<u64>,
-    /// Largest index currently in the log (`None` if log is empty).
-    pub last_index: Option<u64>,
-    /// Largest index that has been purged (compacted into a snapshot).
-    pub last_purged_index: Option<u64>,
+    /// Full `LogId` of the last entry in the log, or `None` if the log is empty.
+    pub last_log_id: Option<LogId>,
+    /// Full `LogId` of the last purged entry (compacted into a snapshot).
+    pub last_purged_log_id: Option<LogId>,
 }
 
 /// Metadata identifying a snapshot.

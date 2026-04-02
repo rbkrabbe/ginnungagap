@@ -1,10 +1,8 @@
 use std::fmt::Debug;
 use std::io;
 use std::ops::RangeBounds;
-use std::sync::Arc;
 
-use ggap_storage::fjall::FjallStore;
-use ggap_storage::keys::{meta_key, raft_log_key};
+use ggap_storage::traits::LogStorage;
 use ggap_types::ShardId;
 use openraft::storage::RaftLogStorage;
 use openraft::AnyError;
@@ -14,7 +12,7 @@ use openraft::{
 };
 
 use crate::config::GgapTypeConfig;
-use crate::convert::{decode, encode};
+use crate::convert;
 
 fn sto_err(msg: impl Into<String>) -> StorageError<u64> {
     let io = StorageIOError::new(
@@ -29,23 +27,23 @@ fn sto_err(msg: impl Into<String>) -> StorageError<u64> {
 // GgapLogStorage
 // ---------------------------------------------------------------------------
 
-/// openraft `RaftLogStorage` adapter backed by `FjallStore`.
+/// openraft `RaftLogStorage` adapter backed by any `LogStorage` implementation.
 ///
-/// Stores serialized `Entry<GgapTypeConfig>` in the `raft_log` partition,
-/// keyed by `raft_log_key(shard_id, index)`. Vote and metadata are stored
-/// in the `meta` partition.
-pub struct GgapLogStorage {
-    pub(crate) store: Arc<FjallStore>,
+/// Converts between openraft types and domain types. All storage I/O is
+/// delegated to the underlying `S: LogStorage`; this adapter contains no
+/// fjall-specific code.
+pub struct GgapLogStorage<S: LogStorage> {
+    pub(crate) store: S,
     pub(crate) shard_id: ShardId,
 }
 
-impl GgapLogStorage {
-    pub fn new(store: Arc<FjallStore>, shard_id: ShardId) -> Self {
+impl<S: LogStorage> GgapLogStorage<S> {
+    pub fn new(store: S, shard_id: ShardId) -> Self {
         GgapLogStorage { store, shard_id }
     }
 }
 
-impl Clone for GgapLogStorage {
+impl<S: LogStorage + Clone> Clone for GgapLogStorage<S> {
     fn clone(&self) -> Self {
         GgapLogStorage {
             store: self.store.clone(),
@@ -59,12 +57,11 @@ impl Clone for GgapLogStorage {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::result_large_err)]
-impl RaftLogReader<GgapTypeConfig> for GgapLogStorage {
+impl<S: LogStorage + Clone> RaftLogReader<GgapTypeConfig> for GgapLogStorage<S> {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
     ) -> Result<Vec<<GgapTypeConfig as RaftTypeConfig>::Entry>, StorageError<u64>> {
-        let store = self.store.clone();
         let shard_id = self.shard_id;
 
         // Resolve bounds to concrete u64 values.
@@ -83,24 +80,16 @@ impl RaftLogReader<GgapTypeConfig> for GgapLogStorage {
             return Ok(vec![]);
         }
 
-        tokio::task::spawn_blocking(move || {
-            let key_start = raft_log_key(shard_id, start).to_vec();
-            let key_end = raft_log_key(shard_id, end).to_vec();
-            store
-                .raft_log
-                .range(key_start..=key_end)
-                .map(|g| {
-                    g.into_inner()
-                        .map_err(|e| sto_err(e.to_string()))
-                        .and_then(|(_, v)| {
-                            decode::<<GgapTypeConfig as RaftTypeConfig>::Entry>(&v)
-                                .map_err(|e| sto_err(e.to_string()))
-                        })
-                })
-                .collect()
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        let entries = self
+            .store
+            .get_entries(shard_id, start, end)
+            .await
+            .map_err(|e| sto_err(e.to_string()))?;
+
+        entries
+            .iter()
+            .map(|e| convert::log_entry_to_or_entry(e).map_err(|e| sto_err(e.to_string())))
+            .collect()
     }
 }
 
@@ -109,123 +98,57 @@ impl RaftLogReader<GgapTypeConfig> for GgapLogStorage {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::result_large_err)]
-impl RaftLogStorage<GgapTypeConfig> for GgapLogStorage {
-    type LogReader = GgapLogStorage;
+impl<S: LogStorage + Clone> RaftLogStorage<GgapTypeConfig> for GgapLogStorage<S> {
+    type LogReader = GgapLogStorage<S>;
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        let bytes = encode(vote).map_err(|e| sto_err(e.to_string()))?;
-        tokio::task::spawn_blocking(move || {
-            store
-                .meta
-                .insert(meta_key(shard_id, "or_vote"), bytes)
-                .map_err(|e| sto_err(e.to_string()))
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        let domain_vote = convert::or_vote_to_vote(vote);
+        self.store
+            .save_vote(self.shard_id, domain_vote)
+            .await
+            .map_err(|e| sto_err(e.to_string()))
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || {
-            match store
-                .meta
-                .get(meta_key(shard_id, "or_vote"))
-                .map_err(|e| sto_err(e.to_string()))?
-            {
-                None => Ok(None),
-                Some(b) => decode::<Vote<u64>>(&b)
-                    .map(Some)
-                    .map_err(|e| sto_err(e.to_string())),
-            }
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        let vote = self
+            .store
+            .read_vote(self.shard_id)
+            .await
+            .map_err(|e| sto_err(e.to_string()))?;
+        Ok(vote.map(|v| convert::vote_to_or_vote(&v)))
     }
 
     async fn get_log_state(&mut self) -> Result<LogState<GgapTypeConfig>, StorageError<u64>> {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || {
-            // Read last_purged_log_id from meta.
-            let last_purged_log_id: Option<LogId<u64>> = match store
-                .meta
-                .get(meta_key(shard_id, "or_last_purged"))
-                .map_err(|e| sto_err(e.to_string()))?
-            {
-                None => None,
-                Some(b) => Some(decode::<LogId<u64>>(&b).map_err(|e| sto_err(e.to_string()))?),
-            };
-
-            // Read only the last log entry (iterator is DoubleEndedIterator).
-            let start_key = raft_log_key(shard_id, 0).to_vec();
-            let end_key = raft_log_key(shard_id, u64::MAX).to_vec();
-
-            let last_log_id = store
-                .raft_log
-                .range(start_key..=end_key)
-                .next_back()
-                .map(|g| {
-                    g.into_inner()
-                        .map_err(|e| sto_err(e.to_string()))
-                        .and_then(|(_, v)| {
-                            decode::<<GgapTypeConfig as RaftTypeConfig>::Entry>(&v)
-                                .map_err(|e| sto_err(e.to_string()))
-                                .map(|entry| entry.log_id)
-                        })
-                })
-                .transpose()?;
-
-            // If the log is empty, last_log_id falls back to last_purged_log_id.
-            let last_log_id = last_log_id.or(last_purged_log_id);
-
-            Ok(LogState {
-                last_purged_log_id,
-                last_log_id,
-            })
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        let state = self
+            .store
+            .log_state(self.shard_id)
+            .await
+            .map_err(|e| sto_err(e.to_string()))?;
+        Ok(convert::log_state_to_or_log_state(&state))
     }
 
     async fn save_committed(
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        let bytes = encode(&committed).map_err(|e| sto_err(e.to_string()))?;
-        tokio::task::spawn_blocking(move || {
-            store
-                .meta
-                .insert(meta_key(shard_id, "or_committed"), bytes)
-                .map_err(|e| sto_err(e.to_string()))
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        let domain_committed = committed.map(convert::or_log_id_to_log_id);
+        self.store
+            .save_committed(self.shard_id, domain_committed)
+            .await
+            .map_err(|e| sto_err(e.to_string()))
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || {
-            match store
-                .meta
-                .get(meta_key(shard_id, "or_committed"))
-                .map_err(|e| sto_err(e.to_string()))?
-            {
-                None => Ok(None),
-                Some(b) => decode::<Option<LogId<u64>>>(&b).map_err(|e| sto_err(e.to_string())),
-            }
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        let committed = self
+            .store
+            .read_committed(self.shard_id)
+            .await
+            .map_err(|e| sto_err(e.to_string()))?;
+        Ok(committed.map(convert::log_id_to_or_log_id))
     }
 
     async fn append<I>(
@@ -237,89 +160,36 @@ impl RaftLogStorage<GgapTypeConfig> for GgapLogStorage {
         I: IntoIterator<Item = <GgapTypeConfig as RaftTypeConfig>::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        let entries: Vec<_> = entries.into_iter().collect();
+        let domain_entries: Vec<_> = entries
+            .into_iter()
+            .map(|e| convert::or_entry_to_log_entry(&e))
+            .collect::<Result<_, _>>()
+            .map_err(|e| sto_err(e.to_string()))?;
 
-        let result: Result<(), StorageError<u64>> = tokio::task::spawn_blocking(move || {
-            let mut batch = store.db.batch();
-            for entry in &entries {
-                let index = entry.log_id.index;
-                let key = raft_log_key(shard_id, index).to_vec();
-                let val = encode(entry).map_err(|e| sto_err(e.to_string()))?;
-                batch.insert(&store.raft_log, key, val);
-            }
-            batch.commit().map_err(|e| sto_err(e.to_string()))
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?;
+        let result = self
+            .store
+            .append(self.shard_id, domain_entries)
+            .await
+            .map_err(|e| sto_err(e.to_string()));
 
-        // Report flush completion after disk write.
+        // Report flush completion after storage write.
         callback.log_io_completed(result.map_err(|e| io::Error::other(e.to_string())));
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || {
-            let start = raft_log_key(shard_id, log_id.index).to_vec();
-            let end = raft_log_key(shard_id, u64::MAX).to_vec();
-
-            let keys: Vec<Vec<u8>> = store
-                .raft_log
-                .range(start..=end)
-                .map(|g| {
-                    g.into_inner()
-                        .map(|(k, _)| k.to_vec())
-                        .map_err(|e| sto_err(e.to_string()))
-                })
-                .collect::<Result<_, _>>()?;
-
-            if !keys.is_empty() {
-                let mut batch = store.db.batch();
-                for k in keys {
-                    batch.remove(&store.raft_log, k);
-                }
-                batch.commit().map_err(|e| sto_err(e.to_string()))?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        self.store
+            .truncate(self.shard_id, log_id.index)
+            .await
+            .map_err(|e| sto_err(e.to_string()))
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let store = self.store.clone();
-        let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || {
-            let start = raft_log_key(shard_id, 0).to_vec();
-            let end = raft_log_key(shard_id, log_id.index).to_vec();
-
-            let keys: Vec<Vec<u8>> = store
-                .raft_log
-                .range(start..=end)
-                .map(|g| {
-                    g.into_inner()
-                        .map(|(k, _)| k.to_vec())
-                        .map_err(|e| sto_err(e.to_string()))
-                })
-                .collect::<Result<_, _>>()?;
-
-            let purged_bytes = encode(&log_id).map_err(|e| sto_err(e.to_string()))?;
-            let mut batch = store.db.batch();
-            for k in keys {
-                batch.remove(&store.raft_log, k);
-            }
-            batch.insert(
-                &store.meta,
-                meta_key(shard_id, "or_last_purged"),
-                purged_bytes,
-            );
-            batch.commit().map_err(|e| sto_err(e.to_string()))
-        })
-        .await
-        .map_err(|e| sto_err(e.to_string()))?
+        let domain_log_id = convert::or_log_id_to_log_id(log_id);
+        self.store
+            .purge(self.shard_id, domain_log_id)
+            .await
+            .map_err(|e| sto_err(e.to_string()))
     }
 }
 

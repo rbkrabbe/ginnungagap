@@ -18,7 +18,7 @@ use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
 
 use ggap_storage::{
-    fjall::{FjallStateMachine, FjallStore},
+    fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
     ttl::TtlGcTask,
     ShardMap,
 };
@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
 
     for shard_info in &shards {
         let shard_id = shard_info.shard_id;
-        let log_store = GgapLogStorage::new(store.clone(), shard_id);
+        let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), shard_id);
         let sm = GgapStateMachine::new(fsm.clone(), shard_id);
         let net = GgapNetworkFactory::new(shard_id);
 
