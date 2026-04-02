@@ -6,7 +6,7 @@ use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
 };
 use ggap_storage::{
-    fjall::{FjallStateMachine, FjallStore},
+    fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
     traits::StateMachineStore,
 };
 use ggap_types::{KvCommand, KvResponse};
@@ -17,7 +17,7 @@ async fn single_node_leader_write_read() {
     let dir = tempfile::tempdir().unwrap();
     let store = FjallStore::open(dir.path()).unwrap();
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
-    let log_store = GgapLogStorage::new(store.clone(), 0);
+    let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     let net = GgapNetworkFactory::new(0);
     let cfg = build_raft_config(50, 150, 300, 500);

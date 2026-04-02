@@ -17,7 +17,7 @@ use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
-use ggap_storage::fjall::{FjallStateMachine, FjallStore};
+use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
 use ggap_types::{KvCommand, KvResponse, ReadMode, WriteMode};
@@ -36,7 +36,7 @@ async fn setup() -> TestSetup {
     let tempdir = TempDir::new().unwrap();
     let store = FjallStore::open(tempdir.path()).unwrap();
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
-    let log_store = GgapLogStorage::new(store.clone(), 0);
+    let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     let cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(

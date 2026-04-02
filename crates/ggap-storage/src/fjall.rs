@@ -91,61 +91,50 @@ impl FjallStore {
 /// `LogStorage` backed by fjall.
 ///
 /// All blocking I/O is wrapped in `tokio::task::spawn_blocking`.
+#[derive(Clone)]
 pub struct FjallLogStorage(pub Arc<FjallStore>);
 
 impl LogStorage for FjallLogStorage {
     async fn log_state(&self, shard_id: ShardId) -> Result<LogState, GgapError> {
         let store = self.0.clone();
         tokio::task::spawn_blocking(move || -> Result<LogState, GgapError> {
-            let start = raft_log_key(shard_id, 0).to_vec();
-            let end = raft_log_key(shard_id, u64::MAX).to_vec();
-
-            let mut first_index: Option<u64> = None;
-            let mut last_index: Option<u64> = None;
-
-            for guard in store.raft_log.range(start..=end) {
-                let (k, _) = guard.into_inner().map_err(fjall_err)?;
-                let idx_bytes: [u8; 8] = k[8..16]
-                    .try_into()
-                    .map_err(|_| GgapError::Storage("short raft_log key".into()))?;
-                let idx = u64::from_be_bytes(idx_bytes);
-                if first_index.is_none() {
-                    first_index = Some(idx);
-                }
-                last_index = Some(idx);
-            }
-
-            let last_purged_index = match store
+            // Read last_purged_log_id from meta.
+            let last_purged_log_id = match store
                 .meta
                 .get(meta_key(shard_id, "last_purged"))
                 .map_err(fjall_err)?
             {
-                Some(b) => Some(decode::<u64>(&b)?),
+                Some(b) => Some(decode::<LogId>(&b)?),
                 None => None,
             };
 
-            Ok(LogState {
-                first_index,
-                last_index,
-                last_purged_index,
-            })
-        })
-        .await
-        .map_err(|e| GgapError::Storage(e.to_string()))?
-    }
+            // Read only the last log entry (iterator is DoubleEndedIterator).
+            let start_key = raft_log_key(shard_id, 0).to_vec();
+            let end_key = raft_log_key(shard_id, u64::MAX).to_vec();
 
-    async fn get_entry(
-        &self,
-        shard_id: ShardId,
-        index: u64,
-    ) -> Result<Option<LogEntry>, GgapError> {
-        let store = self.0.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<LogEntry>, GgapError> {
-            let key = raft_log_key(shard_id, index);
-            match store.raft_log.get(key).map_err(fjall_err)? {
-                Some(b) => Ok(Some(decode::<LogEntry>(&b)?)),
-                None => Ok(None),
-            }
+            let last_log_id = store
+                .raft_log
+                .range(start_key..=end_key)
+                .next_back()
+                .map(|g| {
+                    g.into_inner().map_err(fjall_err).and_then(|(_, v)| {
+                        let entry = decode::<LogEntry>(&v)?;
+                        Ok(LogId {
+                            term: entry.term,
+                            leader_id: entry.leader_id,
+                            index: entry.index,
+                        })
+                    })
+                })
+                .transpose()?;
+
+            // If the log is empty, last_log_id falls back to last_purged_log_id.
+            let last_log_id = last_log_id.or(last_purged_log_id);
+
+            Ok(LogState {
+                last_log_id,
+                last_purged_log_id,
+            })
         })
         .await
         .map_err(|e| GgapError::Storage(e.to_string()))?
@@ -214,11 +203,11 @@ impl LogStorage for FjallLogStorage {
         .map_err(|e| GgapError::Storage(e.to_string()))?
     }
 
-    async fn purge(&self, shard_id: ShardId, up_to_index: u64) -> Result<(), GgapError> {
+    async fn purge(&self, shard_id: ShardId, up_to: LogId) -> Result<(), GgapError> {
         let store = self.0.clone();
         tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
             let start = raft_log_key(shard_id, 0).to_vec();
-            let end = raft_log_key(shard_id, up_to_index).to_vec();
+            let end = raft_log_key(shard_id, up_to.index).to_vec();
 
             let keys: Vec<Vec<u8>> = store
                 .raft_log
@@ -233,7 +222,7 @@ impl LogStorage for FjallLogStorage {
             batch.insert(
                 &store.meta,
                 meta_key(shard_id, "last_purged"),
-                encode(&up_to_index)?,
+                encode(&up_to)?,
             );
             batch.commit().map_err(fjall_err)
         })
@@ -262,6 +251,38 @@ impl LogStorage for FjallLogStorage {
                 .map_err(fjall_err)?
             {
                 Some(b) => Ok(Some(decode::<Vote>(&b)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| GgapError::Storage(e.to_string()))?
+    }
+
+    async fn save_committed(
+        &self,
+        shard_id: ShardId,
+        committed: Option<LogId>,
+    ) -> Result<(), GgapError> {
+        let store = self.0.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
+            store
+                .meta
+                .insert(meta_key(shard_id, "committed"), encode(&committed)?)
+                .map_err(fjall_err)
+        })
+        .await
+        .map_err(|e| GgapError::Storage(e.to_string()))?
+    }
+
+    async fn read_committed(&self, shard_id: ShardId) -> Result<Option<LogId>, GgapError> {
+        let store = self.0.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<LogId>, GgapError> {
+            match store
+                .meta
+                .get(meta_key(shard_id, "committed"))
+                .map_err(fjall_err)?
+            {
+                Some(b) => decode::<Option<LogId>>(&b),
                 None => Ok(None),
             }
         })
@@ -1041,6 +1062,7 @@ mod tests {
         LogEntry {
             index,
             term,
+            leader_id: 1,
             payload: LogPayload::Blank,
         }
     }
@@ -1060,7 +1082,7 @@ mod tests {
         let shard = 0u64;
 
         let state = log.log_state(shard).await.unwrap();
-        assert!(state.first_index.is_none());
+        assert!(state.last_log_id.is_none());
 
         log.append(
             shard,
@@ -1070,23 +1092,26 @@ mod tests {
         .unwrap();
 
         let state = log.log_state(shard).await.unwrap();
-        assert_eq!(state.first_index, Some(1));
-        assert_eq!(state.last_index, Some(3));
-
-        let e = log.get_entry(shard, 2).await.unwrap().unwrap();
-        assert_eq!(e.index, 2);
+        assert_eq!(state.last_log_id.unwrap().index, 3);
 
         let es = log.get_entries(shard, 1, 2).await.unwrap();
         assert_eq!(es.len(), 2);
 
         log.truncate(shard, 3).await.unwrap();
         let state = log.log_state(shard).await.unwrap();
-        assert_eq!(state.last_index, Some(2));
+        assert_eq!(state.last_log_id.unwrap().index, 2);
 
-        log.purge(shard, 1).await.unwrap();
+        let purge_id = LogId {
+            term: 1,
+            leader_id: 1,
+            index: 1,
+        };
+        log.purge(shard, purge_id).await.unwrap();
         let state = log.log_state(shard).await.unwrap();
-        assert_eq!(state.last_purged_index, Some(1));
-        assert!(log.get_entry(shard, 1).await.unwrap().is_none());
+        assert_eq!(state.last_purged_log_id.unwrap().index, 1);
+        // Entry 1 should be gone
+        let es = log.get_entries(shard, 1, 1).await.unwrap();
+        assert!(es.is_empty());
     }
 
     #[tokio::test]

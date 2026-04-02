@@ -28,13 +28,15 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Result<T, GgapEr
 
 struct MemLogInner {
     entries: BTreeMap<u64, LogEntry>, // index → entry (single shard, Phase 3)
-    last_purged: Option<u64>,
-    votes: HashMap<u64, Vote>, // shard_id → vote
+    last_purged: Option<LogId>,
+    votes: HashMap<u64, Vote>,              // shard_id → vote
+    committed: HashMap<u64, Option<LogId>>, // shard_id → committed log id
 }
 
 /// In-memory `LogStorage` backed by a `BTreeMap`.
 ///
 /// Intended for unit tests; not persisted across restarts.
+#[derive(Clone)]
 pub struct MemLogStorage {
     inner: Arc<RwLock<MemLogInner>>,
 }
@@ -46,6 +48,7 @@ impl MemLogStorage {
                 entries: BTreeMap::new(),
                 last_purged: None,
                 votes: HashMap::new(),
+                committed: HashMap::new(),
             })),
         }
     }
@@ -60,19 +63,20 @@ impl Default for MemLogStorage {
 impl LogStorage for MemLogStorage {
     async fn log_state(&self, _shard_id: ShardId) -> Result<LogState, GgapError> {
         let g = self.inner.read().await;
+        let last_log_id = g
+            .entries
+            .values()
+            .next_back()
+            .map(|e| LogId {
+                term: e.term,
+                leader_id: e.leader_id,
+                index: e.index,
+            })
+            .or(g.last_purged);
         Ok(LogState {
-            first_index: g.entries.keys().next().copied(),
-            last_index: g.entries.keys().next_back().copied(),
-            last_purged_index: g.last_purged,
+            last_log_id,
+            last_purged_log_id: g.last_purged,
         })
-    }
-
-    async fn get_entry(
-        &self,
-        _shard_id: ShardId,
-        index: u64,
-    ) -> Result<Option<LogEntry>, GgapError> {
-        Ok(self.inner.read().await.entries.get(&index).cloned())
     }
 
     async fn get_entries(
@@ -102,10 +106,10 @@ impl LogStorage for MemLogStorage {
         Ok(())
     }
 
-    async fn purge(&self, _shard_id: ShardId, up_to_index: u64) -> Result<(), GgapError> {
+    async fn purge(&self, _shard_id: ShardId, up_to: LogId) -> Result<(), GgapError> {
         let mut g = self.inner.write().await;
-        g.entries.retain(|&idx, _| idx > up_to_index);
-        g.last_purged = Some(up_to_index);
+        g.entries.retain(|&idx, _| idx > up_to.index);
+        g.last_purged = Some(up_to);
         Ok(())
     }
 
@@ -116,6 +120,30 @@ impl LogStorage for MemLogStorage {
 
     async fn read_vote(&self, shard_id: ShardId) -> Result<Option<Vote>, GgapError> {
         Ok(self.inner.read().await.votes.get(&shard_id).cloned())
+    }
+
+    async fn save_committed(
+        &self,
+        shard_id: ShardId,
+        committed: Option<LogId>,
+    ) -> Result<(), GgapError> {
+        self.inner
+            .write()
+            .await
+            .committed
+            .insert(shard_id, committed);
+        Ok(())
+    }
+
+    async fn read_committed(&self, shard_id: ShardId) -> Result<Option<LogId>, GgapError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .committed
+            .get(&shard_id)
+            .cloned()
+            .flatten())
     }
 }
 
@@ -396,6 +424,7 @@ mod tests {
         LogEntry {
             index,
             term,
+            leader_id: 1,
             payload: LogPayload::Blank,
         }
     }
@@ -407,9 +436,8 @@ mod tests {
 
         // Empty state
         let state = store.log_state(shard).await.unwrap();
-        assert!(state.first_index.is_none());
-        assert!(state.last_index.is_none());
-        assert!(state.last_purged_index.is_none());
+        assert!(state.last_log_id.is_none());
+        assert!(state.last_purged_log_id.is_none());
 
         // Append entries 1..=3
         store
@@ -421,12 +449,7 @@ mod tests {
             .unwrap();
 
         let state = store.log_state(shard).await.unwrap();
-        assert_eq!(state.first_index, Some(1));
-        assert_eq!(state.last_index, Some(3));
-
-        // Get individual entry
-        let e = store.get_entry(shard, 2).await.unwrap().unwrap();
-        assert_eq!(e.index, 2);
+        assert_eq!(state.last_log_id.unwrap().index, 3);
 
         // Get range
         let entries = store.get_entries(shard, 1, 2).await.unwrap();
@@ -435,13 +458,17 @@ mod tests {
         // Truncate from index 3 (removes index 3)
         store.truncate(shard, 3).await.unwrap();
         let state = store.log_state(shard).await.unwrap();
-        assert_eq!(state.last_index, Some(2));
+        assert_eq!(state.last_log_id.unwrap().index, 2);
 
         // Purge up to index 1
-        store.purge(shard, 1).await.unwrap();
+        let purge_id = LogId {
+            term: 1,
+            leader_id: 1,
+            index: 1,
+        };
+        store.purge(shard, purge_id).await.unwrap();
         let state = store.log_state(shard).await.unwrap();
-        assert_eq!(state.first_index, Some(2));
-        assert_eq!(state.last_purged_index, Some(1));
+        assert_eq!(state.last_purged_log_id.unwrap().index, 1);
     }
 
     #[tokio::test]

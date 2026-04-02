@@ -18,14 +18,6 @@ pub trait LogStorage: Send + Sync + 'static {
         shard_id: ShardId,
     ) -> impl Future<Output = Result<LogState, GgapError>> + Send;
 
-    /// Return the entry at `index`, or `None` if it has been purged or does
-    /// not exist.
-    fn get_entry(
-        &self,
-        shard_id: ShardId,
-        index: u64,
-    ) -> impl Future<Output = Result<Option<LogEntry>, GgapError>> + Send;
-
     /// Return all entries in the inclusive range `[from, to_inclusive]`.
     fn get_entries(
         &self,
@@ -49,12 +41,12 @@ pub trait LogStorage: Send + Sync + 'static {
         from_index: u64,
     ) -> impl Future<Output = Result<(), GgapError>> + Send;
 
-    /// Delete all entries with `index <= up_to_index` (post-snapshot GC).
-    /// Updates `last_purged_index`.
+    /// Delete all entries with `index <= up_to.index` (post-snapshot GC).
+    /// Stores the full `LogId` as the purge marker for `log_state()`.
     fn purge(
         &self,
         shard_id: ShardId,
-        up_to_index: u64,
+        up_to: LogId,
     ) -> impl Future<Output = Result<(), GgapError>> + Send;
 
     /// Durably persist the vote for the shard (called before granting a vote).
@@ -69,6 +61,19 @@ pub trait LogStorage: Send + Sync + 'static {
         &self,
         shard_id: ShardId,
     ) -> impl Future<Output = Result<Option<Vote>, GgapError>> + Send;
+
+    /// Durably persist the committed log id for the shard.
+    fn save_committed(
+        &self,
+        shard_id: ShardId,
+        committed: Option<LogId>,
+    ) -> impl Future<Output = Result<(), GgapError>> + Send;
+
+    /// Retrieve the last persisted committed log id for the shard.
+    fn read_committed(
+        &self,
+        shard_id: ShardId,
+    ) -> impl Future<Output = Result<Option<LogId>, GgapError>> + Send;
 }
 
 /// Persistent key-value state machine for a single shard.

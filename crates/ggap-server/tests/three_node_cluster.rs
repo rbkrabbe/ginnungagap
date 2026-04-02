@@ -22,7 +22,7 @@ use ggap_consensus::{
     OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
-use ggap_storage::fjall::{FjallStateMachine, FjallStore};
+use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
 use ggap_types::{KvCommand, KvResponse, ReadMode};
@@ -47,7 +47,7 @@ async fn start_node(id: u64) -> TestNode {
     let tempdir = TempDir::new().unwrap();
     let store = FjallStore::open(tempdir.path()).unwrap();
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
-    let log_store = GgapLogStorage::new(store.clone(), 0);
+    let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     // Fast timeouts so tests finish quickly.
     let cfg = build_raft_config(50, 150, 300, 500);

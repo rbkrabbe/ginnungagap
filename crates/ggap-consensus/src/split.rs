@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use openraft::{BasicNode, ServerState};
 
-use ggap_storage::fjall::{FjallStateMachine, FjallStore};
+use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
 use ggap_types::{GgapError, KeyRange, ShardId, ShardInfo, ShardState};
 
@@ -189,7 +189,7 @@ impl SplitCoordinator {
         self.shard_map.put_shard(new_shard).await?;
 
         // 9. Bootstrap new Raft group for the new shard
-        let log_store = GgapLogStorage::new(self.store.clone(), new_shard_id);
+        let log_store = GgapLogStorage::new(FjallLogStorage(self.store.clone()), new_shard_id);
         let sm = GgapStateMachine::new(self.fsm.clone(), new_shard_id);
         let net = GgapNetworkFactory::new(new_shard_id);
         let cfg = build_raft_config(
