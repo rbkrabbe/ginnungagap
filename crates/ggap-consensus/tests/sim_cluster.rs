@@ -862,3 +862,94 @@ async fn test_snapshot_catchup() {
     let _ = raft4.shutdown().await;
     drop(dir4);
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_membership_change_under_partition() {
+    // Start a 3-node cluster.
+    let cluster = SimCluster::start(3, 1000).await;
+    let leader = cluster.wait_for_leader().await;
+
+    // Write initial data.
+    cluster.write(leader, "init", b"data").await;
+    tokio::time::advance(Duration::from_millis(200)).await;
+    drain_tasks(200).await;
+
+    // Add node 4 with its own storage (learner, non-blocking).
+    let new_id: u64 = 4;
+    let dir4 = tempfile::tempdir().unwrap();
+    let store4 = FjallStore::open(dir4.path()).unwrap();
+    let fsm4 = Arc::new(FjallStateMachine::new(store4.clone()));
+    let log_store4 = GgapLogStorage::new(FjallLogStorage(store4.clone()), 0);
+    let sm4 = GgapStateMachine::new(fsm4.clone(), 0);
+    let net4 = SimNetworkFactory {
+        from_id: new_id,
+        registry: cluster.registry.clone(),
+        fault: cluster.fault.clone(),
+    };
+    let cfg4 = build_raft_config(50, 150, 300, 1000);
+    let raft4 = Arc::new(
+        GgapRaft::new(new_id, cfg4, net4, log_store4, sm4)
+            .await
+            .unwrap(),
+    );
+    cluster.registry.write().await.insert(new_id, raft4.clone());
+
+    // Start the membership change (add_learner is non-blocking here).
+    cluster
+        .node(leader)
+        .raft
+        .add_learner(new_id, BasicNode::default(), false)
+        .await
+        .expect("add_learner failed");
+
+    // Immediately partition the leader from one follower to stress joint-consensus.
+    let follower = cluster
+        .nodes
+        .iter()
+        .find(|n| n.id != leader)
+        .map(|n| n.id)
+        .unwrap();
+    cluster.partition(leader, follower).await;
+
+    // Advance time: let the cluster detect partition and elect a new leader.
+    for _ in 0..20 {
+        tokio::time::advance(Duration::from_millis(300)).await;
+        drain_tasks(300).await;
+    }
+
+    // Heal the partition.
+    cluster.repair(leader, follower).await;
+
+    // Allow time for convergence.
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        drain_tasks(200).await;
+    }
+
+    // The cluster must have a stable leader.
+    let final_leader = cluster.wait_for_leader().await;
+    assert!(
+        (1..=4).contains(&final_leader),
+        "expected a valid leader after partition heals, got {final_leader}"
+    );
+
+    // All original nodes that are still in the registry must agree on the initial key.
+    let surviving_ids: Vec<u64> = {
+        let reg = cluster.registry.read().await;
+        reg.keys().copied().collect()
+    };
+    // Every surviving original node must have "init".
+    for id in &surviving_ids {
+        if *id <= 3 {
+            // original nodes only
+            assert_eq!(
+                cluster.read(*id, "init").await.as_deref(),
+                Some(b"data".as_ref()),
+                "node {id} lost the initial write after membership change + partition"
+            );
+        }
+    }
+
+    let _ = raft4.shutdown().await;
+    drop(dir4);
+}
