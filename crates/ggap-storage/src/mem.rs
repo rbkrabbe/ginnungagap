@@ -29,7 +29,7 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Result<T, GgapEr
 struct MemLogInner {
     entries: BTreeMap<u64, LogEntry>, // index → entry (single shard, Phase 3)
     last_purged: Option<LogId>,
-    votes: HashMap<u64, Vote>,          // shard_id → vote
+    votes: HashMap<u64, Vote>,              // shard_id → vote
     committed: HashMap<u64, Option<LogId>>, // shard_id → committed log id
 }
 

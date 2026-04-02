@@ -56,9 +56,7 @@ pub(crate) fn or_entry_to_log_entry(
 }
 
 /// Convert a domain `LogEntry` back to an openraft `Entry<GgapTypeConfig>`.
-pub(crate) fn log_entry_to_or_entry(
-    entry: &LogEntry,
-) -> Result<Entry<GgapTypeConfig>, GgapError> {
+pub(crate) fn log_entry_to_or_entry(entry: &LogEntry) -> Result<Entry<GgapTypeConfig>, GgapError> {
     let log_id = openraft::log_id::LogId {
         leader_id: LeaderId::new(entry.term, entry.leader_id),
         index: entry.index,

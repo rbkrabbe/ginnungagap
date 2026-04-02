@@ -117,16 +117,14 @@ impl LogStorage for FjallLogStorage {
                 .range(start_key..=end_key)
                 .next_back()
                 .map(|g| {
-                    g.into_inner()
-                        .map_err(fjall_err)
-                        .and_then(|(_, v)| {
-                            let entry = decode::<LogEntry>(&v)?;
-                            Ok(LogId {
-                                term: entry.term,
-                                leader_id: entry.leader_id,
-                                index: entry.index,
-                            })
+                    g.into_inner().map_err(fjall_err).and_then(|(_, v)| {
+                        let entry = decode::<LogEntry>(&v)?;
+                        Ok(LogId {
+                            term: entry.term,
+                            leader_id: entry.leader_id,
+                            index: entry.index,
                         })
+                    })
                 })
                 .transpose()?;
 
