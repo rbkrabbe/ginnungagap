@@ -844,6 +844,21 @@ async fn test_snapshot_catchup() {
         );
     }
 
+    // Verify that node 4 caught up via snapshot install (not just log replication).
+    // If a snapshot was installed, raft4.metrics().borrow().snapshot should be Some(_).
+    let metrics4 = raft4.metrics().borrow().clone();
+    assert!(
+        metrics4.snapshot.is_some(),
+        "node 4 should have installed a snapshot, but metrics.snapshot is None"
+    );
+
+    // last_applied should be at least the index of the 20th write.
+    let last_applied_index = metrics4.last_applied.map(|lid| lid.index).unwrap_or(0);
+    assert!(
+        last_applied_index >= 20,
+        "node 4 last_applied index {last_applied_index} should be >= 20"
+    );
+
     let _ = raft4.shutdown().await;
     drop(dir4);
 }
