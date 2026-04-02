@@ -349,6 +349,24 @@ async fn drain_tasks(n: usize) {
     }
 }
 
+/// Assert that every live node (present in the registry) has the same value for each key.
+/// `node_ids` is the list of node IDs to check. Panics on any mismatch or missing key.
+async fn assert_all_nodes_agree(cluster: &SimCluster, node_ids: &[u64], keys: &[&str]) {
+    for &key in keys {
+        let mut reference: Option<Option<Vec<u8>>> = None;
+        for &id in node_ids {
+            let val = cluster.read(id, key).await;
+            match &reference {
+                None => reference = Some(val),
+                Some(ref_val) => assert_eq!(
+                    ref_val, &val,
+                    "node {id} disagrees on key {key:?}: expected {ref_val:?}, got {val:?}"
+                ),
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Linearizability checker
 // ---------------------------------------------------------------------------
@@ -488,6 +506,20 @@ async fn test_leader_failure_and_reelection() {
         cluster.read(new_leader, "k2").await.as_deref(),
         Some(b"v2".as_ref())
     );
+
+    // Determine the surviving node (neither the killed leader nor the new leader).
+    let survivor = cluster
+        .nodes
+        .iter()
+        .find(|n| n.id != leader && n.id != new_leader)
+        .map(|n| n.id)
+        .unwrap();
+
+    // Both surviving nodes must agree on k1 and k2.
+    // Allow k2 time to replicate to survivor.
+    tokio::time::advance(Duration::from_millis(300)).await;
+    drain_tasks(200).await;
+    assert_all_nodes_agree(&cluster, &[new_leader, survivor], &["k1", "k2"]).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -530,14 +562,19 @@ async fn test_partition_and_heal() {
     cluster.repair(isolated, other).await;
 
     // Give the isolated node time to catch up.
-    tokio::time::advance(Duration::from_millis(600)).await;
-    drain_tasks(400).await;
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        drain_tasks(300).await;
+    }
 
     assert_eq!(
         cluster.read(isolated, "during").await.as_deref(),
         Some(b"majority".as_ref()),
         "isolated node should replicate after partition heals"
     );
+
+    // All three nodes must agree on both keys after the partition heals.
+    assert_all_nodes_agree(&cluster, &[leader, isolated, other], &["before", "during"]).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
