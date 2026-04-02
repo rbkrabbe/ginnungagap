@@ -123,6 +123,13 @@ impl ShardMap {
             .insert(key, val)
             .map_err(|e| GgapError::Storage(e.to_string()))
     }
+
+    /// Synchronous variant of `put_shard` — writes only to fjall storage,
+    /// not to the in-memory cache. Safe to call from `spawn_blocking` contexts.
+    /// The caller must subsequently update the in-memory cache via `put_shard`.
+    pub fn put_shard_sync(&self, info: &ShardInfo) -> Result<(), GgapError> {
+        self.persist_shard(info)
+    }
 }
 
 #[cfg(test)]

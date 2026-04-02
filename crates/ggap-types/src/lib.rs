@@ -89,6 +89,14 @@ pub enum KvCommand {
         new_value: Vec<u8>,
         ttl_ns: Option<i64>,
     },
+    /// Proposed by the split coordinator through the source shard's Raft log.
+    /// Every node applies this deterministically: copy keys >= split_key to
+    /// new_shard_id, delete them from source, update ShardMap ranges.
+    Split {
+        split_key: String,
+        new_shard_id: ShardId,
+        source_range: KeyRange,
+    },
 }
 
 /// Responses returned from state machine apply
@@ -113,6 +121,11 @@ pub enum KvResponse {
     /// Returned for Raft-internal entries (Blank, Membership).
     /// Never sent to clients; guarded by unreachable!() in ggap-server.
     NoOp,
+    /// Returned to the split coordinator after a KvCommand::Split is applied.
+    /// Never routed through the KV service path.
+    SplitComplete {
+        new_shard_id: ShardId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

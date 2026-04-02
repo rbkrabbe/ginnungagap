@@ -6,6 +6,7 @@ pub mod traits;
 pub mod ttl;
 pub mod types;
 
+pub use fjall::SplitApplied;
 pub use shard_map::ShardMap;
 pub use traits::{LogStorage, StateMachineStore};
 pub use types::{LogEntry, LogPayload, LogState, Snapshot, SnapshotContents, SnapshotMeta, Vote};

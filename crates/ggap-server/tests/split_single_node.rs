@@ -14,8 +14,9 @@ use openraft::{BasicNode, ServerState};
 use tempfile::TempDir;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
+    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
@@ -35,12 +36,24 @@ struct TestSetup {
 async fn setup() -> TestSetup {
     let tempdir = TempDir::new().unwrap();
     let store = FjallStore::open(tempdir.path()).unwrap();
-    let fsm = Arc::new(FjallStateMachine::new(store.clone()));
+
+    // ShardMap must be created before FSM so we can pass it in.
+    let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
+    shard_map.initialize_default().await.unwrap();
+
+    // Split channel: FjallStateMachine sends events; background handler receives them.
+    let (split_tx, split_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut fsm_builder = FjallStateMachine::new(store.clone());
+    fsm_builder.set_split_sender(split_tx);
+    fsm_builder.set_shard_map(shard_map.clone());
+    let fsm = Arc::new(fsm_builder);
+
+    let raft_cfg = build_raft_config(50, 150, 300, 500);
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
-    let cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
-        GgapRaft::new(1, cfg, GgapNetworkFactory::new(0), log_store, sm)
+        GgapRaft::new(1, raft_cfg.clone(), GgapNetworkFactory::new(0), log_store, sm)
             .await
             .unwrap(),
     );
@@ -56,9 +69,6 @@ async fn setup() -> TestSetup {
         .await
         .unwrap();
 
-    let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
-    shard_map.initialize_default().await.unwrap();
-
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
     let node = Arc::new(OpenRaftNode::new(
         raft.clone(),
@@ -70,17 +80,19 @@ async fn setup() -> TestSetup {
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
     router.add_shard(0, node, cluster).await;
 
+    // Spawn background split handler: creates new shard Raft instances on split events.
+    tokio::spawn(run_split_handler(
+        split_rx,
+        store.clone(),
+        fsm.clone(),
+        router.clone(),
+        1, // node_id
+        raft_cfg,
+    ));
+
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
-        store,
-        fsm: fsm.clone(),
-        node_id: 1,
-        cluster_addr: "127.0.0.1:0".into(), // unused for single-node
-        heartbeat_ms: 50,
-        election_min_ms: 150,
-        election_max_ms: 300,
-        snapshot_threshold: 500,
     }));
 
     TestSetup {
