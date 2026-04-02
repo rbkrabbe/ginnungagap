@@ -80,14 +80,14 @@ Each item below is designed to be implemented as an independent PR.
 
 ### P0 — High confidence gains, moderate effort
 
-#### 1. Add concurrent writers to the drop test
-Replace the sequential write loop in `test_message_drop_linearizability` with 3-5 concurrent writers (spawned tasks) writing to different key ranges simultaneously. Verify all writes eventually commit and are visible. This catches write-pipeline bugs that sequential testing misses.
-
-#### 2. Cross-node state assertion after every test
+#### 1. Cross-node state assertion after every test
 Add a helper `assert_all_nodes_agree(cluster, keys)` that reads each key from every surviving node's FSM and asserts they all match. Apply after `test_leader_failure_and_reelection` (check `k1` on new leader), and after `test_partition_and_heal`.
 
-#### 3. Verify snapshot was actually installed
+#### 2. Verify snapshot was actually installed
 In `test_snapshot_catchup`, after adding node 4, check that node 4's last applied log index jumped (indicating snapshot install) rather than incrementing one-by-one (indicating log replication). Can query `raft4.metrics().borrow().last_applied`.
+
+#### 3. Membership change under partition
+Start a membership change (add node 4), then partition the leader mid-joint-consensus. Verify the cluster recovers to a consistent membership state.
 
 ### P1 — Meaningful coverage expansion
 
@@ -104,9 +104,6 @@ Rename `check_read_after_write` to exactly that — don't call it a linearizabil
 
 #### 7. Cascading leader failure
 Elect leader A, write, kill A, wait for B to become leader, immediately kill B. Verify the remaining node C either becomes leader (if quorum allows) or correctly refuses writes.
-
-#### 8. Membership change under partition
-Start a membership change (add node 4), then partition the leader mid-joint-consensus. Verify the cluster recovers to a consistent membership state.
 
 ---
 
