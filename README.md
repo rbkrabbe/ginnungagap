@@ -74,12 +74,77 @@ All storage keys are prefixed with `be_u64(shard_id)`, so splitting is a metadat
 
 ## Running
 
+### Single node
+
 ```bash
 cargo run -p ggap-node -- \
   --node-id 1 \
   --client-addr 127.0.0.1:17000 \
-  --cluster-addr 127.0.0.1:17001
+  --cluster-addr 127.0.0.1:17001 \
+  --data-dir /tmp/ggap-node1
 ```
+
+### Multi-node cluster
+
+A production-grade Raft cluster runs 3 or 5 nodes (odd count ensures a majority quorum can always form). Each node requires a unique `--node-id`, `--client-addr` (gRPC for clients), `--cluster-addr` (internal Raft RPC), and `--data-dir`.
+
+**Terminal 1 — node 1 (bootstraps as initial leader)**
+
+```bash
+cargo run -p ggap-node -- \
+  --node-id 1 \
+  --client-addr 127.0.0.1:17000 \
+  --cluster-addr 127.0.0.1:17001 \
+  --data-dir /tmp/ggap-node1
+```
+
+Node 1 initialises a single-member Raft group on first boot and immediately becomes leader.
+
+**Terminal 2 — node 2**
+
+```bash
+cargo run -p ggap-node -- \
+  --node-id 2 \
+  --client-addr 127.0.0.1:17010 \
+  --cluster-addr 127.0.0.1:17011 \
+  --data-dir /tmp/ggap-node2
+```
+
+**Terminal 3 — node 3**
+
+```bash
+cargo run -p ggap-node -- \
+  --node-id 3 \
+  --client-addr 127.0.0.1:17020 \
+  --cluster-addr 127.0.0.1:17021 \
+  --data-dir /tmp/ggap-node3
+```
+
+**Add nodes to the cluster**
+
+Once all three processes are running, register nodes 2 and 3 as learners by calling the leader's cluster port (17001):
+
+```bash
+# Add node 2 as a learner
+grpcurl -plaintext \
+  -d '{"node":{"node_id":2,"client_addr":"127.0.0.1:17010","cluster_addr":"127.0.0.1:17011"}}' \
+  localhost:17001 ginnungagap.v1.AdminService/AddLearner
+
+# Add node 3 as a learner
+grpcurl -plaintext \
+  -d '{"node":{"node_id":3,"client_addr":"127.0.0.1:17020","cluster_addr":"127.0.0.1:17021"}}' \
+  localhost:17001 ginnungagap.v1.AdminService/AddLearner
+```
+
+Then promote all three to voting members:
+
+```bash
+grpcurl -plaintext \
+  -d '{"node_ids":[1,2,3]}' \
+  localhost:17001 ginnungagap.v1.AdminService/ChangeMembership
+```
+
+> **Note:** `AddLearner` and `ChangeMembership` currently return `UNIMPLEMENTED` — the gRPC membership-management handlers are not yet wired up. Once complete, the flow above will be the standard way to grow or shrink the cluster without a restart.
 
 With [grpcurl](https://github.com/fullstorydev/grpcurl) (server reflection is enabled, no `--proto` needed):
 
