@@ -370,6 +370,83 @@ fn check_read_after_write(history: &[OpRecord], reads: &[(String, bool)]) -> boo
     true
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent writer task
+// ---------------------------------------------------------------------------
+
+/// A single writer task that writes `num_writes` keys with a unique prefix,
+/// retrying on errors with leader re-discovery from the registry.
+async fn writer_task(
+    writer_id: usize,
+    num_writes: usize,
+    registry: NodeRegistry,
+    result_tx: tokio::sync::mpsc::Sender<OpRecord>,
+) {
+    let mut cur_leader_id: Option<u64> = None;
+
+    for i in 0..num_writes {
+        let key = format!("w{writer_id}_key{i:02}");
+        let value = format!("w{writer_id}_val{i}").into_bytes();
+
+        let log_index = loop {
+            // Find the current leader from the registry.
+            let leader_raft = {
+                let reg = registry.read().await;
+                let cached = cur_leader_id.and_then(|lid| {
+                    let r = reg.get(&lid)?;
+                    if r.metrics().borrow().state == ServerState::Leader {
+                        Some(r.clone())
+                    } else {
+                        None
+                    }
+                });
+                match cached {
+                    Some(r) => r,
+                    None => {
+                        // Scan for a leader.
+                        let found = reg.iter().find_map(|(&id, r)| {
+                            if r.metrics().borrow().state == ServerState::Leader {
+                                Some((id, r.clone()))
+                            } else {
+                                None
+                            }
+                        });
+                        match found {
+                            Some((id, r)) => {
+                                cur_leader_id = Some(id);
+                                r
+                            }
+                            None => {
+                                // No leader yet; yield and retry.
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            };
+
+            match leader_raft
+                .client_write(KvCommand::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                    ttl_ns: None,
+                    expect_version: 0,
+                })
+                .await
+            {
+                Ok(resp) => break resp.log_id().index,
+                Err(_) => {
+                    cur_leader_id = None; // force re-discovery
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+
+        let _ = result_tx.send(OpRecord { key, log_index }).await;
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -539,6 +616,78 @@ async fn test_message_drop_linearizability() {
     assert!(
         check_read_after_write(&history, &reads),
         "read-after-write linearizability violated"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_message_drop_linearizability_concurrent() {
+    let cluster = SimCluster::start(3, 1000).await;
+    let _leader = cluster.wait_for_leader().await;
+
+    // 20 % message drop rate.
+    cluster.fault.set_drop_rate(200_000);
+
+    const NUM_WRITERS: usize = 5;
+    const WRITES_PER_WRITER: usize = 10;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OpRecord>(NUM_WRITERS * WRITES_PER_WRITER);
+
+    let mut handles = Vec::new();
+    for w in 0..NUM_WRITERS {
+        let registry = cluster.registry.clone();
+        let tx = tx.clone();
+        handles.push(tokio::spawn(writer_task(
+            w,
+            WRITES_PER_WRITER,
+            registry,
+            tx,
+        )));
+    }
+    drop(tx); // close sender so rx drains cleanly after writers finish
+
+    // Pump simulated time until all writers complete.
+    let mut rounds = 0;
+    loop {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        drain_tasks(200).await;
+        if handles.iter().all(|h| h.is_finished()) {
+            break;
+        }
+        rounds += 1;
+        if rounds > 2000 {
+            panic!("concurrent writers did not complete after 200 s of simulated time");
+        }
+    }
+
+    // Propagate any panics from writer tasks.
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Collect all OpRecords.
+    let mut history = Vec::new();
+    while let Ok(record) = rx.try_recv() {
+        history.push(record);
+    }
+    assert_eq!(
+        history.len(),
+        NUM_WRITERS * WRITES_PER_WRITER,
+        "expected {} committed writes, got {}",
+        NUM_WRITERS * WRITES_PER_WRITER,
+        history.len()
+    );
+
+    // Verify every key is readable from the leader's FSM.
+    let leader = cluster.wait_for_leader().await;
+    let mut reads = Vec::new();
+    for record in &history {
+        let visible = cluster.read(leader, &record.key).await.is_some();
+        reads.push((record.key.clone(), visible));
+    }
+
+    assert!(
+        check_read_after_write(&history, &reads),
+        "read-after-write violated with concurrent writers"
     );
 }
 
