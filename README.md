@@ -72,12 +72,19 @@ All storage keys are prefixed with `be_u64(shard_id)`, so splitting is a metadat
 - **Single-shard scans** — scans that span shard boundaries are rejected; clients must issue per-shard scans
 - **Writes blocked during split** — the source shard is unavailable for writes while the split executes
 
+## Building
+
+```bash
+cargo build --release -p ggap-node
+# binary at: target/release/ggap-node
+```
+
 ## Running
 
 ### Single node
 
 ```bash
-cargo run -p ggap-node -- \
+ggap-node \
   --node-id 1 \
   --client-addr 127.0.0.1:17000 \
   --cluster-addr 127.0.0.1:17001 \
@@ -91,7 +98,7 @@ A production-grade Raft cluster runs 3 or 5 nodes (odd count ensures a majority 
 **Terminal 1 — node 1 (bootstraps as initial leader)**
 
 ```bash
-cargo run -p ggap-node -- \
+ggap-node \
   --node-id 1 \
   --client-addr 127.0.0.1:17000 \
   --cluster-addr 127.0.0.1:17001 \
@@ -103,7 +110,7 @@ Node 1 initialises a single-member Raft group on first boot and immediately beco
 **Terminal 2 — node 2**
 
 ```bash
-cargo run -p ggap-node -- \
+ggap-node \
   --node-id 2 \
   --client-addr 127.0.0.1:17010 \
   --cluster-addr 127.0.0.1:17011 \
@@ -113,7 +120,7 @@ cargo run -p ggap-node -- \
 **Terminal 3 — node 3**
 
 ```bash
-cargo run -p ggap-node -- \
+ggap-node \
   --node-id 3 \
   --client-addr 127.0.0.1:17020 \
   --cluster-addr 127.0.0.1:17021 \
