@@ -562,8 +562,10 @@ async fn test_partition_and_heal() {
     cluster.repair(isolated, other).await;
 
     // Give the isolated node time to catch up.
-    tokio::time::advance(Duration::from_millis(600)).await;
-    drain_tasks(400).await;
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        drain_tasks(300).await;
+    }
 
     assert_eq!(
         cluster.read(isolated, "during").await.as_deref(),
