@@ -318,6 +318,11 @@ pub struct FjallStateMachine {
     watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
     split_tx: Option<tokio::sync::mpsc::UnboundedSender<SplitApplied>>,
     shard_map: Option<Arc<ShardMap>>,
+    /// Fault injection: when `true`, `apply()` returns `Err` after Phase 1 commits
+    /// but before Phase 2 (ShardMap updates), simulating a crash at that boundary.
+    /// Always present but can only be armed via `arm_crash_after_phase1` which is
+    /// gated behind `#[cfg(any(test, feature = "test-utils"))]`.
+    crash_after_phase1: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FjallStateMachine {
@@ -329,6 +334,7 @@ impl FjallStateMachine {
             watch_tx: None,
             split_tx: None,
             shard_map: None,
+            crash_after_phase1: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -340,7 +346,16 @@ impl FjallStateMachine {
             watch_tx: None,
             split_tx: None,
             shard_map: None,
+            crash_after_phase1: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Arm the crash-injection point between Phase 1 and Phase 2 of a Split apply.
+    /// Available in test builds and when the `test-utils` feature is enabled.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_crash_after_phase1(&self) {
+        self.crash_after_phase1
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn with_clock(mut self, now_fn: NowFn) -> Self {
@@ -437,6 +452,17 @@ impl StateMachineStore for FjallStateMachine {
             })
             .await
             .map_err(|e| GgapError::Storage(e.to_string()))??;
+
+            // Fault injection: simulate a crash after Phase 1 commits but before Phase 2.
+            // The flag is never armed in production (arm_crash_after_phase1 is test-only).
+            if self
+                .crash_after_phase1
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(GgapError::Storage(
+                    "simulated crash after phase 1".into(),
+                ));
+            }
 
             // Phase 2: update ShardMap in-memory cache (async).
             if let Some(ref sm) = self.shard_map {
