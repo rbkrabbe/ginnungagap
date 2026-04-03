@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use ggap_storage::{
     fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
+    keys::meta_key,
     ttl::TtlGcTask,
     ShardMap,
 };
@@ -207,19 +208,39 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to create Raft for shard {shard_id}"))?,
         );
 
-        // Initialize as single-node cluster on first boot (only for shard 0 initially).
+        // Initialize Raft membership on first boot.
+        // - Shard 0 (and any shard created before this fix): single-node bootstrap.
+        // - Split-created shards: read membership from bootstrap_members key written
+        //   atomically with the split data movement. This prevents a restarted node
+        //   from re-initializing as a single-node cluster, discarding replication.
         if !raft
             .is_initialized()
             .await
             .with_context(|| format!("raft.is_initialized failed for shard {shard_id}"))?
         {
-            let mut members = BTreeMap::new();
-            members.insert(
-                cli.node_id,
-                BasicNode {
-                    addr: cluster_addr.to_string(),
-                },
-            );
+            let bootstrap_key = meta_key(shard_id, "bootstrap_members");
+            let members: BTreeMap<u64, BasicNode> = match store.meta.get(&bootstrap_key) {
+                Ok(Some(bytes)) => {
+                    let (addr_map, _): (BTreeMap<u64, String>, _) =
+                        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                            .with_context(|| {
+                                format!("failed to decode bootstrap_members for shard {shard_id}")
+                            })?;
+                    addr_map
+                        .into_iter()
+                        .map(|(id, addr)| (id, BasicNode { addr }))
+                        .collect()
+                }
+                Ok(None) => {
+                    // Original shard or pre-fix split: fall back to single-node init.
+                    BTreeMap::from([(cli.node_id, BasicNode { addr: cluster_addr.to_string() })])
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to read bootstrap_members for shard {shard_id}: {e}"
+                    ));
+                }
+            };
             raft.initialize(members)
                 .await
                 .map_err(|e| anyhow::anyhow!("raft.initialize failed for shard {shard_id}: {e}"))?;

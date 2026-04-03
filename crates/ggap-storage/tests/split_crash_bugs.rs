@@ -110,6 +110,7 @@ async fn bug1_nonatomic_split_loses_data_on_crash() {
                         start: String::new(),
                         end: String::new(),
                     },
+                    source_members: [(1u64, "127.0.0.1:7001".to_string())].into(),
                 }),
                 None,
             )
@@ -124,45 +125,25 @@ async fn bug1_nonatomic_split_loses_data_on_crash() {
     }
 
     // --- Restart: reopen store from the same path ---
+    // The fault injection fired after the atomic batch committed, so storage
+    // is fully consistent: ShardMap, data, and last_applied were all written
+    // in the same batch.commit() call.
     let store2 = FjallStore::open(dir.path()).unwrap();
     let shard_map2 = ShardMap::load(store2.clone()).unwrap();
 
-    // BUG: ShardMap shows only shard 0 with the full range.
-    // Shard 1 was never written in Phase 2.
+    // Both shards are in the ShardMap — written atomically with the data.
     let shards = shard_map2.all_shards().await;
-    assert_eq!(
-        shards.len(),
-        1,
-        "bug1: ShardMap should have 2 shards after split, but has {}",
-        shards.len()
-    );
-    assert!(
-        shards[0].range.end.is_empty(),
-        "bug1: shard 0 still claims the full key range"
-    );
+    assert_eq!(shards.len(), 2, "both shards must be in the ShardMap after atomic commit");
 
-    // BUG: upper-half data is gone from shard 0 (Phase 1 deleted it)
-    assert!(
-        has_key(&store2, 0, "apple"),
-        "lower-half key 'apple' should still be in shard 0"
-    );
-    assert!(
-        !has_key(&store2, 0, "mango"),
-        "bug1: 'mango' was deleted from shard 0 by Phase 1 but ShardMap still claims shard 0 owns it"
-    );
+    // Lower-half data still in shard 0.
+    assert!(has_key(&store2, 0, "apple"), "'apple' must remain in shard 0");
+    assert!(!has_key(&store2, 0, "mango"), "'mango' must have been moved out of shard 0");
 
-    // BUG: data exists in shard 1 storage but is unroutable via ShardMap
-    assert!(
-        has_key(&store2, 1, "mango"),
-        "bug1: 'mango' is stranded in shard 1 storage with no ShardMap entry routing to it"
-    );
+    // Upper-half data routable via shard 1.
+    assert!(has_key(&store2, 1, "mango"), "'mango' must be in shard 1");
 
-    // BUG: last_applied is advanced past the split entry; Raft won't re-apply it
-    assert_eq!(
-        last_applied_index(&store2, 0),
-        Some(5),
-        "bug1: last_applied must equal split entry index so Raft skips re-apply"
-    );
+    // last_applied advanced, split will not be re-applied.
+    assert_eq!(last_applied_index(&store2, 0), Some(5));
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +182,7 @@ async fn bug2_no_bootstrap_members_for_split_shard() {
                         start: String::new(),
                         end: String::new(),
                     },
+                    source_members: [(1u64, "127.0.0.1:7001".to_string())].into(),
                 }),
                 None,
             )
@@ -225,13 +207,19 @@ async fn bug2_no_bootstrap_members_for_split_shard() {
         "split completed, ShardMap must show 2 shards"
     );
 
-    // BUG: no bootstrap_members key stored for shard 1.
-    // On restart, main.rs has no way to know the membership for shard 1
-    // and falls back to single-node initialization.
+    // bootstrap_members is now written atomically with the split data.
+    // On restart, main.rs can read this key and initialise the new shard
+    // with the correct multi-node membership.
     let bootstrap_key = meta_key(1, "bootstrap_members");
     let result = store2.meta.get(&bootstrap_key).unwrap();
     assert!(
-        result.is_none(),
-        "bug2: bootstrap_members must be absent — this is the bug being demonstrated"
+        result.is_some(),
+        "bootstrap_members must be present after the fix so restart uses correct membership"
     );
+
+    // The stored membership should match what was passed in source_members.
+    let raw = result.unwrap();
+    let (members, _): (std::collections::BTreeMap<u64, String>, _) =
+        bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    assert_eq!(members.get(&1u64).map(|s| s.as_str()), Some("127.0.0.1:7001"));
 }

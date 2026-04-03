@@ -10,7 +10,7 @@ use tracing::warn;
 use crate::keys::{
     data_key, data_shard_end, history_key, history_prefix, meta_key, raft_log_key, ttl_index_key,
 };
-use crate::shard_map::ShardMap;
+use crate::shard_map::{bootstrap_members_key, encode as sm_encode, shard_map_key, ShardMap};
 use crate::traits::{LogStorage, StateMachineStore};
 use crate::types::{LogEntry, LogState, Snapshot, SnapshotContents, SnapshotMeta, Vote};
 
@@ -427,34 +427,92 @@ impl StateMachineStore for FjallStateMachine {
             ref split_key,
             new_shard_id,
             ref source_range,
+            ref source_members,
         }) = cmd
         {
             let store = self.store.clone();
             let split_key = split_key.clone();
             let source_range = source_range.clone();
-            // Clone again for use after the spawn_blocking (split_key is moved in).
+            let source_members = source_members.clone();
+            // Keep copies for the in-memory cache update after spawn_blocking.
             let split_key_post = split_key.clone();
+            let source_range_post = source_range.clone();
 
-            // Phase 1: synchronous data movement inside spawn_blocking.
-            tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
+            // Single atomic spawn_blocking: reads, then one batch.commit() covering
+            // data movement + last_applied + ShardMap entries + bootstrap_members.
+            // A crash at any point leaves the store consistent: either all of these
+            // are visible on restart, or none are (last_applied not advanced →
+            // Raft re-applies the entry on the next leader).
+            tokio::task::spawn_blocking(move || -> Result<(ShardInfo, ShardInfo), GgapError> {
+                // Read phase (no writes yet).
                 let contents = build_partial_snapshot_sync(&store, shard_id, &split_key)?;
-                install_partial_snapshot_sync(&store, new_shard_id, &contents)?;
-                delete_range_from_sync(&store, shard_id, &split_key)?;
+                let (del_data, del_history, del_ttl) =
+                    collect_range_deletes(&store, shard_id, &split_key)?;
 
-                // Advance last_applied atomically with the data movement.
+                let updated_source = ShardInfo {
+                    shard_id,
+                    range: KeyRange {
+                        start: source_range.start.clone(),
+                        end: split_key.clone(),
+                    },
+                    state: ShardState::Active,
+                };
+                let new_shard = ShardInfo {
+                    shard_id: new_shard_id,
+                    range: KeyRange {
+                        start: split_key.clone(),
+                        end: source_range.end.clone(),
+                    },
+                    state: ShardState::Active,
+                };
+
+                // Single atomic batch: all or nothing.
                 let mut batch = store.db.batch();
+
+                // 1. Copy upper-half data to new shard.
+                install_into_batch(&mut batch, &store, new_shard_id, &contents)?;
+
+                // 2. Delete upper-half from source shard.
+                delete_range_into_batch(&mut batch, &store, del_data, del_history, del_ttl);
+
+                // 3. Advance last_applied for the source shard.
                 batch.insert(
                     &store.meta,
                     meta_key(shard_id, "last_applied"),
                     encode(&log_id)?,
                 );
-                batch.commit().map_err(fjall_err)
+
+                // 4. Persist updated source ShardMap entry (narrowed range).
+                batch.insert(
+                    &store.meta,
+                    shard_map_key(shard_id),
+                    sm_encode(&updated_source)?,
+                );
+
+                // 5. Persist new shard ShardMap entry.
+                batch.insert(
+                    &store.meta,
+                    shard_map_key(new_shard_id),
+                    sm_encode(&new_shard)?,
+                );
+
+                // 6. Persist bootstrap membership for the new shard so that on
+                //    restart main.rs can initialise it with the correct peers.
+                batch.insert(
+                    &store.meta,
+                    bootstrap_members_key(new_shard_id),
+                    encode(&source_members)?,
+                );
+
+                batch.commit().map_err(fjall_err)?;
+                Ok((updated_source, new_shard))
             })
             .await
             .map_err(|e| GgapError::Storage(e.to_string()))??;
 
-            // Fault injection: simulate a crash after Phase 1 commits but before Phase 2.
-            // The flag is never armed in production (arm_crash_after_phase1 is test-only).
+            // Fault injection: armed in tests to verify the pre-fix buggy state.
+            // After the fix above this point is never reached with inconsistent state,
+            // but the check is kept so existing repro tests document the old boundary.
             if self
                 .crash_after_phase1
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -464,12 +522,14 @@ impl StateMachineStore for FjallStateMachine {
                 ));
             }
 
-            // Phase 2: update ShardMap in-memory cache (async).
+            // Update in-memory ShardMap cache only — storage was already written
+            // atomically in the batch above. Do not call put_shard() (which would
+            // double-write to fjall).
             if let Some(ref sm) = self.shard_map {
                 let updated_source = ShardInfo {
                     shard_id,
                     range: KeyRange {
-                        start: source_range.start.clone(),
+                        start: source_range_post.start.clone(),
                         end: split_key_post.clone(),
                     },
                     state: ShardState::Active,
@@ -478,15 +538,14 @@ impl StateMachineStore for FjallStateMachine {
                     shard_id: new_shard_id,
                     range: KeyRange {
                         start: split_key_post.clone(),
-                        end: source_range.end.clone(),
+                        end: source_range_post.end.clone(),
                     },
                     state: ShardState::Active,
                 };
-                sm.put_shard(updated_source).await?;
-                sm.put_shard(new_shard).await?;
+                sm.update_cache_after_split(updated_source, new_shard).await;
             }
 
-            // Phase 3: signal background split handler.
+            // Signal background split handler.
             if let Some(ref tx) = self.split_tx {
                 let _ = tx.send(SplitApplied { new_shard_id });
             }
@@ -1035,6 +1094,17 @@ pub(crate) fn install_partial_snapshot_sync(
     contents: &SnapshotContents,
 ) -> Result<(), GgapError> {
     let mut batch = store.db.batch();
+    install_into_batch(&mut batch, store, new_shard_id, contents)?;
+    batch.commit().map_err(fjall_err)
+}
+
+/// Add snapshot install writes to an existing batch without committing.
+pub(crate) fn install_into_batch(
+    batch: &mut fjall::OwnedWriteBatch,
+    store: &FjallStore,
+    new_shard_id: ShardId,
+    contents: &SnapshotContents,
+) -> Result<(), GgapError> {
     for (user_key, entry) in &contents.data {
         batch.insert(
             &store.data,
@@ -1056,15 +1126,16 @@ pub(crate) fn install_partial_snapshot_sync(
             encode(entry)?,
         );
     }
-    batch.commit().map_err(fjall_err)
+    Ok(())
 }
 
-/// Delete all keys `>= from_key` from data, history, and ttl_index for `shard_id`.
-pub(crate) fn delete_range_from_sync(
+/// Collect all raw storage keys `>= from_key` for `shard_id` across data,
+/// history, and ttl_index. Returns (data_keys, history_keys, ttl_keys).
+pub(crate) fn collect_range_deletes(
     store: &FjallStore,
     shard_id: ShardId,
     from_key: &str,
-) -> Result<(), GgapError> {
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>), GgapError> {
     let start = data_key(shard_id, from_key);
     let shard_end = data_shard_end(shard_id).to_vec();
 
@@ -1110,7 +1181,29 @@ pub(crate) fn delete_range_from_sync(
         })
         .collect::<Result<_, _>>()?;
 
+    Ok((data_keys, history_keys, ttl_keys))
+}
+
+/// Delete all keys `>= from_key` from data, history, and ttl_index for `shard_id`.
+pub(crate) fn delete_range_from_sync(
+    store: &FjallStore,
+    shard_id: ShardId,
+    from_key: &str,
+) -> Result<(), GgapError> {
+    let (data_keys, history_keys, ttl_keys) = collect_range_deletes(store, shard_id, from_key)?;
     let mut batch = store.db.batch();
+    delete_range_into_batch(&mut batch, store, data_keys, history_keys, ttl_keys);
+    batch.commit().map_err(fjall_err)
+}
+
+/// Add range-delete writes to an existing batch without committing.
+pub(crate) fn delete_range_into_batch(
+    batch: &mut fjall::OwnedWriteBatch,
+    store: &FjallStore,
+    data_keys: Vec<Vec<u8>>,
+    history_keys: Vec<Vec<u8>>,
+    ttl_keys: Vec<Vec<u8>>,
+) {
     for k in data_keys {
         batch.remove(&store.data, k);
     }
@@ -1120,7 +1213,6 @@ pub(crate) fn delete_range_from_sync(
     for k in ttl_keys {
         batch.remove(&store.ttl_index, k);
     }
-    batch.commit().map_err(fjall_err)
 }
 
 // ---------------------------------------------------------------------------

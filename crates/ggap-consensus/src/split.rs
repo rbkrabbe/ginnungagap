@@ -141,6 +141,10 @@ impl SplitCoordinator {
             split_key: split_key.to_string(),
             new_shard_id,
             source_range: source_info.range.clone(),
+            source_members: source_members
+                .iter()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect(),
         };
         let write_result = source_node
             .raft()

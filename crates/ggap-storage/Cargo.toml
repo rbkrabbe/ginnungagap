@@ -20,6 +20,10 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 
+[[test]]
+name = "split_crash_bugs"
+required-features = ["test-utils"]
+
 [dev-dependencies]
 tempfile = "3"
 bincode = { workspace = true }

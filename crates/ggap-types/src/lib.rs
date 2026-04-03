@@ -91,11 +91,19 @@ pub enum KvCommand {
     },
     /// Proposed by the split coordinator through the source shard's Raft log.
     /// Every node applies this deterministically: copy keys >= split_key to
-    /// new_shard_id, delete them from source, update ShardMap ranges.
+    /// new_shard_id, delete them from source, update ShardMap ranges, and
+    /// persist bootstrap membership for the new shard so it can be restarted
+    /// with the correct Raft group.
     Split {
         split_key: String,
         new_shard_id: ShardId,
         source_range: KeyRange,
+        /// Raft membership for the new shard: node_id → gRPC address.
+        /// Stored atomically alongside the data movement so that on restart
+        /// main.rs can initialise the new shard with the correct peers.
+        /// Uses `String` addresses (not `BasicNode`) to keep ggap-types free
+        /// of any openraft dependency.
+        source_members: std::collections::BTreeMap<u64, String>,
     },
 }
 
