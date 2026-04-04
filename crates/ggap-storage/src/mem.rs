@@ -313,6 +313,12 @@ impl StateMachineStore for MemStateMachine {
                 // Raft-internal entry (Blank, Membership). No state change; return NoOp.
                 KvResponse::NoOp
             }
+            Some(KvCommand::Split { .. }) => {
+                // MemStateMachine is used only in tests; Split is not supported there.
+                return Err(GgapError::InvalidArgument(
+                    "Split command not supported by MemStateMachine".into(),
+                ));
+            }
         };
 
         if let Some(bytes) = membership_bytes {

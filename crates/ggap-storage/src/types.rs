@@ -56,7 +56,7 @@ pub struct SnapshotMeta {
 /// partition are captured so that `at_version` reads survive a snapshot
 /// round-trip on the node that built it, and remain available on a follower
 /// that receives and installs the snapshot.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotContents {
     /// Current value per key (mirrors the `data` partition).
     pub data: Vec<(String, KvEntry)>,

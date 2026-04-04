@@ -88,14 +88,6 @@ async fn start_node(id: u64) -> BenchNode {
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
-        store,
-        fsm,
-        node_id: id,
-        cluster_addr: cluster_addr.to_string(),
-        heartbeat_ms: HEARTBEAT_MS,
-        election_min_ms: ELECTION_MIN_MS,
-        election_max_ms: ELECTION_MAX_MS,
-        snapshot_threshold: 50_000,
     }));
 
     let mut handles = Vec::new();

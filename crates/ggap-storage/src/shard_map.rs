@@ -12,13 +12,19 @@ use crate::keys::meta_key;
 /// keyspace. This must never collide with a real shard_id.
 const SHARD_MAP_PREFIX: ShardId = u64::MAX;
 
-fn shard_map_key(shard_id: ShardId) -> Vec<u8> {
+pub(crate) fn shard_map_key(shard_id: ShardId) -> Vec<u8> {
     // meta_key(SHARD_MAP_PREFIX, "shard:XXXX") where XXXX is be_u64(shard_id)
     let label = format!("shard:{}", shard_id);
     meta_key(SHARD_MAP_PREFIX, &label)
 }
 
-fn encode<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, GgapError> {
+/// Key used to store bootstrap membership for a shard created by a split.
+/// Written atomically with the split data movement so restart can find peers.
+pub(crate) fn bootstrap_members_key(shard_id: ShardId) -> Vec<u8> {
+    meta_key(shard_id, "bootstrap_members")
+}
+
+pub(crate) fn encode<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, GgapError> {
     bincode::serde::encode_to_vec(val, bincode::config::standard())
         .map_err(|e| GgapError::Storage(e.to_string()))
 }
@@ -122,6 +128,22 @@ impl ShardMap {
             .meta
             .insert(key, val)
             .map_err(|e| GgapError::Storage(e.to_string()))
+    }
+
+    /// Synchronous variant of `put_shard` — writes only to fjall storage,
+    /// not to the in-memory cache. Safe to call from `spawn_blocking` contexts.
+    /// The caller must subsequently update the in-memory cache via `put_shard`.
+    pub fn put_shard_sync(&self, info: &ShardInfo) -> Result<(), GgapError> {
+        self.persist_shard(info)
+    }
+
+    /// Update only the in-memory cache for two shards after a split whose
+    /// storage writes have already been committed atomically by the caller.
+    /// Does NOT write to fjall — storage is already consistent.
+    pub async fn update_cache_after_split(&self, updated_source: ShardInfo, new_shard: ShardInfo) {
+        let mut shards = self.shards.write().await;
+        shards.insert(updated_source.shard_id, updated_source);
+        shards.insert(new_shard.shard_id, new_shard);
     }
 }
 

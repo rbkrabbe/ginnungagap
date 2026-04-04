@@ -2,14 +2,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ggap_types::{
-    system_now_fn, DomainWatchEvent, GgapError, KvCommand, KvEntry, KvResponse, LogId, NowFn,
-    ShardId, WatchEventKind,
+    system_now_fn, DomainWatchEvent, GgapError, KeyRange, KvCommand, KvEntry, KvResponse, LogId,
+    NowFn, ShardId, ShardInfo, ShardState, WatchEventKind,
 };
 use tracing::warn;
 
 use crate::keys::{
     data_key, data_shard_end, history_key, history_prefix, meta_key, raft_log_key, ttl_index_key,
 };
+use crate::shard_map::{bootstrap_members_key, encode as sm_encode, shard_map_key, ShardMap};
 use crate::traits::{LogStorage, StateMachineStore};
 use crate::types::{LogEntry, LogState, Snapshot, SnapshotContents, SnapshotMeta, Vote};
 
@@ -295,12 +296,33 @@ impl LogStorage for FjallLogStorage {
 // FjallStateMachine
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// SplitApplied — signal sent from apply() to background split handler
+// ---------------------------------------------------------------------------
+
+/// Sent through the split channel when a `KvCommand::Split` is successfully applied.
+/// The background handler on each node receives this and bootstraps the new Raft group.
+pub struct SplitApplied {
+    pub new_shard_id: ShardId,
+}
+
+// ---------------------------------------------------------------------------
+// FjallStateMachine
+// ---------------------------------------------------------------------------
+
 /// `StateMachineStore` backed by fjall.
 pub struct FjallStateMachine {
     pub(crate) store: Arc<FjallStore>,
     max_history_versions: u64,
     now_fn: NowFn,
     watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
+    split_tx: Option<tokio::sync::mpsc::UnboundedSender<SplitApplied>>,
+    shard_map: Option<Arc<ShardMap>>,
+    /// Fault injection: when `true`, `apply()` returns `Err` after Phase 1 commits
+    /// but before Phase 2 (ShardMap updates), simulating a crash at that boundary.
+    /// Always present but can only be armed via `arm_crash_after_phase1` which is
+    /// gated behind `#[cfg(any(test, feature = "test-utils"))]`.
+    crash_after_phase1: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FjallStateMachine {
@@ -310,6 +332,9 @@ impl FjallStateMachine {
             max_history_versions: DEFAULT_MAX_HISTORY,
             now_fn: system_now_fn(),
             watch_tx: None,
+            split_tx: None,
+            shard_map: None,
+            crash_after_phase1: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -319,7 +344,18 @@ impl FjallStateMachine {
             max_history_versions,
             now_fn: system_now_fn(),
             watch_tx: None,
+            split_tx: None,
+            shard_map: None,
+            crash_after_phase1: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Arm the crash-injection point between Phase 1 and Phase 2 of a Split apply.
+    /// Available in test builds and when the `test-utils` feature is enabled.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_crash_after_phase1(&self) {
+        self.crash_after_phase1
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn with_clock(mut self, now_fn: NowFn) -> Self {
@@ -331,6 +367,19 @@ impl FjallStateMachine {
     pub fn with_watch(mut self, tx: tokio::sync::broadcast::Sender<DomainWatchEvent>) -> Self {
         self.watch_tx = Some(tx);
         self
+    }
+
+    /// Attach a split-event sender. When a `KvCommand::Split` is applied, the new
+    /// shard id is sent through this channel so that the background handler can
+    /// bootstrap the new Raft group on this node.
+    pub fn set_split_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<SplitApplied>) {
+        self.split_tx = Some(tx);
+    }
+
+    /// Attach the ShardMap so the state machine can update shard ranges when
+    /// applying a `KvCommand::Split`.
+    pub fn set_shard_map(&mut self, shard_map: Arc<ShardMap>) {
+        self.shard_map = Some(shard_map);
     }
 }
 
@@ -370,6 +419,141 @@ impl StateMachineStore for FjallStateMachine {
         cmd: Option<KvCommand>,
         membership_bytes: Option<Vec<u8>>,
     ) -> Result<KvResponse, GgapError> {
+        // -----------------------------------------------------------------------
+        // Split command: handled separately to allow async ShardMap updates and
+        // split-channel signaling after the synchronous data movement.
+        // -----------------------------------------------------------------------
+        if let Some(KvCommand::Split {
+            ref split_key,
+            new_shard_id,
+            ref source_range,
+            ref source_members,
+        }) = cmd
+        {
+            let store = self.store.clone();
+            let split_key = split_key.clone();
+            let source_range = source_range.clone();
+            let source_members = source_members.clone();
+            // Keep copies for the in-memory cache update after spawn_blocking.
+            let split_key_post = split_key.clone();
+            let source_range_post = source_range.clone();
+
+            // Single atomic spawn_blocking: reads, then one batch.commit() covering
+            // data movement + last_applied + ShardMap entries + bootstrap_members.
+            // A crash at any point leaves the store consistent: either all of these
+            // are visible on restart, or none are (last_applied not advanced →
+            // Raft re-applies the entry on the next leader).
+            tokio::task::spawn_blocking(move || -> Result<(ShardInfo, ShardInfo), GgapError> {
+                // Read phase (no writes yet).
+                let contents = build_partial_snapshot_sync(&store, shard_id, &split_key)?;
+                let (del_data, del_history, del_ttl) =
+                    collect_range_deletes(&store, shard_id, &split_key)?;
+
+                let updated_source = ShardInfo {
+                    shard_id,
+                    range: KeyRange {
+                        start: source_range.start.clone(),
+                        end: split_key.clone(),
+                    },
+                    state: ShardState::Active,
+                };
+                let new_shard = ShardInfo {
+                    shard_id: new_shard_id,
+                    range: KeyRange {
+                        start: split_key.clone(),
+                        end: source_range.end.clone(),
+                    },
+                    state: ShardState::Active,
+                };
+
+                // Single atomic batch: all or nothing.
+                let mut batch = store.db.batch();
+
+                // 1. Copy upper-half data to new shard.
+                install_into_batch(&mut batch, &store, new_shard_id, &contents)?;
+
+                // 2. Delete upper-half from source shard.
+                delete_range_into_batch(&mut batch, &store, del_data, del_history, del_ttl);
+
+                // 3. Advance last_applied for the source shard.
+                batch.insert(
+                    &store.meta,
+                    meta_key(shard_id, "last_applied"),
+                    encode(&log_id)?,
+                );
+
+                // 4. Persist updated source ShardMap entry (narrowed range).
+                batch.insert(
+                    &store.meta,
+                    shard_map_key(shard_id),
+                    sm_encode(&updated_source)?,
+                );
+
+                // 5. Persist new shard ShardMap entry.
+                batch.insert(
+                    &store.meta,
+                    shard_map_key(new_shard_id),
+                    sm_encode(&new_shard)?,
+                );
+
+                // 6. Persist bootstrap membership for the new shard so that on
+                //    restart main.rs can initialise it with the correct peers.
+                batch.insert(
+                    &store.meta,
+                    bootstrap_members_key(new_shard_id),
+                    encode(&source_members)?,
+                );
+
+                batch.commit().map_err(fjall_err)?;
+                Ok((updated_source, new_shard))
+            })
+            .await
+            .map_err(|e| GgapError::Storage(e.to_string()))??;
+
+            // Fault injection: armed in tests to verify the pre-fix buggy state.
+            // After the fix above this point is never reached with inconsistent state,
+            // but the check is kept so existing repro tests document the old boundary.
+            if self
+                .crash_after_phase1
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(GgapError::Storage("simulated crash after phase 1".into()));
+            }
+
+            // Update in-memory ShardMap cache only — storage was already written
+            // atomically in the batch above. Do not call put_shard() (which would
+            // double-write to fjall).
+            if let Some(ref sm) = self.shard_map {
+                let updated_source = ShardInfo {
+                    shard_id,
+                    range: KeyRange {
+                        start: source_range_post.start.clone(),
+                        end: split_key_post.clone(),
+                    },
+                    state: ShardState::Active,
+                };
+                let new_shard = ShardInfo {
+                    shard_id: new_shard_id,
+                    range: KeyRange {
+                        start: split_key_post.clone(),
+                        end: source_range_post.end.clone(),
+                    },
+                    state: ShardState::Active,
+                };
+                sm.update_cache_after_split(updated_source, new_shard).await;
+            }
+
+            // Signal background split handler.
+            if let Some(ref tx) = self.split_tx {
+                let _ = tx.send(SplitApplied { new_shard_id });
+            }
+
+            return Ok(KvResponse::SplitComplete { new_shard_id });
+        }
+
+        // -----------------------------------------------------------------------
+        // All other commands: handled inside a single spawn_blocking.
+        // -----------------------------------------------------------------------
         let store = self.store.clone();
         let max_history = self.max_history_versions;
         let now_fn = self.now_fn.clone();
@@ -596,6 +780,11 @@ impl StateMachineStore for FjallStateMachine {
                     );
                     batch.commit().map_err(fjall_err)?;
                     Ok(KvResponse::NoOp)
+                }
+                // Split is handled before this spawn_blocking block and never
+                // reaches here.
+                Some(KvCommand::Split { .. }) => {
+                    unreachable!("Split command must be handled before spawn_blocking")
                 }
             }
         })
@@ -842,12 +1031,196 @@ impl StateMachineStore for FjallStateMachine {
 }
 
 // ---------------------------------------------------------------------------
-// Split helpers on FjallStateMachine
+// Split helpers — synchronous inner functions (callable from spawn_blocking)
+// ---------------------------------------------------------------------------
+
+/// Extract all keys `>= split_key` from `shard_id` into a `SnapshotContents`.
+pub(crate) fn build_partial_snapshot_sync(
+    store: &FjallStore,
+    shard_id: ShardId,
+    split_key: &str,
+) -> Result<SnapshotContents, GgapError> {
+    let start = data_key(shard_id, split_key);
+    let shard_end = data_shard_end(shard_id).to_vec();
+
+    let data: Vec<(String, KvEntry)> = store
+        .data
+        .range(start..shard_end.clone())
+        .map(|g| {
+            g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
+                let user_key = String::from_utf8(k[8..].to_vec())
+                    .map_err(|e| GgapError::Storage(e.to_string()))?;
+                Ok((user_key, decode::<KvEntry>(&v)?))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // History: scan entire shard and filter by user key >= split_key
+    let shard_start = shard_id.to_be_bytes().to_vec();
+    let history: Vec<((String, u64), KvEntry)> = store
+        .history
+        .range(shard_start..shard_end)
+        .map(|g| {
+            g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
+                let raw = &k[8..];
+                let null_pos = raw.iter().position(|&b| b == 0).ok_or_else(|| {
+                    GgapError::Storage("malformed history key: missing null byte".into())
+                })?;
+                let user_key = String::from_utf8(raw[..null_pos].to_vec())
+                    .map_err(|e| GgapError::Storage(e.to_string()))?;
+                let version =
+                    u64::from_be_bytes(raw[null_pos + 1..null_pos + 9].try_into().map_err(
+                        |_| GgapError::Storage("malformed history key: short version".into()),
+                    )?);
+                Ok(((user_key, version), decode::<KvEntry>(&v)?))
+            })
+        })
+        .filter(|r| match r {
+            Ok(((ref user_key, _), _)) => user_key.as_str() >= split_key,
+            Err(_) => true, // propagate errors
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(SnapshotContents { data, history })
+}
+
+/// Write `contents` into `new_shard_id`, creating TTL index entries as needed.
+pub(crate) fn install_partial_snapshot_sync(
+    store: &FjallStore,
+    new_shard_id: ShardId,
+    contents: &SnapshotContents,
+) -> Result<(), GgapError> {
+    let mut batch = store.db.batch();
+    install_into_batch(&mut batch, store, new_shard_id, contents)?;
+    batch.commit().map_err(fjall_err)
+}
+
+/// Add snapshot install writes to an existing batch without committing.
+pub(crate) fn install_into_batch(
+    batch: &mut fjall::OwnedWriteBatch,
+    store: &FjallStore,
+    new_shard_id: ShardId,
+    contents: &SnapshotContents,
+) -> Result<(), GgapError> {
+    for (user_key, entry) in &contents.data {
+        batch.insert(
+            &store.data,
+            data_key(new_shard_id, user_key),
+            encode(entry)?,
+        );
+        if let Some(expires_at_ns) = entry.expires_at_ns {
+            batch.insert(
+                &store.ttl_index,
+                ttl_index_key(new_shard_id, expires_at_ns, user_key),
+                Vec::new(),
+            );
+        }
+    }
+    for ((user_key, version), entry) in &contents.history {
+        batch.insert(
+            &store.history,
+            history_key(new_shard_id, user_key, *version),
+            encode(entry)?,
+        );
+    }
+    Ok(())
+}
+
+/// Raw storage keys to delete: (data_keys, history_keys, ttl_keys).
+type RangeDeleteKeys = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// Collect all raw storage keys `>= from_key` for `shard_id` across data,
+/// history, and ttl_index. Returns (data_keys, history_keys, ttl_keys).
+pub(crate) fn collect_range_deletes(
+    store: &FjallStore,
+    shard_id: ShardId,
+    from_key: &str,
+) -> Result<RangeDeleteKeys, GgapError> {
+    let start = data_key(shard_id, from_key);
+    let shard_end = data_shard_end(shard_id).to_vec();
+
+    let data_keys: Vec<Vec<u8>> = store
+        .data
+        .range(start..shard_end.clone())
+        .map(|g| g.into_inner().map(|(k, _)| k.to_vec()).map_err(fjall_err))
+        .collect::<Result<_, _>>()?;
+
+    let shard_start = shard_id.to_be_bytes().to_vec();
+    let history_keys: Vec<Vec<u8>> = store
+        .history
+        .range(shard_start.clone()..shard_end.clone())
+        .filter_map(|g| match g.into_inner().map_err(fjall_err) {
+            Ok((k, _)) => {
+                let raw = &k[8..];
+                if let Some(null_pos) = raw.iter().position(|&b| b == 0) {
+                    let user_key_bytes = &raw[..null_pos];
+                    if user_key_bytes >= from_key.as_bytes() {
+                        return Some(Ok(k.to_vec()));
+                    }
+                }
+                None
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<_, _>>()?;
+
+    let ttl_keys: Vec<Vec<u8>> = store
+        .ttl_index
+        .range(shard_start..shard_end)
+        .filter_map(|g| match g.into_inner().map_err(fjall_err) {
+            Ok((k, _)) => {
+                // TTL key: shard(8) ++ expires_at_ns(8) ++ key_utf8
+                let user_key_bytes = &k[16..];
+                if user_key_bytes >= from_key.as_bytes() {
+                    Some(Ok(k.to_vec()))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok((data_keys, history_keys, ttl_keys))
+}
+
+/// Delete all keys `>= from_key` from data, history, and ttl_index for `shard_id`.
+pub(crate) fn delete_range_from_sync(
+    store: &FjallStore,
+    shard_id: ShardId,
+    from_key: &str,
+) -> Result<(), GgapError> {
+    let (data_keys, history_keys, ttl_keys) = collect_range_deletes(store, shard_id, from_key)?;
+    let mut batch = store.db.batch();
+    delete_range_into_batch(&mut batch, store, data_keys, history_keys, ttl_keys);
+    batch.commit().map_err(fjall_err)
+}
+
+/// Add range-delete writes to an existing batch without committing.
+pub(crate) fn delete_range_into_batch(
+    batch: &mut fjall::OwnedWriteBatch,
+    store: &FjallStore,
+    data_keys: Vec<Vec<u8>>,
+    history_keys: Vec<Vec<u8>>,
+    ttl_keys: Vec<Vec<u8>>,
+) {
+    for k in data_keys {
+        batch.remove(&store.data, k);
+    }
+    for k in history_keys {
+        batch.remove(&store.history, k);
+    }
+    for k in ttl_keys {
+        batch.remove(&store.ttl_index, k);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split helpers on FjallStateMachine (async wrappers for external callers)
 // ---------------------------------------------------------------------------
 
 impl FjallStateMachine {
     /// Build a snapshot containing only keys `>= split_key` within the shard.
-    /// Used during range splitting to extract the upper half of a shard.
     pub async fn build_partial_snapshot(
         &self,
         shard_id: ShardId,
@@ -855,97 +1228,29 @@ impl FjallStateMachine {
     ) -> Result<SnapshotContents, GgapError> {
         let store = self.store.clone();
         let split_key = split_key.to_string();
-        tokio::task::spawn_blocking(move || -> Result<SnapshotContents, GgapError> {
-            let start = data_key(shard_id, &split_key);
-            let shard_end = data_shard_end(shard_id).to_vec();
-
-            let data: Vec<(String, KvEntry)> = store
-                .data
-                .range(start..shard_end.clone())
-                .map(|g| {
-                    g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
-                        let user_key = String::from_utf8(k[8..].to_vec())
-                            .map_err(|e| GgapError::Storage(e.to_string()))?;
-                        Ok((user_key, decode::<KvEntry>(&v)?))
-                    })
-                })
-                .collect::<Result<_, _>>()?;
-
-            // History: scan entire shard and filter by user key >= split_key
-            let shard_start = shard_id.to_be_bytes().to_vec();
-            let history: Vec<((String, u64), KvEntry)> = store
-                .history
-                .range(shard_start..shard_end)
-                .map(|g| {
-                    g.into_inner().map_err(fjall_err).and_then(|(k, v)| {
-                        let raw = &k[8..];
-                        let null_pos = raw.iter().position(|&b| b == 0).ok_or_else(|| {
-                            GgapError::Storage("malformed history key: missing null byte".into())
-                        })?;
-                        let user_key = String::from_utf8(raw[..null_pos].to_vec())
-                            .map_err(|e| GgapError::Storage(e.to_string()))?;
-                        let version = u64::from_be_bytes(
-                            raw[null_pos + 1..null_pos + 9].try_into().map_err(|_| {
-                                GgapError::Storage("malformed history key: short version".into())
-                            })?,
-                        );
-                        Ok(((user_key, version), decode::<KvEntry>(&v)?))
-                    })
-                })
-                .filter(|r| match r {
-                    Ok(((ref user_key, _), _)) => user_key.as_str() >= split_key.as_str(),
-                    Err(_) => true, // propagate errors
-                })
-                .collect::<Result<_, _>>()?;
-
-            Ok(SnapshotContents { data, history })
+        tokio::task::spawn_blocking(move || {
+            build_partial_snapshot_sync(&store, shard_id, &split_key)
         })
         .await
         .map_err(|e| GgapError::Storage(e.to_string()))?
     }
 
-    /// Install a partial snapshot into a new shard, writing keys with the
-    /// new shard_id prefix. Also copies TTL index entries.
+    /// Install a partial snapshot into a new shard.
     pub async fn install_partial_snapshot(
         &self,
         new_shard_id: ShardId,
         contents: &SnapshotContents,
     ) -> Result<(), GgapError> {
         let store = self.store.clone();
-        let data = contents.data.clone();
-        let history = contents.history.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
-            let mut batch = store.db.batch();
-            for (user_key, entry) in &data {
-                batch.insert(
-                    &store.data,
-                    data_key(new_shard_id, user_key),
-                    encode(entry)?,
-                );
-                if let Some(expires_at_ns) = entry.expires_at_ns {
-                    batch.insert(
-                        &store.ttl_index,
-                        ttl_index_key(new_shard_id, expires_at_ns, user_key),
-                        Vec::new(),
-                    );
-                }
-            }
-            for ((user_key, version), entry) in &history {
-                batch.insert(
-                    &store.history,
-                    history_key(new_shard_id, user_key, *version),
-                    encode(entry)?,
-                );
-            }
-            batch.commit().map_err(fjall_err)
+        let contents = contents.clone();
+        tokio::task::spawn_blocking(move || {
+            install_partial_snapshot_sync(&store, new_shard_id, &contents)
         })
         .await
         .map_err(|e| GgapError::Storage(e.to_string()))?
     }
 
-    /// Delete all keys `>= from_key` from a shard's data, history, and
-    /// ttl_index partitions. Used after a split to remove the upper half
-    /// from the source shard.
+    /// Delete all keys `>= from_key` from source shard.
     pub async fn delete_range_from(
         &self,
         shard_id: ShardId,
@@ -953,71 +1258,9 @@ impl FjallStateMachine {
     ) -> Result<(), GgapError> {
         let store = self.store.clone();
         let from_key = from_key.to_string();
-        tokio::task::spawn_blocking(move || -> Result<(), GgapError> {
-            let start = data_key(shard_id, &from_key);
-            let shard_end = data_shard_end(shard_id).to_vec();
-
-            // Collect data keys to delete
-            let data_keys: Vec<Vec<u8>> = store
-                .data
-                .range(start..shard_end.clone())
-                .map(|g| g.into_inner().map(|(k, _)| k.to_vec()).map_err(fjall_err))
-                .collect::<Result<_, _>>()?;
-
-            // Collect history keys to delete (filter by user key)
-            let shard_start = shard_id.to_be_bytes().to_vec();
-            let history_keys: Vec<Vec<u8>> = store
-                .history
-                .range(shard_start.clone()..shard_end.clone())
-                .filter_map(|g| match g.into_inner().map_err(fjall_err) {
-                    Ok((k, _)) => {
-                        let raw = &k[8..];
-                        if let Some(null_pos) = raw.iter().position(|&b| b == 0) {
-                            let user_key_bytes = &raw[..null_pos];
-                            if user_key_bytes >= from_key.as_bytes() {
-                                return Some(Ok(k.to_vec()));
-                            }
-                        }
-                        None
-                    }
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<Result<_, _>>()?;
-
-            // Collect TTL index keys to delete (filter by user key)
-            let ttl_keys: Vec<Vec<u8>> = store
-                .ttl_index
-                .range(shard_start..shard_end)
-                .filter_map(|g| {
-                    match g.into_inner().map_err(fjall_err) {
-                        Ok((k, _)) => {
-                            // TTL key: shard(8) ++ expires_at_ns(8) ++ key_utf8
-                            let user_key_bytes = &k[16..];
-                            if user_key_bytes >= from_key.as_bytes() {
-                                Some(Ok(k.to_vec()))
-                            } else {
-                                None
-                            }
-                        }
-                        Err(e) => Some(Err(e)),
-                    }
-                })
-                .collect::<Result<_, _>>()?;
-
-            let mut batch = store.db.batch();
-            for k in data_keys {
-                batch.remove(&store.data, k);
-            }
-            for k in history_keys {
-                batch.remove(&store.history, k);
-            }
-            for k in ttl_keys {
-                batch.remove(&store.ttl_index, k);
-            }
-            batch.commit().map_err(fjall_err)
-        })
-        .await
-        .map_err(|e| GgapError::Storage(e.to_string()))?
+        tokio::task::spawn_blocking(move || delete_range_from_sync(&store, shard_id, &from_key))
+            .await
+            .map_err(|e| GgapError::Storage(e.to_string()))?
     }
 }
 

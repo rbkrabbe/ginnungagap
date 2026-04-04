@@ -11,14 +11,16 @@ use openraft::BasicNode;
 use serde::Deserialize;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
+    GgapStateMachine, OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
 
 use ggap_storage::{
     fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
+    keys::meta_key,
     ttl::TtlGcTask,
     ShardMap,
 };
@@ -170,7 +172,16 @@ async fn main() -> anyhow::Result<()> {
     // 3. Create watch broadcast channel and FSM (shared across all shards).
     let (watch_tx, _watch_rx) =
         tokio::sync::broadcast::channel::<DomainWatchEvent>(config.server.watch_broadcast_capacity);
-    let fsm = Arc::new(FjallStateMachine::new(store.clone()).with_watch(watch_tx.clone()));
+
+    // Create split-event channel: FjallStateMachine sends SplitApplied events when
+    // a KvCommand::Split is applied; run_split_handler receives them and bootstraps
+    // the new shard's Raft group on this node.
+    let (split_tx, split_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut fsm_builder = FjallStateMachine::new(store.clone()).with_watch(watch_tx.clone());
+    fsm_builder.set_split_sender(split_tx);
+    fsm_builder.set_shard_map(shard_map.clone());
+    let fsm = Arc::new(fsm_builder);
 
     // 4. Create ShardRouter.
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
@@ -197,19 +208,44 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to create Raft for shard {shard_id}"))?,
         );
 
-        // Initialize as single-node cluster on first boot (only for shard 0 initially).
+        // Initialize Raft membership on first boot.
+        // - Shard 0 (and any shard created before this fix): single-node bootstrap.
+        // - Split-created shards: read membership from bootstrap_members key written
+        //   atomically with the split data movement. This prevents a restarted node
+        //   from re-initializing as a single-node cluster, discarding replication.
         if !raft
             .is_initialized()
             .await
             .with_context(|| format!("raft.is_initialized failed for shard {shard_id}"))?
         {
-            let mut members = BTreeMap::new();
-            members.insert(
-                cli.node_id,
-                BasicNode {
-                    addr: cluster_addr.to_string(),
-                },
-            );
+            let bootstrap_key = meta_key(shard_id, "bootstrap_members");
+            let members: BTreeMap<u64, BasicNode> = match store.meta.get(&bootstrap_key) {
+                Ok(Some(bytes)) => {
+                    let (addr_map, _): (BTreeMap<u64, String>, _) =
+                        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                            .with_context(|| {
+                                format!("failed to decode bootstrap_members for shard {shard_id}")
+                            })?;
+                    addr_map
+                        .into_iter()
+                        .map(|(id, addr)| (id, BasicNode { addr }))
+                        .collect()
+                }
+                Ok(None) => {
+                    // Original shard or pre-fix split: fall back to single-node init.
+                    BTreeMap::from([(
+                        cli.node_id,
+                        BasicNode {
+                            addr: cluster_addr.to_string(),
+                        },
+                    )])
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to read bootstrap_members for shard {shard_id}: {e}"
+                    ));
+                }
+            };
             raft.initialize(members)
                 .await
                 .map_err(|e| anyhow::anyhow!("raft.initialize failed for shard {shard_id}: {e}"))?;
@@ -245,21 +281,25 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(shard_id, "started Raft group");
     }
 
-    // 6. Create the SplitCoordinator.
+    // 6. Spawn the background split handler.
+    //    Receives SplitApplied events from FjallStateMachine::apply() and
+    //    bootstraps the new shard's Raft group + registers it in the router.
+    tokio::spawn(run_split_handler(
+        split_rx,
+        store.clone(),
+        fsm.clone(),
+        router.clone(),
+        cli.node_id,
+        raft_cfg.clone(),
+    ));
+
+    // 7. Create the SplitCoordinator.
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
-        store: store.clone(),
-        fsm: fsm.clone(),
-        node_id: cli.node_id,
-        cluster_addr: cluster_addr.to_string(),
-        heartbeat_ms: config.raft.heartbeat_interval_ms,
-        election_min_ms: config.raft.election_timeout_min_ms,
-        election_max_ms: config.raft.election_timeout_max_ms,
-        snapshot_threshold: config.raft.snapshot_threshold,
     }));
 
-    // 7. Serve with graceful shutdown on SIGINT / SIGTERM.
+    // 8. Serve with graceful shutdown on SIGINT / SIGTERM.
     let kv_config = KvServiceConfig {
         max_key_bytes: config.storage.max_key_bytes,
         max_value_bytes: config.storage.max_value_bytes,

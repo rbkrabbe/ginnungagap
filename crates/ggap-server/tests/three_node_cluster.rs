@@ -18,8 +18,9 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
+    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
@@ -46,15 +47,33 @@ struct TestNode {
 async fn start_node(id: u64) -> TestNode {
     let tempdir = TempDir::new().unwrap();
     let store = FjallStore::open(tempdir.path()).unwrap();
-    let fsm = Arc::new(FjallStateMachine::new(store.clone()));
+
+    // ShardMap created before FSM so we can inject it.
+    let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
+    shard_map.initialize_default().await.unwrap();
+
+    // Split channel: state machine signals background handler on apply.
+    let (split_tx, split_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut fsm_builder = FjallStateMachine::new(store.clone());
+    fsm_builder.set_split_sender(split_tx);
+    fsm_builder.set_shard_map(shard_map.clone());
+    let fsm = Arc::new(fsm_builder);
+
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     // Fast timeouts so tests finish quickly.
-    let cfg = build_raft_config(50, 150, 300, 500);
+    let raft_cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
-        GgapRaft::new(id, cfg, GgapNetworkFactory::new(0), log_store, sm)
-            .await
-            .unwrap_or_else(|e| panic!("node {id}: raft init failed: {e}")),
+        GgapRaft::new(
+            id,
+            raft_cfg.clone(),
+            GgapNetworkFactory::new(0),
+            log_store,
+            sm,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("node {id}: raft init failed: {e}")),
     );
 
     // Pre-bind on port 0 → OS picks a free port we can pass to BasicNode.
@@ -72,22 +91,22 @@ async fn start_node(id: u64) -> TestNode {
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
 
     // Build a single-shard router for this node.
-    let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
-    shard_map.initialize_default().await.unwrap();
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
     router.add_shard(0, raft_node.clone(), cluster).await;
+
+    // Spawn background split handler.
+    tokio::spawn(run_split_handler(
+        split_rx,
+        store.clone(),
+        fsm.clone(),
+        router.clone(),
+        id,
+        raft_cfg,
+    ));
 
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
-        store,
-        fsm: fsm.clone(),
-        node_id: id,
-        cluster_addr: cluster_addr.to_string(),
-        heartbeat_ms: 50,
-        election_min_ms: 150,
-        election_max_ms: 300,
-        snapshot_threshold: 500,
     }));
 
     let mut handles = Vec::new();

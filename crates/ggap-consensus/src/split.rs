@@ -6,9 +6,9 @@ use openraft::{BasicNode, ServerState};
 
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
-use ggap_types::{GgapError, KeyRange, ShardId, ShardInfo, ShardState};
+use ggap_storage::SplitApplied;
+use ggap_types::{GgapError, KvCommand, KvResponse, ShardId, ShardInfo, ShardState};
 
-use crate::config::build_raft_config;
 use crate::log_store::GgapLogStorage;
 use crate::network::GgapNetworkFactory;
 use crate::node::{GgapRaft, OpenRaftCluster, OpenRaftNode};
@@ -19,41 +19,16 @@ use crate::state_machine::GgapStateMachine;
 pub struct SplitCoordinatorConfig {
     pub router: Arc<ShardRouter>,
     pub shard_map: Arc<ShardMap>,
-    pub store: Arc<FjallStore>,
-    pub fsm: Arc<FjallStateMachine>,
-    pub node_id: u64,
-    pub cluster_addr: String,
-    pub heartbeat_ms: u64,
-    pub election_min_ms: u64,
-    pub election_max_ms: u64,
-    pub snapshot_threshold: u64,
 }
 
 /// Coordinates the split of a shard's key range into two shards.
 ///
-/// The split protocol blocks writes on the source shard during the split
-/// to ensure consistency. The steps are:
-///
-/// 1. Validate the split request
-/// 2. Mark source shard as Splitting (blocks writes via router)
-/// 3. Write barrier: propose a no-op and wait for commit
-/// 4. Build partial snapshot of keys >= split_key
-/// 5. Bootstrap new Raft group with new ShardId
-/// 6. Install partial snapshot on new shard
-/// 7. Delete transferred keys from source shard
-/// 8. Update ShardMap with new ranges
-/// 9. Resume writes on source shard (state → Active)
+/// The split is driven via Raft: a `KvCommand::Split` is proposed through the
+/// source shard's log, so every node applies the data movement deterministically.
+/// The new shard's Raft group is then bootstrapped with the source membership.
 pub struct SplitCoordinator {
     router: Arc<ShardRouter>,
     shard_map: Arc<ShardMap>,
-    store: Arc<FjallStore>,
-    fsm: Arc<FjallStateMachine>,
-    node_id: u64,
-    cluster_addr: String,
-    heartbeat_ms: u64,
-    election_min_ms: u64,
-    election_max_ms: u64,
-    snapshot_threshold: u64,
 }
 
 impl SplitCoordinator {
@@ -61,14 +36,6 @@ impl SplitCoordinator {
         SplitCoordinator {
             router: cfg.router,
             shard_map: cfg.shard_map,
-            store: cfg.store,
-            fsm: cfg.fsm,
-            node_id: cfg.node_id,
-            cluster_addr: cfg.cluster_addr,
-            heartbeat_ms: cfg.heartbeat_ms,
-            election_min_ms: cfg.election_min_ms,
-            election_max_ms: cfg.election_max_ms,
-            snapshot_threshold: cfg.snapshot_threshold,
         }
     }
 
@@ -102,7 +69,7 @@ impl SplitCoordinator {
             ));
         }
 
-        // 2. Mark source shard as Splitting
+        // 2. Mark source shard as Splitting (blocks writes via router).
         let splitting_info = ShardInfo {
             shard_id,
             range: source_info.range.clone(),
@@ -110,28 +77,30 @@ impl SplitCoordinator {
         };
         self.shard_map.put_shard(splitting_info).await?;
 
-        // From here on, if we fail, we need to restore the source shard to Active.
+        // 3. Execute the split.
+        // do_split() returns Err only if the KvCommand::Split was NOT committed to
+        // the Raft log (pre-commit failures). Once the command is committed the
+        // ShardMap is already updated by apply() on every node, so on post-commit
+        // failures do_split() logs a warning and returns Ok (the split is done).
         let result = self.do_split(shard_id, split_key, &source_info).await;
 
-        match result {
-            Ok(new_shard_id) => Ok(new_shard_id),
-            Err(e) => {
-                // Restore source shard to Active on failure
-                tracing::error!(
-                    shard_id,
-                    split_key,
-                    error = %e,
-                    "split failed, restoring source shard to Active"
-                );
-                let restored = ShardInfo {
-                    shard_id,
-                    range: source_info.range.clone(),
-                    state: ShardState::Active,
-                };
-                let _ = self.shard_map.put_shard(restored).await;
-                Err(e)
-            }
+        if let Err(ref e) = result {
+            // The Raft propose failed — the split was not applied. Restore source.
+            tracing::error!(
+                shard_id,
+                split_key,
+                error = %e,
+                "split failed before commit, restoring source shard to Active"
+            );
+            let restored = ShardInfo {
+                shard_id,
+                range: source_info.range.clone(),
+                state: ShardState::Active,
+            };
+            let _ = self.shard_map.put_shard(restored).await;
         }
+
+        result
     }
 
     async fn do_split(
@@ -140,103 +109,114 @@ impl SplitCoordinator {
         split_key: &str,
         source_info: &ShardInfo,
     ) -> Result<ShardId, GgapError> {
-        // 3. Write barrier: propose a no-op through the source shard's Raft
+        // 1. Get source node's Raft handle.
         let source_node = self
             .router
             .get_node(shard_id)
             .await
             .ok_or(GgapError::ShardNotFound(shard_id))?;
 
-        // Use a Put with empty key as a barrier — just ensure linearizability
-        source_node
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| GgapError::Consensus(format!("write barrier failed: {e}")))?;
+        // 2. Read source shard membership from Raft metrics.
+        let source_members: BTreeMap<u64, BasicNode> = {
+            let metrics = source_node.raft().metrics().borrow().clone();
+            metrics
+                .membership_config
+                .membership()
+                .nodes()
+                .map(|(id, node)| (*id, node.clone()))
+                .collect()
+        };
 
-        // 4. Build partial snapshot of keys >= split_key
-        let contents = self.fsm.build_partial_snapshot(shard_id, split_key).await?;
-
-        // 5. Allocate new shard id
+        // 3. Allocate new shard id.
         let new_shard_id = self.shard_map.next_shard_id().await;
 
-        // 6. Install partial snapshot on new shard
-        self.fsm
-            .install_partial_snapshot(new_shard_id, &contents)
-            .await?;
-
-        // 7. Delete transferred keys from source shard
-        self.fsm.delete_range_from(shard_id, split_key).await?;
-
-        // 8. Update ShardMap: narrow source, add new shard
-        let updated_source = ShardInfo {
-            shard_id,
-            range: KeyRange {
-                start: source_info.range.start.clone(),
-                end: split_key.to_string(),
-            },
-            state: ShardState::Active,
+        // 4. Propose KvCommand::Split through the source shard's Raft log.
+        //    This is the write barrier: ordered after all prior writes.
+        //    Every node's apply() will:
+        //      a) Move keys >= split_key to new_shard_id
+        //      b) Delete those keys from source shard
+        //      c) Update ShardMap (narrow source, add new shard)
+        //      d) Signal the background split handler via SplitApplied channel
+        let cmd = KvCommand::Split {
+            split_key: split_key.to_string(),
+            new_shard_id,
+            source_range: source_info.range.clone(),
+            source_members: source_members
+                .iter()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect(),
         };
-        let new_shard = ShardInfo {
-            shard_id: new_shard_id,
-            range: KeyRange {
-                start: split_key.to_string(),
-                end: source_info.range.end.clone(),
-            },
-            state: ShardState::Active,
-        };
-        self.shard_map.put_shard(updated_source).await?;
-        self.shard_map.put_shard(new_shard).await?;
-
-        // 9. Bootstrap new Raft group for the new shard
-        let log_store = GgapLogStorage::new(FjallLogStorage(self.store.clone()), new_shard_id);
-        let sm = GgapStateMachine::new(self.fsm.clone(), new_shard_id);
-        let net = GgapNetworkFactory::new(new_shard_id);
-        let cfg = build_raft_config(
-            self.heartbeat_ms,
-            self.election_min_ms,
-            self.election_max_ms,
-            self.snapshot_threshold,
-        );
-
-        let raft = Arc::new(
-            GgapRaft::new(self.node_id, cfg, net, log_store, sm)
-                .await
-                .map_err(|e| {
-                    GgapError::Consensus(format!("failed to create Raft for new shard: {e}"))
-                })?,
-        );
-
-        // Initialize as single-node cluster
-        let mut members = BTreeMap::new();
-        members.insert(
-            self.node_id,
-            BasicNode {
-                addr: self.cluster_addr.clone(),
-            },
-        );
-        raft.initialize(members).await.map_err(|e| {
-            GgapError::Consensus(format!("failed to initialize new shard Raft: {e}"))
+        let write_result = source_node.raft().client_write(cmd).await.map_err(|e| {
+            if let Some(fwd) = e.forward_to_leader() {
+                let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                return GgapError::NotLeader {
+                    leader: leader_addr,
+                };
+            }
+            GgapError::Consensus(format!("Split propose failed: {e}"))
         })?;
 
-        // Wait for the new shard to become leader
-        raft.wait(Some(Duration::from_secs(5)))
+        // Validate the response.
+        match write_result.data {
+            KvResponse::SplitComplete { new_shard_id: id } if id == new_shard_id => {}
+            ref other => {
+                return Err(GgapError::Consensus(format!(
+                    "unexpected response from Split command: {other:?}"
+                )));
+            }
+        }
+
+        // ── The Split command is now committed. The ShardMap has been updated on
+        //    every node that has applied the entry. From here, post-commit failures
+        //    are logged as warnings but do not cause a rollback (the data is split). ──
+
+        // 5. Wait for the new shard's Raft instance to appear in the router.
+        //    The background split handler creates it after receiving SplitApplied.
+        let new_node = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(node) = self.router.get_node(new_shard_id).await {
+                    break node;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        shard_id,
+                        new_shard_id,
+                        "timed out waiting for new shard Raft instance in router"
+                    );
+                    return Ok(new_shard_id);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+
+        // 6. Initialize new shard's Raft with source membership.
+        //    openraft retries will handle followers whose background handler hasn't
+        //    created the Raft instance yet.
+        if let Err(e) = new_node.raft().initialize(source_members).await {
+            tracing::warn!(
+                shard_id,
+                new_shard_id,
+                error = %e,
+                "failed to initialize new shard Raft (will retry on next split attempt)"
+            );
+            return Ok(new_shard_id);
+        }
+
+        // 7. Wait for new shard leader election.
+        if let Err(e) = new_node
+            .raft()
+            .wait(Some(Duration::from_secs(10)))
             .state(ServerState::Leader, "new shard become leader")
             .await
-            .map_err(|e| GgapError::Consensus(format!("new shard did not become leader: {e}")))?;
-
-        // 10. Register in router
-        let new_node = Arc::new(OpenRaftNode::new(
-            raft.clone(),
-            self.fsm.clone(),
-            new_shard_id,
-            self.node_id,
-            tokio::time::Duration::from_millis(self.election_min_ms.saturating_sub(1)),
-        ));
-        let new_cluster = Arc::new(OpenRaftCluster::new(raft));
-        self.router
-            .add_shard(new_shard_id, new_node, new_cluster)
-            .await;
+        {
+            tracing::warn!(
+                shard_id,
+                new_shard_id,
+                error = %e,
+                "new shard did not elect a leader within timeout"
+            );
+        }
 
         tracing::info!(
             shard_id,
@@ -246,5 +226,62 @@ impl SplitCoordinator {
         );
 
         Ok(new_shard_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background split handler — spawned on every node
+// ---------------------------------------------------------------------------
+
+/// Background task that runs on every node. When a `KvCommand::Split` is applied,
+/// `FjallStateMachine::apply()` sends a `SplitApplied` event through the channel.
+/// This task receives the event and bootstraps the new shard's Raft group,
+/// then registers it in the router.
+pub async fn run_split_handler(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<SplitApplied>,
+    store: Arc<FjallStore>,
+    fsm: Arc<FjallStateMachine>,
+    router: Arc<ShardRouter>,
+    node_id: u64,
+    raft_config: Arc<openraft::Config>,
+) {
+    while let Some(event) = rx.recv().await {
+        let new_shard_id = event.new_shard_id;
+        tracing::info!(
+            new_shard_id,
+            "background split handler: bootstrapping new shard"
+        );
+
+        let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), new_shard_id);
+        let sm = GgapStateMachine::new(fsm.clone(), new_shard_id);
+        let net = GgapNetworkFactory::new(new_shard_id);
+
+        let raft = match GgapRaft::new(node_id, raft_config.clone(), net, log_store, sm).await {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                tracing::error!(
+                    new_shard_id,
+                    error = %e,
+                    "failed to create Raft for new shard in background handler"
+                );
+                continue;
+            }
+        };
+
+        let node = Arc::new(OpenRaftNode::new(
+            raft.clone(),
+            fsm.clone(),
+            new_shard_id,
+            node_id,
+            // Lease duration of zero — the coordinator will initialize membership.
+            tokio::time::Duration::from_secs(0),
+        ));
+        let cluster = Arc::new(OpenRaftCluster::new(raft));
+        router.add_shard(new_shard_id, node, cluster).await;
+
+        tracing::info!(
+            new_shard_id,
+            "background split handler: new shard registered in router"
+        );
     }
 }

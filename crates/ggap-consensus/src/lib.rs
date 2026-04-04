@@ -25,7 +25,7 @@ pub use log_store::GgapLogStorage;
 pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
 pub use router::ShardRouter;
-pub use split::{SplitCoordinator, SplitCoordinatorConfig};
+pub use split::{run_split_handler, SplitCoordinator, SplitCoordinatorConfig};
 pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};
 
 // ---------------------------------------------------------------------------
@@ -136,6 +136,9 @@ impl RaftNode for StubRaftNode {
             KvCommand::Delete { key } => Ok(KvResponse::Deleted {
                 found: g.data.remove(&key).is_some(),
             }),
+            KvCommand::Split { .. } => Err(GgapError::InvalidArgument(
+                "Split command not supported by StubRaftNode".into(),
+            )),
             KvCommand::Cas {
                 key,
                 expected,

@@ -89,6 +89,22 @@ pub enum KvCommand {
         new_value: Vec<u8>,
         ttl_ns: Option<i64>,
     },
+    /// Proposed by the split coordinator through the source shard's Raft log.
+    /// Every node applies this deterministically: copy keys >= split_key to
+    /// new_shard_id, delete them from source, update ShardMap ranges, and
+    /// persist bootstrap membership for the new shard so it can be restarted
+    /// with the correct Raft group.
+    Split {
+        split_key: String,
+        new_shard_id: ShardId,
+        source_range: KeyRange,
+        /// Raft membership for the new shard: node_id → gRPC address.
+        /// Stored atomically alongside the data movement so that on restart
+        /// main.rs can initialise the new shard with the correct peers.
+        /// Uses `String` addresses (not `BasicNode`) to keep ggap-types free
+        /// of any openraft dependency.
+        source_members: std::collections::BTreeMap<u64, String>,
+    },
 }
 
 /// Responses returned from state machine apply
@@ -113,6 +129,11 @@ pub enum KvResponse {
     /// Returned for Raft-internal entries (Blank, Membership).
     /// Never sent to clients; guarded by unreachable!() in ggap-server.
     NoOp,
+    /// Returned to the split coordinator after a KvCommand::Split is applied.
+    /// Never routed through the KV service path.
+    SplitComplete {
+        new_shard_id: ShardId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
