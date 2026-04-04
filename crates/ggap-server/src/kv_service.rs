@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ggap_consensus::{RaftNode, ShardRouter};
@@ -14,6 +15,9 @@ use crate::convert::{
     ggap_to_status, kv_entry_to_proto, proto_read_consistency, proto_write_quorum, stub_header,
 };
 
+/// Global monotonic counter for assigning unique watch IDs.
+static NEXT_WATCH_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Maximum scan limit to prevent resource exhaustion from unbounded scans.
 const MAX_SCAN_LIMIT: u32 = 10_000;
 
@@ -23,6 +27,7 @@ pub struct KvServiceImpl {
     max_key_bytes: usize,
     max_value_bytes: usize,
     watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
+    watch_output_buffer: usize,
 }
 
 impl KvServiceImpl {
@@ -32,6 +37,7 @@ impl KvServiceImpl {
         max_key_bytes: usize,
         max_value_bytes: usize,
         watch_tx: Option<tokio::sync::broadcast::Sender<DomainWatchEvent>>,
+        watch_output_buffer: usize,
     ) -> Self {
         KvServiceImpl {
             router,
@@ -39,6 +45,7 @@ impl KvServiceImpl {
             max_key_bytes,
             max_value_bytes,
             watch_tx,
+            watch_output_buffer,
         }
     }
 }
@@ -254,45 +261,87 @@ impl KvService for KvServiceImpl {
             }
         };
 
+        let watch_id = NEXT_WATCH_ID.fetch_add(1, Ordering::Relaxed);
         let start_key = create_req.start_key;
         let end_key = create_req.end_key;
         let node_id = self.node_id;
 
-        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<WatchEvent, Status>>(128);
+        let (out_tx, out_rx) =
+            tokio::sync::mpsc::channel::<Result<WatchEvent, Status>>(self.watch_output_buffer);
 
         tokio::spawn(async move {
             loop {
-                match domain_rx.recv().await {
-                    Ok(evt) => {
-                        // Filter by key range.
-                        let in_range = (start_key.is_empty() || evt.key >= start_key)
-                            && (end_key.is_empty() || evt.key < end_key);
-                        if !in_range {
-                            continue;
-                        }
+                tokio::select! {
+                    biased;
 
-                        let event_type = match evt.kind {
-                            WatchEventKind::Put => EventType::Put as i32,
-                            WatchEventKind::Delete => EventType::Delete as i32,
-                            WatchEventKind::Expire => EventType::Expire as i32,
-                        };
-                        let kv = evt.entry.map(kv_entry_to_proto);
-                        let proto_evt = WatchEvent {
-                            header: Some(stub_header(node_id)),
-                            r#type: event_type,
-                            kv,
-                            canceled: false,
-                            watch_id: 0,
-                        };
-                        if out_tx.send(Ok(proto_evt)).await.is_err() {
-                            break; // client disconnected
+                    // Listen for cancel requests from the client.
+                    msg = inbound.message() => {
+                        match msg {
+                            Ok(Some(WatchRequest {
+                                request: Some(watch_request::Request::Cancel(c)),
+                            })) if c.watch_id == watch_id => {
+                                // Client explicitly canceled this watch.
+                                let _ = out_tx.send(Ok(WatchEvent {
+                                    header: Some(stub_header(node_id)),
+                                    r#type: EventType::Put as i32,
+                                    kv: None,
+                                    canceled: true,
+                                    watch_id,
+                                })).await;
+                                break;
+                            }
+                            Ok(None) | Err(_) => {
+                                // Client stream closed.
+                                break;
+                            }
+                            _ => {
+                                // Ignore unrecognized or mismatched messages.
+                            }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Fell behind; skip missed events and continue.
-                        continue;
+
+                    // Receive broadcast events from the state machine.
+                    result = domain_rx.recv() => {
+                        match result {
+                            Ok(evt) => {
+                                // Filter by key range.
+                                let in_range = (start_key.is_empty() || evt.key >= start_key)
+                                    && (end_key.is_empty() || evt.key < end_key);
+                                if !in_range {
+                                    continue;
+                                }
+
+                                let event_type = match evt.kind {
+                                    WatchEventKind::Put => EventType::Put as i32,
+                                    WatchEventKind::Delete => EventType::Delete as i32,
+                                    WatchEventKind::Expire => EventType::Expire as i32,
+                                };
+                                let kv = evt.entry.map(kv_entry_to_proto);
+                                let proto_evt = WatchEvent {
+                                    header: Some(stub_header(node_id)),
+                                    r#type: event_type,
+                                    kv,
+                                    canceled: false,
+                                    watch_id,
+                                };
+                                if out_tx.send(Ok(proto_evt)).await.is_err() {
+                                    break; // client disconnected
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // Fell behind the broadcast buffer — send canceled and close.
+                                let _ = out_tx.send(Ok(WatchEvent {
+                                    header: Some(stub_header(node_id)),
+                                    r#type: EventType::Put as i32,
+                                    kv: None,
+                                    canceled: true,
+                                    watch_id,
+                                })).await;
+                                break;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
