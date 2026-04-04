@@ -140,11 +140,7 @@ impl ShardMap {
     /// Update only the in-memory cache for two shards after a split whose
     /// storage writes have already been committed atomically by the caller.
     /// Does NOT write to fjall — storage is already consistent.
-    pub async fn update_cache_after_split(
-        &self,
-        updated_source: ShardInfo,
-        new_shard: ShardInfo,
-    ) {
+    pub async fn update_cache_after_split(&self, updated_source: ShardInfo, new_shard: ShardInfo) {
         let mut shards = self.shards.write().await;
         shards.insert(updated_source.shard_id, updated_source);
         shards.insert(new_shard.shard_id, new_shard);

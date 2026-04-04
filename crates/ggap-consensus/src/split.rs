@@ -5,8 +5,8 @@ use std::time::Duration;
 use openraft::{BasicNode, ServerState};
 
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
-use ggap_storage::SplitApplied;
 use ggap_storage::ShardMap;
+use ggap_storage::SplitApplied;
 use ggap_types::{GgapError, KvCommand, KvResponse, ShardId, ShardInfo, ShardState};
 
 use crate::log_store::GgapLogStorage;
@@ -146,20 +146,15 @@ impl SplitCoordinator {
                 .map(|(id, node)| (*id, node.addr.clone()))
                 .collect(),
         };
-        let write_result = source_node
-            .raft()
-            .client_write(cmd)
-            .await
-            .map_err(|e| {
-                if let Some(fwd) = e.forward_to_leader() {
-                    let leader_addr =
-                        fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
-                    return GgapError::NotLeader {
-                        leader: leader_addr,
-                    };
-                }
-                GgapError::Consensus(format!("Split propose failed: {e}"))
-            })?;
+        let write_result = source_node.raft().client_write(cmd).await.map_err(|e| {
+            if let Some(fwd) = e.forward_to_leader() {
+                let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                return GgapError::NotLeader {
+                    leader: leader_addr,
+                };
+            }
+            GgapError::Consensus(format!("Split propose failed: {e}"))
+        })?;
 
         // Validate the response.
         match write_result.data {
@@ -252,7 +247,10 @@ pub async fn run_split_handler(
 ) {
     while let Some(event) = rx.recv().await {
         let new_shard_id = event.new_shard_id;
-        tracing::info!(new_shard_id, "background split handler: bootstrapping new shard");
+        tracing::info!(
+            new_shard_id,
+            "background split handler: bootstrapping new shard"
+        );
 
         let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), new_shard_id);
         let sm = GgapStateMachine::new(fsm.clone(), new_shard_id);

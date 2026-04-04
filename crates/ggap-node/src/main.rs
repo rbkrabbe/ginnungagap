@@ -233,7 +233,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(None) => {
                     // Original shard or pre-fix split: fall back to single-node init.
-                    BTreeMap::from([(cli.node_id, BasicNode { addr: cluster_addr.to_string() })])
+                    BTreeMap::from([(
+                        cli.node_id,
+                        BasicNode {
+                            addr: cluster_addr.to_string(),
+                        },
+                    )])
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(

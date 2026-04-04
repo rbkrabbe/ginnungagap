@@ -53,9 +53,15 @@ async fn setup() -> TestSetup {
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     let raft = Arc::new(
-        GgapRaft::new(1, raft_cfg.clone(), GgapNetworkFactory::new(0), log_store, sm)
-            .await
-            .unwrap(),
+        GgapRaft::new(
+            1,
+            raft_cfg.clone(),
+            GgapNetworkFactory::new(0),
+            log_store,
+            sm,
+        )
+        .await
+        .unwrap(),
     );
 
     // Initialize as single-node cluster.

@@ -517,9 +517,7 @@ impl StateMachineStore for FjallStateMachine {
                 .crash_after_phase1
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                return Err(GgapError::Storage(
-                    "simulated crash after phase 1".into(),
-                ));
+                return Err(GgapError::Storage("simulated crash after phase 1".into()));
             }
 
             // Update in-memory ShardMap cache only — storage was already written
@@ -1070,11 +1068,10 @@ pub(crate) fn build_partial_snapshot_sync(
                 })?;
                 let user_key = String::from_utf8(raw[..null_pos].to_vec())
                     .map_err(|e| GgapError::Storage(e.to_string()))?;
-                let version = u64::from_be_bytes(
-                    raw[null_pos + 1..null_pos + 9]
-                        .try_into()
-                        .map_err(|_| GgapError::Storage("malformed history key: short version".into()))?,
-                );
+                let version =
+                    u64::from_be_bytes(raw[null_pos + 1..null_pos + 9].try_into().map_err(
+                        |_| GgapError::Storage("malformed history key: short version".into()),
+                    )?);
                 Ok(((user_key, version), decode::<KvEntry>(&v)?))
             })
         })
@@ -1129,13 +1126,16 @@ pub(crate) fn install_into_batch(
     Ok(())
 }
 
+/// Raw storage keys to delete: (data_keys, history_keys, ttl_keys).
+type RangeDeleteKeys = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// Collect all raw storage keys `>= from_key` for `shard_id` across data,
 /// history, and ttl_index. Returns (data_keys, history_keys, ttl_keys).
 pub(crate) fn collect_range_deletes(
     store: &FjallStore,
     shard_id: ShardId,
     from_key: &str,
-) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>), GgapError> {
+) -> Result<RangeDeleteKeys, GgapError> {
     let start = data_key(shard_id, from_key);
     let shard_end = data_shard_end(shard_id).to_vec();
 
@@ -1228,9 +1228,11 @@ impl FjallStateMachine {
     ) -> Result<SnapshotContents, GgapError> {
         let store = self.store.clone();
         let split_key = split_key.to_string();
-        tokio::task::spawn_blocking(move || build_partial_snapshot_sync(&store, shard_id, &split_key))
-            .await
-            .map_err(|e| GgapError::Storage(e.to_string()))?
+        tokio::task::spawn_blocking(move || {
+            build_partial_snapshot_sync(&store, shard_id, &split_key)
+        })
+        .await
+        .map_err(|e| GgapError::Storage(e.to_string()))?
     }
 
     /// Install a partial snapshot into a new shard.

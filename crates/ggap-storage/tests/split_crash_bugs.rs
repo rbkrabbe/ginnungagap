@@ -50,15 +50,14 @@ async fn apply_put(fsm: &FjallStateMachine, shard_id: u64, index: u64, key: &str
 }
 
 fn has_key(store: &FjallStore, shard_id: u64, key: &str) -> bool {
-    store
-        .data
-        .get(data_key(shard_id, key))
-        .unwrap()
-        .is_some()
+    store.data.get(data_key(shard_id, key)).unwrap().is_some()
 }
 
 fn last_applied_index(store: &FjallStore, shard_id: u64) -> Option<u64> {
-    let raw = store.meta.get(meta_key(shard_id, "last_applied")).unwrap()?;
+    let raw = store
+        .meta
+        .get(meta_key(shard_id, "last_applied"))
+        .unwrap()?;
     let (log_id, _): (LogId, _) =
         bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
     Some(log_id.index)
@@ -133,11 +132,21 @@ async fn bug1_nonatomic_split_loses_data_on_crash() {
 
     // Both shards are in the ShardMap — written atomically with the data.
     let shards = shard_map2.all_shards().await;
-    assert_eq!(shards.len(), 2, "both shards must be in the ShardMap after atomic commit");
+    assert_eq!(
+        shards.len(),
+        2,
+        "both shards must be in the ShardMap after atomic commit"
+    );
 
     // Lower-half data still in shard 0.
-    assert!(has_key(&store2, 0, "apple"), "'apple' must remain in shard 0");
-    assert!(!has_key(&store2, 0, "mango"), "'mango' must have been moved out of shard 0");
+    assert!(
+        has_key(&store2, 0, "apple"),
+        "'apple' must remain in shard 0"
+    );
+    assert!(
+        !has_key(&store2, 0, "mango"),
+        "'mango' must have been moved out of shard 0"
+    );
 
     // Upper-half data routable via shard 1.
     assert!(has_key(&store2, 1, "mango"), "'mango' must be in shard 1");
@@ -221,5 +230,8 @@ async fn bug2_no_bootstrap_members_for_split_shard() {
     let raw = result.unwrap();
     let (members, _): (std::collections::BTreeMap<u64, String>, _) =
         bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
-    assert_eq!(members.get(&1u64).map(|s| s.as_str()), Some("127.0.0.1:7001"));
+    assert_eq!(
+        members.get(&1u64).map(|s| s.as_str()),
+        Some("127.0.0.1:7001")
+    );
 }

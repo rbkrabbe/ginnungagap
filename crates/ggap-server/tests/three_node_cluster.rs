@@ -65,9 +65,15 @@ async fn start_node(id: u64) -> TestNode {
     // Fast timeouts so tests finish quickly.
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
-        GgapRaft::new(id, raft_cfg.clone(), GgapNetworkFactory::new(0), log_store, sm)
-            .await
-            .unwrap_or_else(|e| panic!("node {id}: raft init failed: {e}")),
+        GgapRaft::new(
+            id,
+            raft_cfg.clone(),
+            GgapNetworkFactory::new(0),
+            log_store,
+            sm,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("node {id}: raft init failed: {e}")),
     );
 
     // Pre-bind on port 0 → OS picks a free port we can pass to BasicNode.
