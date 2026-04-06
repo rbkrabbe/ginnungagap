@@ -29,6 +29,9 @@ pub struct KvServiceConfig {
     /// Optional watch broadcast channel. When set, `Watch` RPCs are served;
     /// when absent, `Watch` returns `Unimplemented`.
     pub watch_tx: Option<tokio::sync::broadcast::Sender<ggap_types::DomainWatchEvent>>,
+    /// Per-watch output buffer size (mpsc channel capacity between the
+    /// broadcast consumer task and the gRPC response stream). Default: 128.
+    pub watch_output_buffer: usize,
 }
 
 impl Default for KvServiceConfig {
@@ -37,6 +40,7 @@ impl Default for KvServiceConfig {
             max_key_bytes: 4096,
             max_value_bytes: 1_048_576,
             watch_tx: None,
+            watch_output_buffer: 128,
         }
     }
 }
@@ -59,6 +63,7 @@ pub async fn serve_client(
             config.max_key_bytes,
             config.max_value_bytes,
             config.watch_tx,
+            config.watch_output_buffer,
         )))
         .add_service(reflection)
         .serve(addr)
@@ -84,6 +89,7 @@ pub async fn serve_client_with_listener(
             config.max_key_bytes,
             config.max_value_bytes,
             config.watch_tx,
+            config.watch_output_buffer,
         )))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))

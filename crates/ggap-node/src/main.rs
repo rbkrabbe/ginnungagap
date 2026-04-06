@@ -304,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
         max_key_bytes: config.storage.max_key_bytes,
         max_value_bytes: config.storage.max_value_bytes,
         watch_tx: Some(watch_tx),
+        watch_output_buffer: 128,
     };
 
     let shutdown_trigger = shutdown.clone();
