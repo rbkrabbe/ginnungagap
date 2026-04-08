@@ -289,49 +289,55 @@ turmoil                     = "0.6"   # dev-dependency; simulation harness (Phas
 - [x] `GgapLogStorage` (`RaftLogStorage` + `RaftLogReader` v2 trait impls over `FjallLogStorage`)
 - [x] `GgapStateMachine` (`RaftStateMachine` v2 impl): apply, snapshot build/install, `applied_state`
 - [x] `OpenRaftNode` (`RaftNode` trait): `propose` via `raft.client_write()`, linearizable/sequential/eventual reads
-- [x] `LeaseManager` stub (`is_valid()` always false; full lease optimisation is Phase 5)
+- [x] `LeaseManager`: tracks `acquired_at: Instant`, `is_valid()` checks monotonic clock; `ensure_linearizable_or_lease()` skips ReadIndex when lease is fresh
 - [x] `OpenRaftCluster` (`ClusterNode` trait): `append_entries`, `vote`, `install_snapshot` as bytes-in/bytes-out handlers keeping openraft types out of `ggap-server`
 - [x] Swap `StubRaftNode` → `OpenRaftNode` in `ggap-node`; `TtlGcTask` wired through `raft.client_write()`
 - [x] `ggap-node` initialises a real single-shard Raft cluster; single-node smoke-test passes
 - [x] **DST discipline**: `tokio::time` used throughout (`LeaseManager`, `TtlGcTask`, all timeouts)
-- [x] 33/33 tests pass, zero clippy warnings
-- [ ] 3-node cluster integration test — deferred to Phase 5
+- [x] 3-node cluster integration tests (leader election, basic ops, sequential/eventual reads, leader failover)
 
 **Post-phase bug fixes (same commit):**
 - `install_snapshot` and `apply` now both encode `or_last_applied` as `Option<LogId<u64>>`; all readers decode the same type (was a crash-on-restart deserialization mismatch)
 - `KvResponse::Conflict` added; `GgapStateMachine::apply` catches `VersionConflict` and returns `Ok(Conflict)` instead of mapping to `StorageError` (openraft treats any `Err` from `apply` as fatal — node would halt on every stale conditional Put)
 - `kv_service.rs` match arms made explicit: `Conflict → Status::aborted`, `NoOp → unreachable!()`
 
-### Phase 5 — Advanced Features
-- [ ] Watch fan-out (`WatchManager`, broadcast channel, TTL `EXPIRE` events)
-- [ ] MVCC `at_version` reads via `history` partition
-- [ ] Log compaction: snapshot trigger + install on lagging follower
-- [ ] Sequential + eventual read paths tested end-to-end
+### Phase 5 — Advanced Features ✅
+- [x] Watch fan-out: broadcast channel in `FjallStateMachine`, key-range filtering, unique `watch_id` via atomic counter, `WatchCancelRequest` handling via `tokio::select!`, lagged receivers get `canceled=true` then stream closes, TTL `EXPIRE` events broadcast from `TtlGcTask`
+- [x] MVCC `at_version` reads via `history` partition (integrated into `KvServiceImpl.get()`)
+- [x] Log compaction: snapshot build + install on lagging follower (tested via DST `test_snapshot_catchup`)
+- [x] Sequential + eventual read paths tested end-to-end (`sequential_read_from_follower`, `eventual_read_from_any_node` in 3-node cluster tests)
+- [x] Watch integration tests: event ordering, key-range filtering, lag-based cancellation
 
-### Phase 6 — Hardening
-- [ ] **Deterministic simulation testing (DST)**: `turmoil`-based harness — spawn N nodes in one process, inject message drops/reorders/delays via simulated network, seed a PRNG for reproducible fault sequences, verify linearizability. Uses `MemLogStorage` + `MemStateMachine` (already built); `RaftNetwork` is injected through openraft's trait. A failing seed reproduces the exact bug.
-- [ ] Chaos tests: kill leader, isolate follower, restart, linearizability check
+### Phase 6 — Hardening (in progress)
+- [x] **Deterministic simulation testing (DST)**: `sim_cluster.rs` harness — spawn N in-memory nodes, `FaultController` injects partitions/message drops/delays via configurable drop rates, seeded PRNG for reproducible fault sequences. 7 tests: `test_election_under_paused_time`, `test_leader_failure_and_reelection`, `test_partition_and_heal`, `test_message_drop_linearizability`, `test_message_drop_linearizability_concurrent`, `test_snapshot_catchup`, `test_membership_change_under_partition`
+- [x] Chaos tests: kill leader + verify re-election, network partition + heal, message drops with concurrent writes, membership change under partition — all covered by DST suite
 - [ ] Prometheus metrics: request rate/latency p50/p99, Raft term, commit lag, match index
 - [ ] OpenTelemetry trace propagation (client → server → consensus)
 - [ ] TLS/mTLS for external and internal gRPC
+- [ ] Admin RPCs: `ClusterStatus`, `AddLearner`, `ChangeMembership`, `TransferLeader` (currently return `Status::unimplemented`)
 
 ---
 
 ## Multi-Raft Readiness (Phase 7 — deferred)
 
-The single-raft implementation is deliberately shaped to make multi-raft a future addition, not a rewrite.
+The single-raft implementation is deliberately shaped to make multi-raft a future addition, not a rewrite. Most of the infrastructure was built during Phases 3–5.
 
-**Already in place (Phases 1–6):**
+**Already in place:**
 - Storage keys are prefixed with `be_u64(shard_id)` — no data migration needed to add shards
 - `RaftNode` carries a `ShardId` field — a physical node hosting multiple shards is just `HashMap<ShardId, RaftNode>`
+- `ShardRouter`: routes reads/writes/scans by key to the correct shard's `RaftNode`
+- `ShardMap`: persisted shard metadata (range, state) in a dedicated fjall partition; loaded on startup, each shard gets its own Raft group
+- `SplitCoordinator`: orchestrates shard splits — validates split key, marks source `Splitting`, proposes `KvCommand::Split` through Raft
+- `KvCommand::Split` applied deterministically: moves keys, updates ranges, persists bootstrap membership for the new shard
+- `run_split_handler`: background task that receives `SplitApplied` events and bootstraps new Raft groups
+- `AdminService.split_shard()` + `AdminService.list_shards()` RPCs implemented
+- `GgapError::WrongShard` + `GgapError::ShardSplitting` variants for routing errors
 - The external KV proto API has no shard awareness — routing stays server-side, clients are unaffected
+- 5 integration tests: `split_partitions_data_correctly`, `scan_within_shard_works_after_split`, `writes_after_split_route_correctly`, `double_split_works`, `split_rejects_invalid_key`
 
 **What Phase 7 would add:**
-- `ShardMap`: tracks which `ShardId` owns which key range; stored in a dedicated `shards` fjall partition
-- Routing layer in `ggap-server`: lookup `ShardId` from `ShardMap` before dispatching to `RaftNode`; return `WrongShard` error (new `GgapError` variant) with redirect hint for requests that land on the wrong node
 - Placement driver (`ggap-pd` crate or external): monitors shard sizes, triggers split when a shard exceeds a threshold, assigns new shard replicas to underloaded nodes
-- Shard split protocol: leader snapshots the upper half of its key range, bootstraps a new Raft group with `ShardId(new)`, atomically updates `ShardMap`
-- `ggap-node` startup: reads `ShardMap` from local storage, starts one `RaftNode` per assigned shard
+- Automatic rebalancing: detect hot shards, trigger splits, migrate replicas to underloaded nodes
 
 **What does not change in Phase 7:**
 - Proto files (`kv.proto`, `cluster.proto`) — the client API is unchanged
@@ -340,12 +346,22 @@ The single-raft implementation is deliberately shaped to make multi-raft a futur
 
 ---
 
+## Test Summary
+
+61 tests across all crates, all passing. Zero clippy warnings.
+
+| Crate | Tests | Scope |
+|-------|-------|-------|
+| `ggap-storage` | 39 | Log storage, SM apply, MVCC, snapshot, keys, shard map |
+| `ggap-consensus` | 10 | StubRaftNode (2), DST sim_cluster (7), single-node (1) |
+| `ggap-server` | 12 | 3-node cluster (4), shard split (5), watch (3) |
+
 ## Verification Checklist
 
-1. `cargo test -p ggap-storage` — storage unit tests pass
+1. `cargo test --all` — 61/61 tests pass ✅
 2. Single-node smoke: `ggap-node --node-id 1 --client-addr 0.0.0.0:17000 --cluster-addr 0.0.0.0:17001`; `grpcurl` Get/Put/Delete/Scan
-3. 3-node cluster: write to leader, read from followers with `SEQUENTIAL`/`EVENTUAL`; verify `raft_index` in response header
+3. 3-node cluster: write to leader, read from followers with `SEQUENTIAL`/`EVENTUAL`; verify `raft_index` in response header ✅ (automated)
 4. Consistency knobs: `quorum=ALL` write fails when one node is down; `SEQUENTIAL` read from follower returns bounded-stale data
-5. MVCC: write key 3 times → `at_version=1` returns first value, `at_version=0` returns third (latest)
-6. Watch: open stream, issue puts/deletes, verify ordered events with correct `raft_index`; verify `canceled=true` on lagged receiver
-7. Leader failover: kill leader, verify election, client retries succeed via `ggap-leader-addr` metadata
+5. MVCC: write key 3 times → `at_version=1` returns first value, `at_version=0` returns third (latest) ✅ (automated)
+6. Watch: open stream, issue puts/deletes, verify ordered events with correct `watch_id`; verify `canceled=true` on lagged receiver ✅ (automated)
+7. Leader failover: kill leader, verify election, client retries succeed via `ggap-leader-addr` metadata ✅ (automated via DST + 3-node tests)
