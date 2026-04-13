@@ -148,11 +148,15 @@ impl OpenRaftNode {
     /// All supplied `node_ids` must already be learners or voters.
     /// This triggers a joint-consensus membership change that commits
     /// in two phases through Raft.
+    ///
+    /// Voters removed from the set are demoted to learners (`retain = true`)
+    /// rather than ejected from the cluster, so the operation is reversible
+    /// and cannot accidentally cause permanent quorum loss.
     pub async fn change_membership(&self, node_ids: BTreeSet<u64>) -> Result<(), GgapError> {
         self.raft
             .change_membership(
                 ChangeMembers::<u64, BasicNode>::ReplaceAllVoters(node_ids),
-                false,
+                true,
             )
             .await
             .map_err(|e| {
