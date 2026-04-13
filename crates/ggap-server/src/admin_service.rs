@@ -6,7 +6,7 @@ use ggap_proto::v1::{
     admin_service_server::AdminService, AddLearnerRequest, AddLearnerResponse,
     ChangeMembershipRequest, ChangeMembershipResponse, ClusterStatusRequest, ClusterStatusResponse,
     ListShardsRequest, ListShardsResponse, NodeInfo, ShardInfoProto, SplitShardRequest,
-    SplitShardResponse, TransferLeaderRequest, TransferLeaderResponse,
+    SplitShardResponse,
 };
 use ggap_storage::ShardMap;
 use tonic::{Request, Response, Status};
@@ -131,16 +131,6 @@ impl AdminService for AdminServiceImpl {
                 }))
             }
         }
-    }
-
-    async fn transfer_leader(
-        &self,
-        _request: Request<TransferLeaderRequest>,
-    ) -> Result<Response<TransferLeaderResponse>, Status> {
-        // openraft 0.9 does not expose a transfer-leader primitive.
-        Err(Status::unimplemented(
-            "transfer_leader is not supported by openraft 0.9",
-        ))
     }
 
     async fn split_shard(

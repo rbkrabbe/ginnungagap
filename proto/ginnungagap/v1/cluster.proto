@@ -14,7 +14,6 @@ service AdminService {
   rpc ClusterStatus    (ClusterStatusRequest)    returns (ClusterStatusResponse);
   rpc AddLearner       (AddLearnerRequest)        returns (AddLearnerResponse);
   rpc ChangeMembership (ChangeMembershipRequest)  returns (ChangeMembershipResponse);
-  rpc TransferLeader   (TransferLeaderRequest)    returns (TransferLeaderResponse);
   rpc SplitShard       (SplitShardRequest)        returns (SplitShardResponse);
   rpc ListShards       (ListShardsRequest)        returns (ListShardsResponse);
 }
@@ -47,15 +46,6 @@ message ChangeMembershipRequest {
 }
 
 message ChangeMembershipResponse {
-  bool ok = 1;
-  string error = 2;
-}
-
-message TransferLeaderRequest {
-  uint64 target_node_id = 1;
-}
-
-message TransferLeaderResponse {
   bool ok = 1;
   string error = 2;
 }

@@ -79,7 +79,7 @@ Notable request fields:
 ### `cluster.proto` — internal only (bound on `cluster_addr`)
 ```protobuf
 service RaftService   { AppendEntries, RequestVote, InstallSnapshot (streaming) }
-service AdminService  { ClusterStatus, AddLearner, ChangeMembership, TransferLeader }
+service AdminService  { ClusterStatus, AddLearner, ChangeMembership }
 ```
 
 ---
@@ -314,7 +314,7 @@ turmoil                     = "0.6"   # dev-dependency; simulation harness (Phas
 - [ ] Prometheus metrics: request rate/latency p50/p99, Raft term, commit lag, match index
 - [ ] OpenTelemetry trace propagation (client → server → consensus)
 - [ ] TLS/mTLS for external and internal gRPC
-- [x] Admin RPCs: `ClusterStatus` (reads Raft metrics for term, leader, last_applied, voter membership), `AddLearner` (adds non-voting learner via openraft), `ChangeMembership` (replaces voter set via joint-consensus). `TransferLeader` remains `unimplemented` — openraft 0.9 lacks the primitive. All wired through `ShardRouter` → `OpenRaftNode` → openraft APIs
+- [x] Admin RPCs: `ClusterStatus` (reads Raft metrics for term, leader, last_applied, voter membership), `AddLearner` (adds non-voting learner via openraft), `ChangeMembership` (replaces voter set via joint-consensus). All wired through `ShardRouter` → `OpenRaftNode` → openraft APIs
 
 ---
 
