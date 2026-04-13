@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ggap_storage::fjall::FjallStateMachine;
@@ -5,7 +6,7 @@ use ggap_storage::traits::StateMachineStore;
 use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, WriteMode};
 use openraft::{
     raft::{AppendEntriesRequest, VoteRequest},
-    BasicNode, Raft,
+    BasicNode, ChangeMembers, Raft,
 };
 
 use crate::config::GgapTypeConfig;
@@ -90,6 +91,101 @@ impl OpenRaftNode {
             .map_err(|e| GgapError::Consensus(e.to_string()))?;
         self.lease.lock().await.renew();
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Admin operations — cluster management via openraft APIs
+    // -----------------------------------------------------------------
+
+    /// Returns `(term, leader_id, last_applied_index, member_nodes)`.
+    ///
+    /// `member_nodes` contains `(node_id, addr)` for every voter in the
+    /// current membership. The addr comes from the openraft `BasicNode`.
+    pub fn cluster_status(&self) -> (u64, Option<u64>, u64, Vec<(u64, String)>) {
+        let m = self.raft.metrics().borrow().clone();
+        let term = m.current_term;
+        let leader_id = m.current_leader;
+        let last_applied = m.last_applied.map(|log_id| log_id.index).unwrap_or(0);
+
+        // Extract voter nodes from the current membership config.
+        let members: Vec<(u64, String)> = m
+            .membership_config
+            .membership()
+            .voter_ids()
+            .map(|nid| {
+                let addr = m
+                    .membership_config
+                    .membership()
+                    .get_node(&nid)
+                    .map(|n| n.addr.clone())
+                    .unwrap_or_default();
+                (nid, addr)
+            })
+            .collect();
+
+        (term, leader_id, last_applied, members)
+    }
+
+    /// Add a node as a non-voting learner to the Raft group.
+    pub async fn add_learner(&self, node_id: u64, addr: String) -> Result<(), GgapError> {
+        self.raft
+            .add_learner(node_id, BasicNode { addr }, false)
+            .await
+            .map_err(|e| {
+                if let Some(fwd) = e.forward_to_leader() {
+                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                    return GgapError::NotLeader {
+                        leader: leader_addr,
+                    };
+                }
+                GgapError::Consensus(e.to_string())
+            })?;
+        Ok(())
+    }
+
+    /// Replace the voter set with the given node IDs.
+    ///
+    /// All supplied `node_ids` must already be learners or voters.
+    /// This triggers a joint-consensus membership change that commits
+    /// in two phases through Raft.
+    pub async fn change_membership(&self, node_ids: BTreeSet<u64>) -> Result<(), GgapError> {
+        self.raft
+            .change_membership(
+                ChangeMembers::<u64, BasicNode>::ReplaceAllVoters(node_ids),
+                false,
+            )
+            .await
+            .map_err(|e| {
+                if let Some(fwd) = e.forward_to_leader() {
+                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                    return GgapError::NotLeader {
+                        leader: leader_addr,
+                    };
+                }
+                GgapError::Consensus(e.to_string())
+            })?;
+        Ok(())
+    }
+
+    /// Request the current leader to transfer leadership to `target_node_id`.
+    ///
+    /// openraft 0.9 does not provide a dedicated transfer-leader API.
+    /// As a workaround we trigger an election on the current node, which
+    /// causes the leader to step down. The `target_node_id` is recorded
+    /// for documentation but the actual election winner depends on Raft
+    /// timing. Callers should poll `cluster_status` to confirm the result.
+    pub async fn transfer_leader(&self, _target_node_id: u64) -> Result<(), GgapError> {
+        // openraft 0.9.21 Trigger only supports: elect, heartbeat, snapshot, purge_log.
+        // trigger().elect() causes this node to start a new election, which is
+        // only useful if called on a follower. From the leader side, there's no
+        // direct "step down" or "transfer" primitive.
+        //
+        // Return an explicit error so the caller knows this isn't silently ignored.
+        Err(GgapError::Consensus(
+            "transfer_leader is not supported by openraft 0.9; \
+             use AddLearner + ChangeMembership to reconfigure the cluster instead"
+                .to_string(),
+        ))
     }
 }
 
