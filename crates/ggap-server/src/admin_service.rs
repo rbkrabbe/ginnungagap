@@ -135,25 +135,12 @@ impl AdminService for AdminServiceImpl {
 
     async fn transfer_leader(
         &self,
-        request: Request<TransferLeaderRequest>,
+        _request: Request<TransferLeaderRequest>,
     ) -> Result<Response<TransferLeaderResponse>, Status> {
-        let req = request.into_inner();
-        let raft_node = self.shard0_node().await?;
-        match raft_node.transfer_leader(req.target_node_id).await {
-            Ok(()) => Ok(Response::new(TransferLeaderResponse {
-                ok: true,
-                error: String::new(),
-            })),
-            Err(e) => {
-                if matches!(&e, ggap_types::GgapError::NotLeader { .. }) {
-                    return Err(ggap_to_status(e));
-                }
-                Ok(Response::new(TransferLeaderResponse {
-                    ok: false,
-                    error: e.to_string(),
-                }))
-            }
-        }
+        // openraft 0.9 does not expose a transfer-leader primitive.
+        Err(Status::unimplemented(
+            "transfer_leader is not supported by openraft 0.9",
+        ))
     }
 
     async fn split_shard(

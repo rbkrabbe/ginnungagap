@@ -166,27 +166,6 @@ impl OpenRaftNode {
             })?;
         Ok(())
     }
-
-    /// Request the current leader to transfer leadership to `target_node_id`.
-    ///
-    /// openraft 0.9 does not provide a dedicated transfer-leader API.
-    /// As a workaround we trigger an election on the current node, which
-    /// causes the leader to step down. The `target_node_id` is recorded
-    /// for documentation but the actual election winner depends on Raft
-    /// timing. Callers should poll `cluster_status` to confirm the result.
-    pub async fn transfer_leader(&self, _target_node_id: u64) -> Result<(), GgapError> {
-        // openraft 0.9.21 Trigger only supports: elect, heartbeat, snapshot, purge_log.
-        // trigger().elect() causes this node to start a new election, which is
-        // only useful if called on a follower. From the leader side, there's no
-        // direct "step down" or "transfer" primitive.
-        //
-        // Return an explicit error so the caller knows this isn't silently ignored.
-        Err(GgapError::Consensus(
-            "transfer_leader is not supported by openraft 0.9; \
-             use AddLearner + ChangeMembership to reconfigure the cluster instead"
-                .to_string(),
-        ))
-    }
 }
 
 impl RaftNode for OpenRaftNode {
