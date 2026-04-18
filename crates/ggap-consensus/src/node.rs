@@ -40,6 +40,18 @@ pub trait ClusterNode: Send + Sync + 'static {
 }
 
 // ---------------------------------------------------------------------------
+// ClusterStatus — return type for OpenRaftNode::cluster_status()
+// ---------------------------------------------------------------------------
+
+pub struct ClusterStatus {
+    pub term: u64,
+    pub leader_id: Option<u64>,
+    pub last_applied: u64,
+    pub voters: Vec<(u64, String)>,
+    pub learners: Vec<(u64, String)>,
+}
+
+// ---------------------------------------------------------------------------
 // OpenRaftNode
 // ---------------------------------------------------------------------------
 
@@ -81,15 +93,17 @@ impl OpenRaftNode {
     /// local FSM directly. Otherwise fall back to `ensure_linearizable()` and
     /// renew the lease on success.
     async fn ensure_linearizable_or_lease(&self) -> Result<(), GgapError> {
-        let is_leader = self.raft.metrics().borrow().state == openraft::ServerState::Leader;
-        if is_leader && self.lease.lock().await.is_valid() {
+        let metrics = self.raft.metrics().borrow().clone();
+        let is_leader = metrics.state == openraft::ServerState::Leader;
+        if is_leader && self.lease.lock().await.is_valid(metrics.current_term) {
             return Ok(());
         }
         self.raft
             .ensure_linearizable()
             .await
             .map_err(|e| GgapError::Consensus(e.to_string()))?;
-        self.lease.lock().await.renew();
+        let term = self.raft.metrics().borrow().current_term;
+        self.lease.lock().await.renew(term);
         Ok(())
     }
 
@@ -97,33 +111,31 @@ impl OpenRaftNode {
     // Admin operations — cluster management via openraft APIs
     // -----------------------------------------------------------------
 
-    /// Returns `(term, leader_id, last_applied_index, member_nodes)`.
-    ///
-    /// `member_nodes` contains `(node_id, addr)` for every voter in the
-    /// current membership. The addr comes from the openraft `BasicNode`.
-    pub fn cluster_status(&self) -> (u64, Option<u64>, u64, Vec<(u64, String)>) {
+    pub fn cluster_status(&self) -> ClusterStatus {
         let m = self.raft.metrics().borrow().clone();
-        let term = m.current_term;
-        let leader_id = m.current_leader;
         let last_applied = m.last_applied.map(|log_id| log_id.index).unwrap_or(0);
 
-        // Extract voter nodes from the current membership config.
-        let members: Vec<(u64, String)> = m
-            .membership_config
-            .membership()
-            .voter_ids()
-            .map(|nid| {
-                let addr = m
-                    .membership_config
-                    .membership()
-                    .get_node(&nid)
-                    .map(|n| n.addr.clone())
-                    .unwrap_or_default();
-                (nid, addr)
-            })
-            .collect();
+        let membership = m.membership_config.membership();
+        let voter_ids: BTreeSet<u64> = membership.voter_ids().collect();
 
-        (term, leader_id, last_applied, members)
+        let mut voters = Vec::new();
+        let mut learners = Vec::new();
+        for (nid, node) in membership.nodes() {
+            let pair = (*nid, node.addr.clone());
+            if voter_ids.contains(nid) {
+                voters.push(pair);
+            } else {
+                learners.push(pair);
+            }
+        }
+
+        ClusterStatus {
+            term: m.current_term,
+            leader_id: m.current_leader,
+            last_applied,
+            voters,
+            learners,
+        }
     }
 
     /// Add a node as a non-voting learner to the Raft group.
@@ -269,11 +281,12 @@ impl ClusterNode for OpenRaftCluster {
 }
 
 // ---------------------------------------------------------------------------
-// LeaseManager (Phase 5 stub)
+// LeaseManager
 // ---------------------------------------------------------------------------
 
 pub struct LeaseManager {
     acquired_at: Option<tokio::time::Instant>,
+    acquired_at_term: u64,
     duration: tokio::time::Duration,
 }
 
@@ -281,18 +294,25 @@ impl LeaseManager {
     pub fn new(duration: tokio::time::Duration) -> Self {
         LeaseManager {
             acquired_at: None,
+            acquired_at_term: 0,
             duration,
         }
     }
 
-    /// Returns `true` if the lease was acquired and has not yet expired.
-    pub fn is_valid(&self) -> bool {
+    /// Returns `true` if the lease was acquired in `current_term` and has not
+    /// yet expired. A term change invalidates the lease even if the time
+    /// window hasn't elapsed — prevents stale reads across leadership changes.
+    pub fn is_valid(&self, current_term: u64) -> bool {
+        if self.acquired_at_term != current_term {
+            return false;
+        }
         self.acquired_at
             .map(|t| tokio::time::Instant::now() < t + self.duration)
             .unwrap_or(false)
     }
 
-    pub fn renew(&mut self) {
+    pub fn renew(&mut self, term: u64) {
         self.acquired_at = Some(tokio::time::Instant::now());
+        self.acquired_at_term = term;
     }
 }

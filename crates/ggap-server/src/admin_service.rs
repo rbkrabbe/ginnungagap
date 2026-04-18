@@ -50,22 +50,20 @@ impl AdminService for AdminServiceImpl {
         _request: Request<ClusterStatusRequest>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         let node = self.shard0_node().await?;
-        let (term, leader_id, last_applied, members) = node.cluster_status();
+        let status = node.cluster_status();
 
-        let nodes = members
-            .into_iter()
-            .map(|(node_id, cluster_addr)| NodeInfo {
-                node_id,
-                client_addr: String::new(), // not tracked in Raft membership
-                cluster_addr,
-            })
-            .collect();
+        let to_node_info = |(node_id, cluster_addr): (u64, String)| NodeInfo {
+            node_id,
+            client_addr: String::new(),
+            cluster_addr,
+        };
 
         Ok(Response::new(ClusterStatusResponse {
-            nodes,
-            leader_id: leader_id.unwrap_or(0),
-            term,
-            last_applied,
+            nodes: status.voters.into_iter().map(to_node_info).collect(),
+            leader_id: status.leader_id,
+            term: status.term,
+            last_applied: status.last_applied,
+            learners: status.learners.into_iter().map(to_node_info).collect(),
         }))
     }
 
@@ -77,6 +75,9 @@ impl AdminService for AdminServiceImpl {
         let node_info = req
             .node
             .ok_or_else(|| Status::invalid_argument("node must be provided"))?;
+        if node_info.node_id == 0 {
+            return Err(Status::invalid_argument("node_id must be > 0"));
+        }
         if node_info.cluster_addr.is_empty() {
             return Err(Status::invalid_argument("cluster_addr must not be empty"));
         }
@@ -152,11 +153,16 @@ impl AdminService for AdminServiceImpl {
                 new_shard_id,
                 error: String::new(),
             })),
-            Err(e) => Ok(Response::new(SplitShardResponse {
-                ok: false,
-                new_shard_id: 0,
-                error: e.to_string(),
-            })),
+            Err(e) => {
+                if matches!(&e, ggap_types::GgapError::NotLeader { .. }) {
+                    return Err(ggap_to_status(e));
+                }
+                Ok(Response::new(SplitShardResponse {
+                    ok: false,
+                    new_shard_id: 0,
+                    error: e.to_string(),
+                }))
+            }
         }
     }
 

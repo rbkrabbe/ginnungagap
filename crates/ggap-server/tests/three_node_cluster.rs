@@ -442,22 +442,22 @@ async fn cluster_status_reflects_elected_leader_and_membership() {
     let leader_idx = cluster.wait_for_leader().await;
     let leader = &cluster.nodes[leader_idx];
 
-    let (term, leader_id, last_applied, members) = leader.raft_node.cluster_status();
+    let status = leader.raft_node.cluster_status();
 
     // After election the term must be at least 1.
-    assert!(term >= 1, "term should be >= 1, got {term}");
+    assert!(status.term >= 1, "term should be >= 1, got {}", status.term);
 
     // The leader should report itself.
     assert_eq!(
-        leader_id,
+        status.leader_id,
         Some(leader.id),
         "leader_id should be {}, got {:?}",
         leader.id,
-        leader_id
+        status.leader_id
     );
 
     // Membership must contain all 3 original voters.
-    let voter_ids: BTreeSet<u64> = members.iter().map(|(id, _)| *id).collect();
+    let voter_ids: BTreeSet<u64> = status.voters.iter().map(|(id, _)| *id).collect();
     assert_eq!(
         voter_ids,
         BTreeSet::from([1, 2, 3]),
@@ -465,26 +465,37 @@ async fn cluster_status_reflects_elected_leader_and_membership() {
     );
 
     // Each member should have a non-empty cluster address.
-    for (nid, addr) in &members {
+    for (nid, addr) in &status.voters {
         assert!(
             !addr.is_empty(),
             "node {nid} has empty cluster addr in membership"
         );
     }
 
+    // No learners in a fresh 3-node cluster.
+    assert!(
+        status.learners.is_empty(),
+        "expected no learners, got {:?}",
+        status.learners
+    );
+
     // last_applied should be > 0 (at least the initial membership log entry).
     assert!(
-        last_applied > 0,
-        "last_applied should be > 0, got {last_applied}"
+        status.last_applied > 0,
+        "last_applied should be > 0, got {}",
+        status.last_applied
     );
 
     // Follower should also return cluster_status (may have slightly stale data
     // but membership and term should still be valid).
     let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
-    let (f_term, _f_leader, _f_applied, f_members) =
-        cluster.nodes[follower_idx].raft_node.cluster_status();
-    let f_voter_ids: BTreeSet<u64> = f_members.iter().map(|(id, _)| *id).collect();
-    assert!(f_term >= 1, "follower term should be >= 1, got {f_term}");
+    let f_status = cluster.nodes[follower_idx].raft_node.cluster_status();
+    let f_voter_ids: BTreeSet<u64> = f_status.voters.iter().map(|(id, _)| *id).collect();
+    assert!(
+        f_status.term >= 1,
+        "follower term should be >= 1, got {}",
+        f_status.term
+    );
     assert_eq!(
         f_voter_ids,
         BTreeSet::from([1, 2, 3]),
@@ -511,23 +522,34 @@ async fn add_learner_updates_membership() {
         .await
         .expect("add_learner should succeed on leader");
 
-    // Verify via raft metrics that node 99 is now a learner.
-    // Give a moment for the membership to propagate.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let metrics = leader.raft.metrics().borrow().clone();
-    let all_node_ids: BTreeSet<u64> = metrics
-        .membership_config
-        .membership()
-        .nodes()
-        .map(|(nid, _)| *nid)
-        .collect();
-    assert!(
-        all_node_ids.contains(&99),
-        "node 99 should appear in membership nodes, got {all_node_ids:?}"
-    );
+    // Poll until node 99 appears in membership (replaces fragile sleep).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let metrics = leader.raft.metrics().borrow().clone();
+        let all_node_ids: BTreeSet<u64> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(nid, _)| *nid)
+            .collect();
+        if all_node_ids.contains(&99) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for node 99 in membership, got {all_node_ids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-    // Node 99 should NOT be a voter.
-    let voter_ids: BTreeSet<u64> = metrics.membership_config.membership().voter_ids().collect();
+    // Verify via cluster_status that node 99 is a learner, not a voter.
+    let status = leader.raft_node.cluster_status();
+    let voter_ids: BTreeSet<u64> = status.voters.iter().map(|(id, _)| *id).collect();
+    let learner_ids: BTreeSet<u64> = status.learners.iter().map(|(id, _)| *id).collect();
+    assert!(
+        learner_ids.contains(&99),
+        "node 99 should appear in learners, got {learner_ids:?}"
+    );
     assert!(
         !voter_ids.contains(&99),
         "node 99 should not be a voter, voters = {voter_ids:?}"
@@ -610,30 +632,33 @@ async fn change_membership_demotes_removed_voter_to_learner() {
         .await
         .expect("change_membership should succeed");
 
-    // Allow time for the membership change to propagate.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Poll until voter set matches the expected remaining nodes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let poll_status = leader.raft_node.cluster_status();
+        let current_voter_ids: BTreeSet<u64> =
+            poll_status.voters.iter().map(|(id, _)| *id).collect();
+        if current_voter_ids == remaining_ids {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for voter set {remaining_ids:?}, got {current_voter_ids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-    // Verify voter set is now just the remaining nodes.
-    let (_, _, _, members) = leader.raft_node.cluster_status();
-    let new_voter_ids: BTreeSet<u64> = members.iter().map(|(id, _)| *id).collect();
+    // Verify the removed node is now a learner (retain=true) via cluster_status.
+    let status = leader.raft_node.cluster_status();
+    let new_voter_ids: BTreeSet<u64> = status.voters.iter().map(|(id, _)| *id).collect();
+    let learner_ids: BTreeSet<u64> = status.learners.iter().map(|(id, _)| *id).collect();
     assert_eq!(
         new_voter_ids, remaining_ids,
         "voter set should be {remaining_ids:?}, got {new_voter_ids:?}"
     );
-
-    // Verify the removed node is still in the membership as a learner
-    // (retain=true), NOT ejected entirely.
-    let metrics = leader.raft.metrics().borrow().clone();
-    let all_node_ids: BTreeSet<u64> = metrics
-        .membership_config
-        .membership()
-        .nodes()
-        .map(|(nid, _)| *nid)
-        .collect();
     assert!(
-        all_node_ids.contains(&removed_id),
-        "node {removed_id} should still be in membership as learner, \
-         but all nodes = {all_node_ids:?}"
+        learner_ids.contains(&removed_id),
+        "node {removed_id} should be a learner, but learners = {learner_ids:?}"
     );
 
     // Verify writes still work under the new 2-voter config.
