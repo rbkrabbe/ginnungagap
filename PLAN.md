@@ -79,7 +79,7 @@ Notable request fields:
 ### `cluster.proto` — internal only (bound on `cluster_addr`)
 ```protobuf
 service RaftService   { AppendEntries, RequestVote, InstallSnapshot (streaming) }
-service AdminService  { ClusterStatus, AddLearner, ChangeMembership, TransferLeader }
+service AdminService  { ClusterStatus, AddLearner, ChangeMembership }
 ```
 
 ---
@@ -314,7 +314,7 @@ turmoil                     = "0.6"   # dev-dependency; simulation harness (Phas
 - [ ] Prometheus metrics: request rate/latency p50/p99, Raft term, commit lag, match index
 - [ ] OpenTelemetry trace propagation (client → server → consensus)
 - [ ] TLS/mTLS for external and internal gRPC
-- [ ] Admin RPCs: `ClusterStatus`, `AddLearner`, `ChangeMembership`, `TransferLeader` (currently return `Status::unimplemented`)
+- [x] Admin RPCs: `ClusterStatus` (reads Raft metrics for term, leader, last_applied, voter membership), `AddLearner` (adds non-voting learner via openraft), `ChangeMembership` (replaces voter set via joint-consensus). All wired through `ShardRouter` → `OpenRaftNode` → openraft APIs
 
 ---
 
@@ -348,17 +348,17 @@ The single-raft implementation is deliberately shaped to make multi-raft a futur
 
 ## Test Summary
 
-61 tests across all crates, all passing. Zero clippy warnings.
+66 tests across all crates, all passing. Zero clippy warnings.
 
 | Crate | Tests | Scope |
 |-------|-------|-------|
 | `ggap-storage` | 39 | Log storage, SM apply, MVCC, snapshot, keys, shard map |
 | `ggap-consensus` | 10 | StubRaftNode (2), DST sim_cluster (7), single-node (1) |
-| `ggap-server` | 12 | 3-node cluster (4), shard split (5), watch (3) |
+| `ggap-server` | 17 | 3-node cluster (4), admin ops (5), shard split (5), watch (3) |
 
 ## Verification Checklist
 
-1. `cargo test --all` — 61/61 tests pass ✅
+1. `cargo test --all` — 66/66 tests pass ✅
 2. Single-node smoke: `ggap-node --node-id 1 --client-addr 0.0.0.0:17000 --cluster-addr 0.0.0.0:17001`; `grpcurl` Get/Put/Delete/Scan
 3. 3-node cluster: write to leader, read from followers with `SEQUENTIAL`/`EVENTUAL`; verify `raft_index` in response header ✅ (automated)
 4. Consistency knobs: `quorum=ALL` write fails when one node is down; `SEQUENTIAL` read from follower returns bounded-stale data

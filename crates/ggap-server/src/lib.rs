@@ -108,12 +108,10 @@ pub async fn serve_cluster(
         .build_v1()
         .expect("failed to build reflection service");
     tracing::info!(%addr, "cluster gRPC server starting");
+    let admin = AdminServiceImpl::new(router.clone(), split_coordinator, shard_map);
     tonic::transport::Server::builder()
         .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
-        .add_service(AdminServiceServer::new(AdminServiceImpl::new(
-            split_coordinator,
-            shard_map,
-        )))
+        .add_service(AdminServiceServer::new(admin))
         .add_service(reflection)
         .serve(addr)
         .await
@@ -131,12 +129,10 @@ pub async fn serve_cluster_with_listener(
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
+    let admin = AdminServiceImpl::new(router.clone(), split_coordinator, shard_map);
     tonic::transport::Server::builder()
         .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
-        .add_service(AdminServiceServer::new(AdminServiceImpl::new(
-            split_coordinator,
-            shard_map,
-        )))
+        .add_service(AdminServiceServer::new(admin))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await

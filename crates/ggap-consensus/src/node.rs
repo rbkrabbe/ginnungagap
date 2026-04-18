@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ggap_storage::fjall::FjallStateMachine;
@@ -5,7 +6,7 @@ use ggap_storage::traits::StateMachineStore;
 use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, WriteMode};
 use openraft::{
     raft::{AppendEntriesRequest, VoteRequest},
-    BasicNode, Raft,
+    BasicNode, ChangeMembers, Raft,
 };
 
 use crate::config::GgapTypeConfig;
@@ -36,6 +37,18 @@ pub trait ClusterNode: Send + Sync + 'static {
         &self,
         payload: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, GgapError>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// ClusterStatus — return type for OpenRaftNode::cluster_status()
+// ---------------------------------------------------------------------------
+
+pub struct ClusterStatus {
+    pub term: u64,
+    pub leader_id: Option<u64>,
+    pub last_applied: u64,
+    pub voters: Vec<(u64, String)>,
+    pub learners: Vec<(u64, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,15 +93,93 @@ impl OpenRaftNode {
     /// local FSM directly. Otherwise fall back to `ensure_linearizable()` and
     /// renew the lease on success.
     async fn ensure_linearizable_or_lease(&self) -> Result<(), GgapError> {
-        let is_leader = self.raft.metrics().borrow().state == openraft::ServerState::Leader;
-        if is_leader && self.lease.lock().await.is_valid() {
+        let metrics = self.raft.metrics().borrow().clone();
+        let is_leader = metrics.state == openraft::ServerState::Leader;
+        if is_leader && self.lease.lock().await.is_valid(metrics.current_term) {
             return Ok(());
         }
         self.raft
             .ensure_linearizable()
             .await
             .map_err(|e| GgapError::Consensus(e.to_string()))?;
-        self.lease.lock().await.renew();
+        let term = self.raft.metrics().borrow().current_term;
+        self.lease.lock().await.renew(term);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Admin operations — cluster management via openraft APIs
+    // -----------------------------------------------------------------
+
+    pub fn cluster_status(&self) -> ClusterStatus {
+        let m = self.raft.metrics().borrow().clone();
+        let last_applied = m.last_applied.map(|log_id| log_id.index).unwrap_or(0);
+
+        let membership = m.membership_config.membership();
+        let voter_ids: BTreeSet<u64> = membership.voter_ids().collect();
+
+        let mut voters = Vec::new();
+        let mut learners = Vec::new();
+        for (nid, node) in membership.nodes() {
+            let pair = (*nid, node.addr.clone());
+            if voter_ids.contains(nid) {
+                voters.push(pair);
+            } else {
+                learners.push(pair);
+            }
+        }
+
+        ClusterStatus {
+            term: m.current_term,
+            leader_id: m.current_leader,
+            last_applied,
+            voters,
+            learners,
+        }
+    }
+
+    /// Add a node as a non-voting learner to the Raft group.
+    pub async fn add_learner(&self, node_id: u64, addr: String) -> Result<(), GgapError> {
+        self.raft
+            .add_learner(node_id, BasicNode { addr }, false)
+            .await
+            .map_err(|e| {
+                if let Some(fwd) = e.forward_to_leader() {
+                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                    return GgapError::NotLeader {
+                        leader: leader_addr,
+                    };
+                }
+                GgapError::Consensus(e.to_string())
+            })?;
+        Ok(())
+    }
+
+    /// Replace the voter set with the given node IDs.
+    ///
+    /// All supplied `node_ids` must already be learners or voters.
+    /// This triggers a joint-consensus membership change that commits
+    /// in two phases through Raft.
+    ///
+    /// Voters removed from the set are demoted to learners (`retain = true`)
+    /// rather than ejected from the cluster, so the operation is reversible
+    /// and cannot accidentally cause permanent quorum loss.
+    pub async fn change_membership(&self, node_ids: BTreeSet<u64>) -> Result<(), GgapError> {
+        self.raft
+            .change_membership(
+                ChangeMembers::<u64, BasicNode>::ReplaceAllVoters(node_ids),
+                true,
+            )
+            .await
+            .map_err(|e| {
+                if let Some(fwd) = e.forward_to_leader() {
+                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                    return GgapError::NotLeader {
+                        leader: leader_addr,
+                    };
+                }
+                GgapError::Consensus(e.to_string())
+            })?;
         Ok(())
     }
 }
@@ -190,11 +281,12 @@ impl ClusterNode for OpenRaftCluster {
 }
 
 // ---------------------------------------------------------------------------
-// LeaseManager (Phase 5 stub)
+// LeaseManager
 // ---------------------------------------------------------------------------
 
 pub struct LeaseManager {
     acquired_at: Option<tokio::time::Instant>,
+    acquired_at_term: u64,
     duration: tokio::time::Duration,
 }
 
@@ -202,18 +294,25 @@ impl LeaseManager {
     pub fn new(duration: tokio::time::Duration) -> Self {
         LeaseManager {
             acquired_at: None,
+            acquired_at_term: 0,
             duration,
         }
     }
 
-    /// Returns `true` if the lease was acquired and has not yet expired.
-    pub fn is_valid(&self) -> bool {
+    /// Returns `true` if the lease was acquired in `current_term` and has not
+    /// yet expired. A term change invalidates the lease even if the time
+    /// window hasn't elapsed — prevents stale reads across leadership changes.
+    pub fn is_valid(&self, current_term: u64) -> bool {
+        if self.acquired_at_term != current_term {
+            return false;
+        }
         self.acquired_at
             .map(|t| tokio::time::Instant::now() < t + self.duration)
             .unwrap_or(false)
     }
 
-    pub fn renew(&mut self) {
+    pub fn renew(&mut self, term: u64) {
         self.acquired_at = Some(tokio::time::Instant::now());
+        self.acquired_at_term = term;
     }
 }

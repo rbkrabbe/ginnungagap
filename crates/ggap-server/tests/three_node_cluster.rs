@@ -8,7 +8,7 @@
 //! Run with:
 //!   cargo test -p ggap-server --test three_node_cluster -- --nocapture
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvSer
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
-use ggap_types::{KvCommand, KvResponse, ReadMode};
+use ggap_types::{GgapError, KvCommand, KvResponse, ReadMode, WriteMode};
 
 // ---------------------------------------------------------------------------
 // TestNode — a single in-process Raft node with gRPC servers running
@@ -426,6 +426,280 @@ async fn eventual_read_from_any_node() {
             .unwrap_or_else(|| panic!("node {} missing evt_key", node.id));
         assert_eq!(entry.value, b"evt_val", "node {} value mismatch", node.id);
     }
+
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Admin operation tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that `cluster_status` returns correct term, leader, and membership
+/// after election in a 3-node cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_status_reflects_elected_leader_and_membership() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let leader = &cluster.nodes[leader_idx];
+
+    let status = leader.raft_node.cluster_status();
+
+    // After election the term must be at least 1.
+    assert!(status.term >= 1, "term should be >= 1, got {}", status.term);
+
+    // The leader should report itself.
+    assert_eq!(
+        status.leader_id,
+        Some(leader.id),
+        "leader_id should be {}, got {:?}",
+        leader.id,
+        status.leader_id
+    );
+
+    // Membership must contain all 3 original voters.
+    let voter_ids: BTreeSet<u64> = status.voters.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        voter_ids,
+        BTreeSet::from([1, 2, 3]),
+        "expected voters {{1,2,3}}, got {voter_ids:?}"
+    );
+
+    // Each member should have a non-empty cluster address.
+    for (nid, addr) in &status.voters {
+        assert!(
+            !addr.is_empty(),
+            "node {nid} has empty cluster addr in membership"
+        );
+    }
+
+    // No learners in a fresh 3-node cluster.
+    assert!(
+        status.learners.is_empty(),
+        "expected no learners, got {:?}",
+        status.learners
+    );
+
+    // last_applied should be > 0 (at least the initial membership log entry).
+    assert!(
+        status.last_applied > 0,
+        "last_applied should be > 0, got {}",
+        status.last_applied
+    );
+
+    // Follower should also return cluster_status (may have slightly stale data
+    // but membership and term should still be valid).
+    let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let f_status = cluster.nodes[follower_idx].raft_node.cluster_status();
+    let f_voter_ids: BTreeSet<u64> = f_status.voters.iter().map(|(id, _)| *id).collect();
+    assert!(
+        f_status.term >= 1,
+        "follower term should be >= 1, got {}",
+        f_status.term
+    );
+    assert_eq!(
+        f_voter_ids,
+        BTreeSet::from([1, 2, 3]),
+        "follower sees wrong voters: {f_voter_ids:?}"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Verifies that `add_learner` on the leader succeeds and the learner appears
+/// in the Raft membership. The learner node does not need to be running for
+/// the membership change to commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_learner_updates_membership() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let leader = &cluster.nodes[leader_idx];
+
+    // Add node 99 as a learner (no actual node running — that's fine,
+    // the membership change still commits through Raft).
+    leader
+        .raft_node
+        .add_learner(99, "127.0.0.1:19999".to_string())
+        .await
+        .expect("add_learner should succeed on leader");
+
+    // Poll until node 99 appears in membership (replaces fragile sleep).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let metrics = leader.raft.metrics().borrow().clone();
+        let all_node_ids: BTreeSet<u64> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(nid, _)| *nid)
+            .collect();
+        if all_node_ids.contains(&99) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for node 99 in membership, got {all_node_ids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Verify via cluster_status that node 99 is a learner, not a voter.
+    let status = leader.raft_node.cluster_status();
+    let voter_ids: BTreeSet<u64> = status.voters.iter().map(|(id, _)| *id).collect();
+    let learner_ids: BTreeSet<u64> = status.learners.iter().map(|(id, _)| *id).collect();
+    assert!(
+        learner_ids.contains(&99),
+        "node 99 should appear in learners, got {learner_ids:?}"
+    );
+    assert!(
+        !voter_ids.contains(&99),
+        "node 99 should not be a voter, voters = {voter_ids:?}"
+    );
+
+    // Original 3 voters should still be intact.
+    assert_eq!(
+        voter_ids,
+        BTreeSet::from([1, 2, 3]),
+        "original voters should be unchanged"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Verifies that `add_learner` called on a follower returns `NotLeader`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_learner_on_follower_returns_not_leader() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+
+    let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let err = cluster.nodes[follower_idx]
+        .raft_node
+        .add_learner(99, "127.0.0.1:19999".to_string())
+        .await
+        .expect_err("add_learner on follower should fail");
+
+    assert!(
+        matches!(err, GgapError::NotLeader { .. }),
+        "expected NotLeader, got {err:?}"
+    );
+
+    // The error should carry a leader hint.
+    if let GgapError::NotLeader { leader } = &err {
+        assert!(
+            leader.is_some(),
+            "NotLeader error should include a leader address hint"
+        );
+    }
+
+    cluster.shutdown().await;
+}
+
+/// Verifies that `change_membership` correctly shrinks the voter set and that
+/// `retain=true` demotes the removed voter to a learner instead of ejecting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_membership_demotes_removed_voter_to_learner() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let leader = &cluster.nodes[leader_idx];
+
+    // Write some data before the membership change.
+    let resp = leader
+        .raft
+        .client_write(KvCommand::Put {
+            key: "before_change".into(),
+            value: b"v1".to_vec(),
+            ttl_ns: None,
+            expect_version: 0,
+        })
+        .await
+        .unwrap();
+    cluster.wait_for_all_applied(resp.log_id().index).await;
+
+    // Pick a non-leader node to remove from voters.
+    let removed_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let removed_id = cluster.nodes[removed_idx].id;
+    let remaining_ids: BTreeSet<u64> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.id)
+        .filter(|&id| id != removed_id)
+        .collect();
+
+    // Change membership to exclude the removed node.
+    leader
+        .raft_node
+        .change_membership(remaining_ids.clone())
+        .await
+        .expect("change_membership should succeed");
+
+    // Poll until voter set matches the expected remaining nodes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let poll_status = leader.raft_node.cluster_status();
+        let current_voter_ids: BTreeSet<u64> =
+            poll_status.voters.iter().map(|(id, _)| *id).collect();
+        if current_voter_ids == remaining_ids {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for voter set {remaining_ids:?}, got {current_voter_ids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Verify the removed node is now a learner (retain=true) via cluster_status.
+    let status = leader.raft_node.cluster_status();
+    let new_voter_ids: BTreeSet<u64> = status.voters.iter().map(|(id, _)| *id).collect();
+    let learner_ids: BTreeSet<u64> = status.learners.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        new_voter_ids, remaining_ids,
+        "voter set should be {remaining_ids:?}, got {new_voter_ids:?}"
+    );
+    assert!(
+        learner_ids.contains(&removed_id),
+        "node {removed_id} should be a learner, but learners = {learner_ids:?}"
+    );
+
+    // Verify writes still work under the new 2-voter config.
+    let resp = leader
+        .raft_node
+        .propose(
+            KvCommand::Put {
+                key: "after_change".into(),
+                value: b"v2".to_vec(),
+                ttl_ns: None,
+                expect_version: 0,
+            },
+            WriteMode::Majority,
+        )
+        .await
+        .expect("write should succeed with 2-voter config");
+    assert!(
+        matches!(resp, KvResponse::Written { .. }),
+        "expected Written, got {resp:?}"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Verifies that `change_membership` on a follower returns `NotLeader`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_membership_on_follower_returns_not_leader() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+
+    let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let err = cluster.nodes[follower_idx]
+        .raft_node
+        .change_membership(BTreeSet::from([1, 2]))
+        .await
+        .expect_err("change_membership on follower should fail");
+
+    assert!(
+        matches!(err, GgapError::NotLeader { .. }),
+        "expected NotLeader, got {err:?}"
+    );
 
     cluster.shutdown().await;
 }

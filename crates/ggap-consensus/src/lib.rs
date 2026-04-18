@@ -23,7 +23,7 @@ use ggap_types::{
 pub use config::{build_raft_config, GgapTypeConfig};
 pub use log_store::GgapLogStorage;
 pub use network::{GgapNetwork, GgapNetworkFactory};
-pub use node::{ClusterNode, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
+pub use node::{ClusterNode, ClusterStatus, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
 pub use router::ShardRouter;
 pub use split::{run_split_handler, SplitCoordinator, SplitCoordinatorConfig};
 pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};
