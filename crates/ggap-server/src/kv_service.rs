@@ -14,6 +14,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::convert::{
     ggap_to_status, kv_entry_to_proto, proto_read_consistency, proto_write_quorum, stub_header,
 };
+use crate::metrics::{record, status_label};
 
 /// Global monotonic counter for assigning unique watch IDs.
 static NEXT_WATCH_ID: AtomicU64 = AtomicU64::new(1);
@@ -48,12 +49,8 @@ impl KvServiceImpl {
             watch_output_buffer,
         }
     }
-}
 
-#[tonic::async_trait]
-impl KvService for KvServiceImpl {
-    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        let req = request.into_inner();
+    async fn do_get(&self, req: GetRequest) -> Result<Response<GetResponse>, Status> {
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
         }
@@ -77,8 +74,7 @@ impl KvService for KvServiceImpl {
         }
     }
 
-    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
-        let req = request.into_inner();
+    async fn do_put(&self, req: PutRequest) -> Result<Response<PutResponse>, Status> {
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
         }
@@ -125,11 +121,7 @@ impl KvService for KvServiceImpl {
         }
     }
 
-    async fn delete(
-        &self,
-        request: Request<DeleteRequest>,
-    ) -> Result<Response<DeleteResponse>, Status> {
-        let req = request.into_inner();
+    async fn do_delete(&self, req: DeleteRequest) -> Result<Response<DeleteResponse>, Status> {
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
         }
@@ -151,8 +143,7 @@ impl KvService for KvServiceImpl {
         }
     }
 
-    async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
-        let req = request.into_inner();
+    async fn do_scan(&self, req: ScanRequest) -> Result<Response<ScanResponse>, Status> {
         let start_key = if req.page_token.is_empty() {
             req.start_key.clone()
         } else {
@@ -185,11 +176,7 @@ impl KvService for KvServiceImpl {
         }))
     }
 
-    async fn compare_and_swap(
-        &self,
-        request: Request<CasRequest>,
-    ) -> Result<Response<CasResponse>, Status> {
-        let req = request.into_inner();
+    async fn do_compare_and_swap(&self, req: CasRequest) -> Result<Response<CasResponse>, Status> {
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
         }
@@ -234,6 +221,58 @@ impl KvService for KvServiceImpl {
             ggap_types::KvResponse::NoOp => unreachable!("CAS returned NoOp"),
             _ => Err(Status::internal("unexpected response variant")),
         }
+    }
+}
+
+#[tonic::async_trait]
+impl KvService for KvServiceImpl {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_get(request.into_inner()).await;
+        record("get", status_label(result.as_ref().err()), start.elapsed());
+        result
+    }
+
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_put(request.into_inner()).await;
+        record("put", status_label(result.as_ref().err()), start.elapsed());
+        result
+    }
+
+    async fn delete(
+        &self,
+        request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_delete(request.into_inner()).await;
+        record(
+            "delete",
+            status_label(result.as_ref().err()),
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_scan(request.into_inner()).await;
+        record("scan", status_label(result.as_ref().err()), start.elapsed());
+        result
+    }
+
+    async fn compare_and_swap(
+        &self,
+        request: Request<CasRequest>,
+    ) -> Result<Response<CasResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_compare_and_swap(request.into_inner()).await;
+        record(
+            "compare_and_swap",
+            status_label(result.as_ref().err()),
+            start.elapsed(),
+        );
+        result
     }
 
     type WatchStream = ReceiverStream<Result<WatchEvent, Status>>;

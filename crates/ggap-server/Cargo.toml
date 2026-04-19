@@ -16,6 +16,7 @@ tower          = { workspace = true }
 async-trait    = { workspace = true }
 tracing        = { workspace = true }
 anyhow         = { workspace = true }
+metrics        = { workspace = true }
 
 [dev-dependencies]
 ggap-storage = { path = "../ggap-storage" }
@@ -24,6 +25,7 @@ tempfile      = { workspace = true }
 futures       = { workspace = true }
 uuid          = { workspace = true }
 rand          = "0.10"
+metrics-util  = { workspace = true }
 
 [[bench]]
 name    = "kv_write"
