@@ -180,37 +180,39 @@ impl TestCluster {
         Self { nodes }
     }
 
-    /// Block until one node reports `ServerState::Leader`; returns its index.
+    /// Block until one node reports `ServerState::Leader` *and* every node
+    /// has applied the initial bootstrap membership entry. The latter is
+    /// required because openraft checks for an in-flight config change
+    /// before checking leadership: without the extra wait, admin RPCs
+    /// racing bootstrap see `Consensus("already undergoing a configuration
+    /// change")` instead of the expected `NotLeader`, and `add_learner`
+    /// calls on the leader fail outright. Returns the leader's index.
     async fn wait_for_leader(&self) -> usize {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
+        let leader_idx = loop {
+            let mut found = None;
             for (i, node) in self.nodes.iter().enumerate() {
                 if node.raft.metrics().borrow().state == ServerState::Leader {
-                    return i;
+                    found = Some(i);
+                    break;
                 }
+            }
+            if let Some(i) = found {
+                break i;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "no leader elected within 10 s"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// Wait until every node has applied its initial membership entry, so
-    /// subsequent admin RPCs observe a committed config and openraft's
-    /// "already undergoing a configuration change" path is no longer
-    /// reachable. Bootstrap only: once any client write lands, the membership
-    /// has necessarily committed.
-    async fn wait_for_stable_membership(&self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        };
         loop {
             let all_applied = self
                 .nodes
                 .iter()
                 .all(|n| n.raft.metrics().borrow().last_applied.is_some());
             if all_applied {
-                return;
+                return leader_idx;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -593,10 +595,6 @@ async fn add_learner_updates_membership() {
 async fn add_learner_on_follower_returns_not_leader() {
     let cluster = TestCluster::start(3).await;
     let leader_idx = cluster.wait_for_leader().await;
-    // openraft checks for an in-flight config change before checking
-    // leadership; without this wait the initial bootstrap membership may
-    // still be uncommitted on slow runners, masking NotLeader as Consensus.
-    cluster.wait_for_stable_membership().await;
 
     let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
     let err = cluster.nodes[follower_idx]
