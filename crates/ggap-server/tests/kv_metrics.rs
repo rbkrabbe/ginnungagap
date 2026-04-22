@@ -282,25 +282,25 @@ async fn kv_service_emits_metrics_for_each_rpc() {
     let totals = counter_totals(snap);
     let get = |m: &str, s: &str| *totals.get(&(m.to_string(), s.to_string())).unwrap_or(&0);
 
-    assert!(get("put", "ok") >= 1, "put ok missing: {totals:?}");
-    assert!(get("get", "ok") >= 1, "get ok missing: {totals:?}");
+    assert!(get("put", "Ok") >= 1, "put Ok missing: {totals:?}");
+    assert!(get("get", "Ok") >= 1, "get Ok missing: {totals:?}");
     assert!(
-        get("get", "not_found") >= 1,
-        "get not_found missing: {totals:?}"
+        get("get", "NotFound") >= 1,
+        "get NotFound missing: {totals:?}"
     );
     assert!(
-        get("put", "invalid_argument") >= 1,
-        "put invalid_argument missing: {totals:?}"
+        get("put", "InvalidArgument") >= 1,
+        "put InvalidArgument missing: {totals:?}"
     );
     assert!(
-        get("put", "aborted") >= 1,
-        "put aborted missing: {totals:?}"
+        get("put", "Aborted") >= 1,
+        "put Aborted missing: {totals:?}"
     );
-    assert!(get("delete", "ok") >= 1, "delete ok missing: {totals:?}");
-    assert!(get("scan", "ok") >= 1, "scan ok missing: {totals:?}");
+    assert!(get("delete", "Ok") >= 1, "delete Ok missing: {totals:?}");
+    assert!(get("scan", "Ok") >= 1, "scan Ok missing: {totals:?}");
     assert!(
-        get("compare_and_swap", "ok") >= 1,
-        "cas ok missing: {totals:?}"
+        get("compare_and_swap", "Ok") >= 1,
+        "cas Ok missing: {totals:?}"
     );
 
     // Histogram must emit for every (method, status) pair the counter saw.

@@ -14,7 +14,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::convert::{
     ggap_to_status, kv_entry_to_proto, proto_read_consistency, proto_write_quorum, stub_header,
 };
-use crate::metrics::{record, status_label};
+use crate::metrics::record;
 
 /// Global monotonic counter for assigning unique watch IDs.
 static NEXT_WATCH_ID: AtomicU64 = AtomicU64::new(1);
@@ -229,14 +229,14 @@ impl KvService for KvServiceImpl {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_get(request.into_inner()).await;
-        record("get", status_label(result.as_ref().err()), start.elapsed());
+        record("get", &result, start.elapsed());
         result
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_put(request.into_inner()).await;
-        record("put", status_label(result.as_ref().err()), start.elapsed());
+        record("put", &result, start.elapsed());
         result
     }
 
@@ -246,18 +246,14 @@ impl KvService for KvServiceImpl {
     ) -> Result<Response<DeleteResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_delete(request.into_inner()).await;
-        record(
-            "delete",
-            status_label(result.as_ref().err()),
-            start.elapsed(),
-        );
+        record("delete", &result, start.elapsed());
         result
     }
 
     async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_scan(request.into_inner()).await;
-        record("scan", status_label(result.as_ref().err()), start.elapsed());
+        record("scan", &result, start.elapsed());
         result
     }
 
@@ -267,11 +263,7 @@ impl KvService for KvServiceImpl {
     ) -> Result<Response<CasResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_compare_and_swap(request.into_inner()).await;
-        record(
-            "compare_and_swap",
-            status_label(result.as_ref().err()),
-            start.elapsed(),
-        );
+        record("compare_and_swap", &result, start.elapsed());
         result
     }
 
