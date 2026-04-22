@@ -26,6 +26,8 @@ use ggap_storage::{
 };
 use ggap_types::DomainWatchEvent;
 
+mod observability;
+
 #[derive(clap::Parser, Debug)]
 #[command(name = "ggap-node", about = "Ginnungagap KV node")]
 struct Cli {
@@ -42,6 +44,10 @@ struct Cli {
     config: Option<std::path::PathBuf>,
     #[arg(long, default_value = "/var/lib/ginnungagap")]
     data_dir: std::path::PathBuf,
+    /// Prometheus scrape endpoint. Overrides `[observability].metrics_addr`.
+    /// An empty string disables the endpoint entirely.
+    #[arg(long)]
+    metrics_addr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +146,23 @@ async fn main() -> anyhow::Result<()> {
         "node starting"
     );
 
+    // Initialize Prometheus metrics. Empty string disables; CLI overrides config.
+    let shutdown = CancellationToken::new();
+    let raw_metrics_addr = cli
+        .metrics_addr
+        .clone()
+        .unwrap_or_else(|| config.observability.metrics_addr.clone());
+    let metrics_addr: Option<SocketAddr> = if raw_metrics_addr.trim().is_empty() {
+        None
+    } else {
+        Some(
+            raw_metrics_addr
+                .parse()
+                .with_context(|| format!("invalid metrics_addr: {raw_metrics_addr}"))?,
+        )
+    };
+    let _metrics_handle = observability::init_metrics_recorder(metrics_addr, shutdown.clone())?;
+
     let client_addr: SocketAddr = cli
         .client_addr
         .parse()
@@ -187,7 +210,6 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
 
     // 5. Start a Raft group for each shard in the ShardMap.
-    let shutdown = CancellationToken::new();
     let shards = shard_map.all_shards().await;
     let raft_cfg = build_raft_config(
         config.raft.heartbeat_interval_ms,

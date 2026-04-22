@@ -1,6 +1,7 @@
 mod admin_service;
 mod convert;
 mod kv_service;
+mod metrics;
 mod raft_service;
 
 use std::net::SocketAddr;
