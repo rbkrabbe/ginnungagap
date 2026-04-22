@@ -8,22 +8,32 @@ pub const RPC_TOTAL: &str = "ggap_kv_requests_total";
 /// Histogram: `KvService` unary RPC latency in seconds, labeled by method and status.
 pub const RPC_DURATION: &str = "ggap_kv_request_duration_seconds";
 
-/// Map a handler result into a stable, low-cardinality status label.
+/// Map a handler result into the snake_case name of its `tonic::Code`.
 ///
-/// Labels are derived mechanically from the returned `tonic::Code` so the
-/// mapping stays in sync with `convert::ggap_to_status` without duplicating
-/// its logic. When new `Code`s appear they fall through to `"internal"`.
+/// 1:1 with the gRPC status code space (16 codes × 5 methods = 80 tuples),
+/// which is comfortably within Prometheus cardinality budgets and avoids
+/// judgment calls about how to bucket related codes.
 pub fn status_label(err: Option<&Status>) -> &'static str {
     let Some(err) = err else { return "ok" };
     use tonic::Code::*;
     match err.code() {
         Ok => "ok",
+        Cancelled => "cancelled",
+        Unknown => "unknown",
+        InvalidArgument => "invalid_argument",
+        DeadlineExceeded => "deadline_exceeded",
         NotFound => "not_found",
-        InvalidArgument | OutOfRange => "invalid",
-        Aborted => "conflict",
-        Unavailable | DeadlineExceeded => "unavailable",
+        AlreadyExists => "already_exists",
+        PermissionDenied => "permission_denied",
+        ResourceExhausted => "resource_exhausted",
         FailedPrecondition => "failed_precondition",
-        _ => "internal",
+        Aborted => "aborted",
+        OutOfRange => "out_of_range",
+        Unimplemented => "unimplemented",
+        Internal => "internal",
+        Unavailable => "unavailable",
+        DataLoss => "data_loss",
+        Unauthenticated => "unauthenticated",
     }
 }
 

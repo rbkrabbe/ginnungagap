@@ -289,12 +289,12 @@ async fn kv_service_emits_metrics_for_each_rpc() {
         "get not_found missing: {totals:?}"
     );
     assert!(
-        get("put", "invalid") >= 1,
-        "put invalid missing: {totals:?}"
+        get("put", "invalid_argument") >= 1,
+        "put invalid_argument missing: {totals:?}"
     );
     assert!(
-        get("put", "conflict") >= 1,
-        "put conflict missing: {totals:?}"
+        get("put", "aborted") >= 1,
+        "put aborted missing: {totals:?}"
     );
     assert!(get("delete", "ok") >= 1, "delete ok missing: {totals:?}");
     assert!(get("scan", "ok") >= 1, "scan ok missing: {totals:?}");
