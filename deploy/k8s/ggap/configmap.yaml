@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ggap-entrypoint
+  namespace: ginnungagap
+data:
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    ORDINAL="${HOSTNAME##*-}"
+    NODE_ID=$((ORDINAL + 1))
+    echo "ggap-node starting: node_id=${NODE_ID} (each pod bootstraps as its own single-node Raft; see deploy/k8s/README.md)"
+    exec /usr/local/bin/ggap-node \
+      --node_id "${NODE_ID}" \
+      --client_addr 0.0.0.0:17000 \
+      --cluster_addr 0.0.0.0:17001 \
+      --data_dir /var/lib/ginnungagap \
+      --metrics_addr 0.0.0.0:9090 \
+      --peer 1=ggap-0.ggap-headless.ginnungagap.svc.cluster.local:17001 \
+      --peer 2=ggap-1.ggap-headless.ginnungagap.svc.cluster.local:17001 \
+      --peer 3=ggap-2.ggap-headless.ginnungagap.svc.cluster.local:17001

@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: ginnungagap
+data:
+  providers.yaml: |
+    apiVersion: 1
+    providers:
+      - name: ginnungagap
+        orgId: 1
+        folder: Ginnungagap
+        type: file
+        disableDeletion: false
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+  ginnungagap.json: |
+    {
+      "title": "Ginnungagap — Overview",
+      "uid": "ginnungagap-overview",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": {"from": "now-15m", "to": "now"},
+      "tags": ["ginnungagap"],
+      "timezone": "",
+      "templating": {"list": []},
+      "annotations": {"list": []},
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "KV request rate (req/s) by method",
+          "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "sum by (method) (rate(ggap_kv_requests_total[1m]))",
+              "legendFormat": "{{method}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}}
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "KV request rate by pod",
+          "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "sum by (pod) (rate(ggap_kv_requests_total[1m]))",
+              "legendFormat": "{{pod}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}}
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "KV request latency p50 / p99 (seconds)",
+          "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "histogram_quantile(0.5, sum by (le, method) (rate(ggap_kv_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "p50 {{method}}"
+            },
+            {
+              "refId": "B",
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "histogram_quantile(0.99, sum by (le, method) (rate(ggap_kv_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "p99 {{method}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}}
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Non-OK gRPC status by method",
+          "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "sum by (method, status) (rate(ggap_kv_requests_total{status!=\"OK\"}[1m]))",
+              "legendFormat": "{{method}} / {{status}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}}
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "ggap pods scraped (up)",
+          "gridPos": {"x": 0, "y": 16, "w": 8, "h": 4},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "count(up{job=\"otel-collector\"} == 1)"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+          "options": {"graphMode": "none"}
+        }
+      ]
+    }

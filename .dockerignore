@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+.claude/
+docs/
+deploy/
+*.md
+!README.md
