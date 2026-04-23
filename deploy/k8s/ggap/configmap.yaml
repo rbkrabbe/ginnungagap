@@ -19,11 +19,11 @@ data:
     fi
     echo "ggap-node starting: node_id=${NODE_ID} seed=${SEED_FLAG:-no}"
     exec /usr/local/bin/ggap-node \
-      --node_id "${NODE_ID}" \
-      --client_addr 0.0.0.0:17000 \
-      --cluster_addr 0.0.0.0:17001 \
-      --data_dir /var/lib/ginnungagap \
-      --metrics_addr 0.0.0.0:9090 \
+      --node-id "${NODE_ID}" \
+      --client-addr 0.0.0.0:17000 \
+      --cluster-addr $( hostname -i ):17001 \
+      --data-dir /var/lib/ginnungagap \
+      --metrics-addr 0.0.0.0:9090 \
       ${SEED_FLAG} \
       --peer 1=ggap-0.ggap-headless.ginnungagap.svc.cluster.local:17001 \
       --peer 2=ggap-1.ggap-headless.ginnungagap.svc.cluster.local:17001 \
