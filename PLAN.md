@@ -313,7 +313,6 @@ turmoil                     = "0.6"   # dev-dependency; simulation harness (Phas
 - [x] Chaos tests: kill leader + verify re-election, network partition + heal, message drops with concurrent writes, membership change under partition — all covered by DST suite
 - [ ] Prometheus metrics: request rate/latency p50/p99, Raft term, commit lag, match index
 - [ ] OpenTelemetry trace propagation (client → server → consensus)
-- [ ] TLS/mTLS for external and internal gRPC
 - [x] Admin RPCs: `ClusterStatus` (reads Raft metrics for term, leader, last_applied, voter membership), `AddLearner` (adds non-voting learner via openraft), `ChangeMembership` (replaces voter set via joint-consensus). All wired through `ShardRouter` → `OpenRaftNode` → openraft APIs
 
 ---
