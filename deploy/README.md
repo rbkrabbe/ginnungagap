@@ -1,8 +1,8 @@
 # Ginnungagap on Kind
 
-Local observability harness: three Ginnungagap pods, an OpenTelemetry
-Collector scraping their Prometheus metrics, a minimal Prometheus for PromQL,
-and Grafana with a provisioned dashboard.
+Local 3-node Ginnungagap cluster with an OpenTelemetry Collector scraping
+Prometheus metrics from every pod, a minimal Prometheus for PromQL, and
+Grafana with a provisioned dashboard.
 
 ## Prerequisites
 
@@ -23,6 +23,7 @@ That runs:
 2. `make build` — build the `ggap-node` image and `kind load` it
 3. `make deploy` — `kubectl apply -k deploy/k8s`
 4. `make wait` — wait for ggap / OTel / Prometheus / Grafana rollouts
+5. `make bootstrap` — run a Job that forms the 3-voter Raft cluster on shard 0
 
 After it completes:
 
@@ -72,27 +73,33 @@ grpcurl -plaintext -d '{"key":"aGVsbG8="}' \
 The Grafana dashboard should show `ggap_kv_requests_total` climbing within
 ~30 seconds (OTel scrape + Prometheus scrape intervals stacked).
 
-## Known limitation: cluster formation
+## How cluster formation works
 
-`ggap-node` today single-node-bootstraps a Raft group on any fresh data dir
-(`crates/ggap-node/src/main.rs:238-274`). Because all three pods start from
-empty PVCs and there is no CLI surface to skip that bootstrap, **this deploy
-runs three independent single-node Raft clusters, not one 3-voter quorum**.
+`ggap-node` normally self-bootstraps a fresh data dir as a single-voter
+cluster. With three pods starting simultaneously that would produce three
+separate clusters, so a `--seed` flag gates that behavior: only `ggap-0`
+(ordinal 0) runs with `--seed`. `ggap-1` and `ggap-2` start uninitialized —
+openraft instances that will accept `AppendEntries` but do nothing on their
+own.
 
-The observability pipeline still works as intended — OTel discovers and scrapes
-all three pods, Grafana fans them in side-by-side — and each pod's
-`KvService` is usable on its own.
+The `ggap-bootstrap` Job (run by `make bootstrap`) then calls AdminService
+on `ggap-0.ggap-headless.ginnungagap.svc:17001`:
 
-To exercise true Raft quorum on this harness, scale down to a real single
-node:
+1. `AddLearner` for node_id 2 (ggap-1) and node_id 3 (ggap-2)
+2. `ChangeMembership([1, 2, 3])` to promote the learners to voters
+
+The Job is idempotent: if `ClusterStatus` already reports 3 voters it exits 0.
+It is kept out of the root `kubectl apply -k` target because Job pod templates
+are immutable, which would break re-apply.
+
+To inspect the Raft state from inside the cluster:
 
 ```
-kubectl -n ginnungagap scale sts/ggap --replicas=1
+kubectl -n ginnungagap run --rm -it grpcurl \
+  --image=fullstorydev/grpcurl:v1.9.1-alpine --restart=Never -- \
+  -plaintext ggap-0.ggap-headless.ginnungagap.svc:17001 \
+  ginnungagap.v1.AdminService/ClusterStatus
 ```
-
-Forming an actual 3-voter quorum needs a future `--initial-members` or
-`--seed` flag on `ggap-node` plus either a bootstrap Job or a pre-written
-`bootstrap_members` meta key. That work is tracked for a later pass.
 
 ## Caveats
 

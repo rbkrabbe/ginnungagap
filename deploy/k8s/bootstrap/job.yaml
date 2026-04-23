@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ggap-bootstrap-script
+  namespace: ginnungagap
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    # Forms a 3-voter Raft cluster on shard 0.
+    #
+    # - ggap-0 runs with --seed and self-initializes as a single-voter cluster.
+    # - ggap-1 and ggap-2 start uninitialized.
+    # - This Job calls AddLearner on ggap-0 for node_ids 2 and 3, then
+    #   ChangeMembership([1,2,3]) to promote them to voters.
+    #
+    # Idempotent: if ClusterStatus already reports >= 3 voters, exits 0.
+    set -eu
+
+    SEED=ggap-0.ggap-headless.ginnungagap.svc.cluster.local:17001
+
+    echo "waiting for seed AdminService at ${SEED}..."
+    i=0
+    while [ $i -lt 60 ]; do
+      if grpcurl -plaintext -max-time 3 "${SEED}" \
+           ginnungagap.v1.AdminService/ClusterStatus >/dev/null 2>&1; then
+        echo "seed reachable"
+        break
+      fi
+      i=$((i + 1))
+      sleep 2
+    done
+    if [ $i -ge 60 ]; then
+      echo "timeout waiting for seed" >&2
+      exit 1
+    fi
+
+    STATUS=$(grpcurl -plaintext -max-time 5 "${SEED}" \
+               ginnungagap.v1.AdminService/ClusterStatus)
+    VOTERS=$(echo "${STATUS}" | grep -c '"nodeId"' || true)
+    if [ "${VOTERS}" -ge 3 ]; then
+      echo "cluster already has ${VOTERS} voters; nothing to do"
+      echo "${STATUS}"
+      exit 0
+    fi
+
+    for id in 2 3; do
+      ord=$((id - 1))
+      addr="ggap-${ord}.ggap-headless.ginnungagap.svc.cluster.local:17001"
+      echo "AddLearner node_id=${id} cluster_addr=${addr}"
+      grpcurl -plaintext -max-time 10 \
+        -d "{\"node\":{\"nodeId\":${id},\"clusterAddr\":\"${addr}\"}}" \
+        "${SEED}" ginnungagap.v1.AdminService/AddLearner
+    done
+
+    echo "ChangeMembership to [1,2,3]"
+    grpcurl -plaintext -max-time 30 \
+      -d '{"nodeIds":[1,2,3]}' \
+      "${SEED}" ginnungagap.v1.AdminService/ChangeMembership
+
+    echo "final ClusterStatus:"
+    grpcurl -plaintext -max-time 5 "${SEED}" \
+      ginnungagap.v1.AdminService/ClusterStatus
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ggap-bootstrap
+  namespace: ginnungagap
+  labels:
+    app.kubernetes.io/name: ggap-bootstrap
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ggap-bootstrap
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          # The -alpine variant includes /bin/sh; the default tag is distroless
+          # and does not.
+          image: fullstorydev/grpcurl:v1.9.1-alpine
+          command: ["/bin/sh", "/scripts/bootstrap.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: ggap-bootstrap-script
+            defaultMode: 0555
