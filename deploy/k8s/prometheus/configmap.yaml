@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: ginnungagap
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # The OTel Collector does the actual scraping of ggap pods and
+      # re-exposes them at :8889. Prometheus only scrapes that single
+      # endpoint, acting as the PromQL/TSDB layer for Grafana.
+      - job_name: otel-collector
+        static_configs:
+          - targets:
+              - otel-collector.ginnungagap.svc.cluster.local:8889
+      # Collector self-metrics (pipeline stats, scrape success rate, etc.)
+      - job_name: otel-collector-self
+        static_configs:
+          - targets:
+              - otel-collector.ginnungagap.svc.cluster.local:8888

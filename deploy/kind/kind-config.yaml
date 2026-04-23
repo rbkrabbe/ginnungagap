@@ -1,0 +1,15 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ggap
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30300
+        hostPort: 3000
+        protocol: TCP
+      - containerPort: 30700
+        hostPort: 17000
+        protocol: TCP
+  - role: worker
+  - role: worker
+  - role: worker

@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ggap
+  namespace: ginnungagap
+  labels:
+    app.kubernetes.io/name: ggap-node
+spec:
+  serviceName: ggap-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ggap-node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ggap-node
+    spec:
+      terminationGracePeriodSeconds: 20
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ggap-node
+      containers:
+        - name: ggap-node
+          image: ginnungagap:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/etc/ggap/run.sh"]
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: GINNUNGAGAP_OBSERVABILITY__LOG_FORMAT
+              value: pretty
+          ports:
+            - name: client
+              containerPort: 17000
+            - name: cluster
+              containerPort: 17001
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            tcpSocket:
+              port: cluster
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: cluster
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ginnungagap
+            - name: entrypoint
+              mountPath: /etc/ggap
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1
+              memory: 512Mi
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: ggap-entrypoint
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

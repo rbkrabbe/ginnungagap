@@ -40,6 +40,12 @@ struct Cli {
     /// Peer specs: "id=addr" format, repeatable
     #[arg(long = "peer")]
     peers: Vec<String>,
+    /// Initialize shard 0 as a fresh single-voter Raft cluster on first boot.
+    /// Exactly one node in a fresh deployment should run with this flag; other
+    /// nodes start uninitialized and wait for `AdminService.AddLearner` +
+    /// `AdminService.ChangeMembership` from the seed.
+    #[arg(long)]
+    seed: bool,
     #[arg(long)]
     config: Option<std::path::PathBuf>,
     #[arg(long, default_value = "/var/lib/ginnungagap")]
@@ -230,47 +236,63 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to create Raft for shard {shard_id}"))?,
         );
 
-        // Initialize Raft membership on first boot.
-        // - Shard 0 (and any shard created before this fix): single-node bootstrap.
-        // - Split-created shards: read membership from bootstrap_members key written
-        //   atomically with the split data movement. This prevents a restarted node
-        //   from re-initializing as a single-node cluster, discarding replication.
+        // Initialize Raft membership on first boot. Three cases:
+        //   1. `bootstrap_members` meta key present — split-created shard. Always
+        //      initialize from the persisted membership (written atomically with
+        //      the split data movement; a restart must not re-init as single-node).
+        //   2. No `bootstrap_members` and `--seed` was passed — fresh seed node.
+        //      Initialize shard 0 as a single-voter cluster; other nodes join
+        //      later via AdminService.AddLearner/ChangeMembership.
+        //   3. No `bootstrap_members` and no `--seed` — non-seed fresh node.
+        //      Leave Raft uninitialized; it will pick up membership when the
+        //      seed sends it AppendEntries after AddLearner.
         if !raft
             .is_initialized()
             .await
             .with_context(|| format!("raft.is_initialized failed for shard {shard_id}"))?
         {
             let bootstrap_key = meta_key(shard_id, "bootstrap_members");
-            let members: BTreeMap<u64, BasicNode> = match store.meta.get(&bootstrap_key) {
+            let members: Option<BTreeMap<u64, BasicNode>> = match store.meta.get(&bootstrap_key) {
                 Ok(Some(bytes)) => {
                     let (addr_map, _): (BTreeMap<u64, String>, _) =
                         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
                             .with_context(|| {
                                 format!("failed to decode bootstrap_members for shard {shard_id}")
                             })?;
-                    addr_map
-                        .into_iter()
-                        .map(|(id, addr)| (id, BasicNode { addr }))
-                        .collect()
+                    Some(
+                        addr_map
+                            .into_iter()
+                            .map(|(id, addr)| (id, BasicNode { addr }))
+                            .collect(),
+                    )
                 }
-                Ok(None) => {
-                    // Original shard or pre-fix split: fall back to single-node init.
-                    BTreeMap::from([(
-                        cli.node_id,
-                        BasicNode {
-                            addr: cluster_addr.to_string(),
-                        },
-                    )])
-                }
+                Ok(None) if cli.seed => Some(BTreeMap::from([(
+                    cli.node_id,
+                    BasicNode {
+                        addr: cluster_addr.to_string(),
+                    },
+                )])),
+                Ok(None) => None,
                 Err(e) => {
                     return Err(anyhow::anyhow!(
                         "failed to read bootstrap_members for shard {shard_id}: {e}"
                     ));
                 }
             };
-            raft.initialize(members)
-                .await
-                .map_err(|e| anyhow::anyhow!("raft.initialize failed for shard {shard_id}: {e}"))?;
+            match members {
+                Some(members) => {
+                    raft.initialize(members).await.map_err(|e| {
+                        anyhow::anyhow!("raft.initialize failed for shard {shard_id}: {e}")
+                    })?;
+                }
+                None => {
+                    tracing::info!(
+                        shard_id,
+                        node_id = cli.node_id,
+                        "non-seed fresh node: Raft uninitialized, waiting for AddLearner"
+                    );
+                }
+            }
         }
 
         let node = Arc::new(OpenRaftNode::new(

@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ggap-entrypoint
+  namespace: ginnungagap
+data:
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    ORDINAL="${HOSTNAME##*-}"
+    NODE_ID=$((ORDINAL + 1))
+    # Only ordinal 0 self-bootstraps shard 0 as a single-voter cluster.
+    # The bootstrap Job then calls AddLearner + ChangeMembership to promote
+    # ordinals 1 and 2 into voters. Restarts are no-ops because ggap-node
+    # checks raft.is_initialized() before re-initializing.
+    SEED_FLAG=""
+    if [ "${ORDINAL}" = "0" ]; then
+      SEED_FLAG="--seed"
+    fi
+    echo "ggap-node starting: node_id=${NODE_ID} seed=${SEED_FLAG:-no}"
+    exec /usr/local/bin/ggap-node \
+      --node-id "${NODE_ID}" \
+      --client-addr 0.0.0.0:17000 \
+      --cluster-addr $( hostname -i ):17001 \
+      --data-dir /var/lib/ginnungagap \
+      --metrics-addr 0.0.0.0:9090 \
+      ${SEED_FLAG} \
+      --peer 1=ggap-0.ggap-headless.ginnungagap.svc.cluster.local:17001 \
+      --peer 2=ggap-1.ggap-headless.ginnungagap.svc.cluster.local:17001 \
+      --peer 3=ggap-2.ggap-headless.ginnungagap.svc.cluster.local:17001
