@@ -1,6 +1,7 @@
 pub mod config;
 pub mod convert;
 pub mod log_store;
+pub mod metrics_task;
 pub mod network;
 pub mod node;
 pub mod router;
@@ -22,6 +23,7 @@ use ggap_types::{
 
 pub use config::{build_raft_config, GgapTypeConfig};
 pub use log_store::GgapLogStorage;
+pub use metrics_task::RaftMetricsTask;
 pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, ClusterStatus, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
 pub use router::ShardRouter;

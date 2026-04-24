@@ -12,8 +12,8 @@ use serde::Deserialize;
 
 use ggap_consensus::{
     build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator,
-    SplitCoordinatorConfig,
+    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, ShardRouter,
+    SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -321,6 +321,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+
+        tokio::spawn(RaftMetricsTask::new(raft.clone(), shard_id, shutdown.child_token()).run());
 
         tracing::info!(shard_id, "started Raft group");
     }
