@@ -37,8 +37,8 @@ data:
             {
               "refId": "A",
               "datasource": {"type": "prometheus", "uid": "prometheus"},
-              "expr": "sum by (method) (rate(ggap_kv_requests_total[1m]))",
-              "legendFormat": "{{method}}"
+              "expr": "sum by (rpc_method) (rate(rpc_server_call_duration_seconds_count{rpc_method=~\"ginnungagap\\\\.v1\\\\.KvService/.*\"}[1m]))",
+              "legendFormat": "{{rpc_method}}"
             }
           ],
           "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
@@ -53,7 +53,7 @@ data:
             {
               "refId": "A",
               "datasource": {"type": "prometheus", "uid": "prometheus"},
-              "expr": "sum by (pod) (rate(ggap_kv_requests_total[1m]))",
+              "expr": "sum by (pod) (rate(rpc_server_call_duration_seconds_count{rpc_method=~\"ginnungagap\\\\.v1\\\\.KvService/.*\"}[1m]))",
               "legendFormat": "{{pod}}"
             }
           ],
@@ -69,14 +69,14 @@ data:
             {
               "refId": "A",
               "datasource": {"type": "prometheus", "uid": "prometheus"},
-              "expr": "histogram_quantile(0.5, sum by (le, method) (rate(ggap_kv_request_duration_seconds_bucket[5m])))",
-              "legendFormat": "p50 {{method}}"
+              "expr": "histogram_quantile(0.5, sum by (le, rpc_method) (rate(rpc_server_call_duration_seconds_bucket{rpc_method=~\"ginnungagap\\\\.v1\\\\.KvService/.*\"}[5m])))",
+              "legendFormat": "p50 {{rpc_method}}"
             },
             {
               "refId": "B",
               "datasource": {"type": "prometheus", "uid": "prometheus"},
-              "expr": "histogram_quantile(0.99, sum by (le, method) (rate(ggap_kv_request_duration_seconds_bucket[5m])))",
-              "legendFormat": "p99 {{method}}"
+              "expr": "histogram_quantile(0.99, sum by (le, rpc_method) (rate(rpc_server_call_duration_seconds_bucket{rpc_method=~\"ginnungagap\\\\.v1\\\\.KvService/.*\"}[5m])))",
+              "legendFormat": "p99 {{rpc_method}}"
             }
           ],
           "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
@@ -91,8 +91,8 @@ data:
             {
               "refId": "A",
               "datasource": {"type": "prometheus", "uid": "prometheus"},
-              "expr": "sum by (method, status) (rate(ggap_kv_requests_total{status!=\"OK\"}[1m]))",
-              "legendFormat": "{{method}} / {{status}}"
+              "expr": "sum by (rpc_method, rpc_response_status_code) (rate(rpc_server_call_duration_seconds_count{rpc_method=~\"ginnungagap\\\\.v1\\\\.KvService/.*\", rpc_response_status_code!=\"0\"}[1m]))",
+              "legendFormat": "{{rpc_method}} / {{rpc_response_status_code}}"
             }
           ],
           "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
