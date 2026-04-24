@@ -12,6 +12,7 @@ use ggap_storage::ShardMap;
 use tonic::{Request, Response, Status};
 
 use crate::convert::ggap_to_status;
+use crate::metrics::record;
 
 pub struct AdminServiceImpl {
     router: Arc<ShardRouter>,
@@ -41,13 +42,10 @@ impl AdminServiceImpl {
             .await
             .ok_or_else(|| Status::internal("shard 0 not found in router"))
     }
-}
 
-#[tonic::async_trait]
-impl AdminService for AdminServiceImpl {
-    async fn cluster_status(
+    async fn do_cluster_status(
         &self,
-        _request: Request<ClusterStatusRequest>,
+        _req: ClusterStatusRequest,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         let node = self.shard0_node().await?;
         let status = node.cluster_status();
@@ -67,11 +65,10 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn add_learner(
+    async fn do_add_learner(
         &self,
-        request: Request<AddLearnerRequest>,
+        req: AddLearnerRequest,
     ) -> Result<Response<AddLearnerResponse>, Status> {
-        let req = request.into_inner();
         let node_info = req
             .node
             .ok_or_else(|| Status::invalid_argument("node must be provided"))?;
@@ -104,11 +101,10 @@ impl AdminService for AdminServiceImpl {
         }
     }
 
-    async fn change_membership(
+    async fn do_change_membership(
         &self,
-        request: Request<ChangeMembershipRequest>,
+        req: ChangeMembershipRequest,
     ) -> Result<Response<ChangeMembershipResponse>, Status> {
-        let req = request.into_inner();
         if req.node_ids.is_empty() {
             return Err(Status::invalid_argument(
                 "node_ids must contain at least one voter",
@@ -134,11 +130,10 @@ impl AdminService for AdminServiceImpl {
         }
     }
 
-    async fn split_shard(
+    async fn do_split_shard(
         &self,
-        request: Request<SplitShardRequest>,
+        req: SplitShardRequest,
     ) -> Result<Response<SplitShardResponse>, Status> {
-        let req = request.into_inner();
         if req.split_key.is_empty() {
             return Err(Status::invalid_argument("split_key must not be empty"));
         }
@@ -166,9 +161,9 @@ impl AdminService for AdminServiceImpl {
         }
     }
 
-    async fn list_shards(
+    async fn do_list_shards(
         &self,
-        _request: Request<ListShardsRequest>,
+        _req: ListShardsRequest,
     ) -> Result<Response<ListShardsResponse>, Status> {
         let shards = self.shard_map.all_shards().await;
         let protos = shards
@@ -181,5 +176,78 @@ impl AdminService for AdminServiceImpl {
             })
             .collect();
         Ok(Response::new(ListShardsResponse { shards: protos }))
+    }
+}
+
+#[tonic::async_trait]
+impl AdminService for AdminServiceImpl {
+    async fn cluster_status(
+        &self,
+        request: Request<ClusterStatusRequest>,
+    ) -> Result<Response<ClusterStatusResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_cluster_status(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.AdminService/ClusterStatus",
+            &result,
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn add_learner(
+        &self,
+        request: Request<AddLearnerRequest>,
+    ) -> Result<Response<AddLearnerResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_add_learner(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.AdminService/AddLearner",
+            &result,
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn change_membership(
+        &self,
+        request: Request<ChangeMembershipRequest>,
+    ) -> Result<Response<ChangeMembershipResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_change_membership(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.AdminService/ChangeMembership",
+            &result,
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn split_shard(
+        &self,
+        request: Request<SplitShardRequest>,
+    ) -> Result<Response<SplitShardResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_split_shard(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.AdminService/SplitShard",
+            &result,
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn list_shards(
+        &self,
+        request: Request<ListShardsRequest>,
+    ) -> Result<Response<ListShardsResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_list_shards(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.AdminService/ListShards",
+            &result,
+            start.elapsed(),
+        );
+        result
     }
 }

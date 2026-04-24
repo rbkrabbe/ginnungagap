@@ -70,8 +70,9 @@ grpcurl -plaintext -d '{"key":"aGVsbG8="}' \
   localhost:17000 ginnungagap.v1.KvService/Get
 ```
 
-The Grafana dashboard should show `ggap_kv_requests_total` climbing within
-~30 seconds (OTel scrape + Prometheus scrape intervals stacked).
+The Grafana dashboard should show
+`rpc_server_call_duration_seconds_count{rpc_method=~"ginnungagap.v1.KvService/.*"}`
+climbing within ~30 seconds (OTel scrape + Prometheus scrape intervals stacked).
 
 ## How cluster formation works
 

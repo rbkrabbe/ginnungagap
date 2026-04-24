@@ -5,6 +5,7 @@ use ggap_proto::v1::{raft_service_server::RaftService, RaftMessage};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::convert::ggap_to_status;
+use crate::metrics::record;
 
 pub struct RaftServiceImpl {
     router: Arc<ShardRouter>,
@@ -14,15 +15,8 @@ impl RaftServiceImpl {
     pub fn new(router: Arc<ShardRouter>) -> Self {
         RaftServiceImpl { router }
     }
-}
 
-#[tonic::async_trait]
-impl RaftService for RaftServiceImpl {
-    async fn append_entries(
-        &self,
-        request: Request<RaftMessage>,
-    ) -> Result<Response<RaftMessage>, Status> {
-        let msg = request.into_inner();
+    async fn do_append_entries(&self, msg: RaftMessage) -> Result<Response<RaftMessage>, Status> {
         let cluster = self
             .router
             .get_cluster(msg.shard_id)
@@ -38,8 +32,7 @@ impl RaftService for RaftServiceImpl {
         }))
     }
 
-    async fn vote(&self, request: Request<RaftMessage>) -> Result<Response<RaftMessage>, Status> {
-        let msg = request.into_inner();
+    async fn do_vote(&self, msg: RaftMessage) -> Result<Response<RaftMessage>, Status> {
         let cluster = self
             .router
             .get_cluster(msg.shard_id)
@@ -52,11 +45,10 @@ impl RaftService for RaftServiceImpl {
         }))
     }
 
-    async fn install_snapshot(
+    async fn do_install_snapshot(
         &self,
-        request: Request<Streaming<RaftMessage>>,
+        mut stream: Streaming<RaftMessage>,
     ) -> Result<Response<RaftMessage>, Status> {
-        let mut stream = request.into_inner();
         let mut last_resp: Option<Vec<u8>> = None;
         let mut shard_id = 0u64;
 
@@ -75,5 +67,43 @@ impl RaftService for RaftServiceImpl {
 
         let data = last_resp.unwrap_or_default();
         Ok(Response::new(RaftMessage { shard_id, data }))
+    }
+}
+
+#[tonic::async_trait]
+impl RaftService for RaftServiceImpl {
+    async fn append_entries(
+        &self,
+        request: Request<RaftMessage>,
+    ) -> Result<Response<RaftMessage>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_append_entries(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.RaftService/AppendEntries",
+            &result,
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn vote(&self, request: Request<RaftMessage>) -> Result<Response<RaftMessage>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_vote(request.into_inner()).await;
+        record("ginnungagap.v1.RaftService/Vote", &result, start.elapsed());
+        result
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<Streaming<RaftMessage>>,
+    ) -> Result<Response<RaftMessage>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_install_snapshot(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.RaftService/InstallSnapshot",
+            &result,
+            start.elapsed(),
+        );
+        result
     }
 }

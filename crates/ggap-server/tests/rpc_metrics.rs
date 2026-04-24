@@ -1,12 +1,12 @@
-//! Verifies that `KvService` unary RPCs emit the expected Prometheus metric
-//! series. A single-node in-process Raft cluster is started, a `DebuggingRecorder`
-//! is installed process-globally (guarded by `OnceLock` — this is the only test
-//! in the workspace that installs a metrics recorder), and each RPC is exercised
-//! against a tonic client connected to a loopback listener.
+//! Verifies that inbound gRPC calls on all three services (`KvService`,
+//! `AdminService`, `RaftService`) emit the OTel-aligned Prometheus histogram
+//! `rpc_server_call_duration_seconds` with the expected `(rpc.method,
+//! rpc.response.status_code)` label pairs.
 //!
-//! Asserts the `(method, status)` label pairs on `ggap_kv_requests_total` and
-//! that `ggap_kv_request_duration_seconds` records at least one observation
-//! per invocation.
+//! A single-node in-process Raft cluster is started, a `DebuggingRecorder` is
+//! installed process-globally (guarded by `OnceLock` — this is the only test
+//! in the workspace that installs a metrics recorder), and each service is
+//! exercised against a tonic client connected to a loopback listener.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -24,12 +24,15 @@ use ggap_consensus::{
     OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{
-    kv_service_client::KvServiceClient, CasRequest, DeleteRequest, GetRequest, PutRequest,
-    ScanRequest,
+    admin_service_client::AdminServiceClient, kv_service_client::KvServiceClient,
+    raft_service_client::RaftServiceClient, AddLearnerRequest, CasRequest, ClusterStatusRequest,
+    DeleteRequest, GetRequest, ListShardsRequest, NodeInfo, PutRequest, RaftMessage, ScanRequest,
 };
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
+
+const METRIC: &str = "rpc_server_call_duration_seconds";
 
 static SNAPSHOTTER: OnceLock<Snapshotter> = OnceLock::new();
 
@@ -46,6 +49,7 @@ fn install_recorder() -> &'static Snapshotter {
 
 struct TestNode {
     client_addr: SocketAddr,
+    cluster_addr: SocketAddr,
     raft: Arc<GgapRaft>,
     _handles: Vec<tokio::task::JoinHandle<()>>,
     _tempdir: TempDir,
@@ -134,18 +138,19 @@ async fn start_single_node() -> TestNode {
 
     TestNode {
         client_addr,
+        cluster_addr,
         raft,
         _handles: handles,
         _tempdir: tempdir,
     }
 }
 
-/// Collect `ggap_kv_requests_total` samples into a `{(method, status) -> count}` map.
-fn counter_totals(snap: &Snapshotter) -> HashMap<(String, String), u64> {
+/// Collect histogram observation counts keyed by `(rpc.method, rpc.response.status_code)`.
+fn duration_counts(snap: &Snapshotter) -> HashMap<(String, String), usize> {
     let mut out = HashMap::new();
     for (key, _unit, _desc, value) in snap.snapshot().into_vec() {
         let (_kind, k) = key.into_parts();
-        if k.name() != "ggap_kv_requests_total" {
+        if k.name() != METRIC {
             continue;
         }
         let mut method = None;
@@ -153,74 +158,74 @@ fn counter_totals(snap: &Snapshotter) -> HashMap<(String, String), u64> {
         for label in k.labels() {
             let label: &metrics::Label = label;
             match label.key() {
-                "method" => method = Some(label.value().to_string()),
-                "status" => status = Some(label.value().to_string()),
+                "rpc.method" => method = Some(label.value().to_string()),
+                "rpc.response.status_code" => status = Some(label.value().to_string()),
                 _ => {}
             }
         }
         if let (Some(m), Some(s)) = (method, status) {
-            if let DebugValue::Counter(c) = value {
-                *out.entry((m, s)).or_insert(0) += c;
+            if let DebugValue::Histogram(values) = value {
+                *out.entry((m, s)).or_insert(0) += values.len();
             }
         }
     }
     out
 }
 
-/// Count distinct `(method, status)` tuples seen on the histogram metric.
-fn histogram_method_statuses(snap: &Snapshotter) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+/// Verify every `rpc_server_call_duration_seconds` series carries
+/// `rpc.system.name = "grpc"`.
+fn assert_grpc_system(snap: &Snapshotter) {
     for (key, _unit, _desc, _value) in snap.snapshot().into_vec() {
         let (_kind, k) = key.into_parts();
-        if k.name() != "ggap_kv_request_duration_seconds" {
+        if k.name() != METRIC {
             continue;
         }
-        let mut method = None;
-        let mut status = None;
-        for label in k.labels() {
-            let label: &metrics::Label = label;
-            match label.key() {
-                "method" => method = Some(label.value().to_string()),
-                "status" => status = Some(label.value().to_string()),
-                _ => {}
-            }
-        }
-        if let (Some(m), Some(s)) = (method, status) {
-            out.push((m, s));
-        }
+        let has_grpc = k
+            .labels()
+            .any(|l| l.key() == "rpc.system.name" && l.value() == "grpc");
+        assert!(
+            has_grpc,
+            "series missing rpc.system.name=grpc: labels={:?}",
+            k.labels().collect::<Vec<_>>()
+        );
     }
-    out
+}
+
+fn has(counts: &HashMap<(String, String), usize>, method: &str, status: &str) -> bool {
+    counts
+        .get(&(method.to_string(), status.to_string()))
+        .copied()
+        .unwrap_or(0)
+        >= 1
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kv_service_emits_metrics_for_each_rpc() {
+async fn all_services_emit_rpc_server_call_duration_metrics() {
     let snap = install_recorder();
     let node = start_single_node().await;
 
-    let endpoint = format!("http://{}", node.client_addr);
-    let mut client = KvServiceClient::connect(endpoint)
+    let client_endpoint = format!("http://{}", node.client_addr);
+    let cluster_endpoint = format!("http://{}", node.cluster_addr);
+
+    // ---------- KvService ----------
+    let mut kv = KvServiceClient::connect(client_endpoint)
         .await
         .expect("connect to kv service");
 
-    // ok: Put + Get
-    client
-        .put(PutRequest {
-            key: "a".into(),
-            value: b"1".to_vec(),
-            ..Default::default()
-        })
-        .await
-        .expect("put ok");
-    client
-        .get(GetRequest {
-            key: "a".into(),
-            ..Default::default()
-        })
-        .await
-        .expect("get ok");
-
-    // not_found: Get missing key
-    let err = client
+    kv.put(PutRequest {
+        key: "a".into(),
+        value: b"1".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .expect("put ok");
+    kv.get(GetRequest {
+        key: "a".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("get ok");
+    let err = kv
         .get(GetRequest {
             key: "missing".into(),
             ..Default::default()
@@ -228,9 +233,7 @@ async fn kv_service_emits_metrics_for_each_rpc() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
-
-    // invalid: Put with empty key
-    let err = client
+    let err = kv
         .put(PutRequest {
             key: "".into(),
             value: b"x".to_vec(),
@@ -239,9 +242,7 @@ async fn kv_service_emits_metrics_for_each_rpc() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-
-    // conflict: Put with stale expect_version
-    let err = client
+    let err = kv
         .put(PutRequest {
             key: "a".into(),
             value: b"2".to_vec(),
@@ -251,66 +252,123 @@ async fn kv_service_emits_metrics_for_each_rpc() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Aborted);
+    kv.delete(DeleteRequest {
+        key: "a".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("delete ok");
+    kv.scan(ScanRequest {
+        start_key: "".into(),
+        end_key: "".into(),
+        limit: 10,
+        ..Default::default()
+    })
+    .await
+    .expect("scan ok");
+    kv.compare_and_swap(CasRequest {
+        key: "b".into(),
+        expected_value: b"".to_vec(),
+        new_value: b"v".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .expect("cas ok");
 
-    // ok: Delete, Scan, CompareAndSwap
-    client
-        .delete(DeleteRequest {
-            key: "a".into(),
-            ..Default::default()
+    // ---------- AdminService ----------
+    let mut admin = AdminServiceClient::connect(cluster_endpoint.clone())
+        .await
+        .expect("connect to admin service");
+    admin
+        .cluster_status(ClusterStatusRequest {})
+        .await
+        .expect("cluster_status ok");
+    admin
+        .list_shards(ListShardsRequest {})
+        .await
+        .expect("list_shards ok");
+    let err = admin
+        .add_learner(AddLearnerRequest {
+            node: Some(NodeInfo {
+                node_id: 0,
+                client_addr: String::new(),
+                cluster_addr: "127.0.0.1:1".into(),
+            }),
         })
         .await
-        .expect("delete ok");
-    client
-        .scan(ScanRequest {
-            start_key: "".into(),
-            end_key: "".into(),
-            limit: 10,
-            ..Default::default()
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // ---------- RaftService ----------
+    let mut raft_client = RaftServiceClient::connect(cluster_endpoint)
+        .await
+        .expect("connect to raft service");
+    let err = raft_client
+        .vote(RaftMessage {
+            shard_id: 999,
+            data: Vec::new(),
         })
         .await
-        .expect("scan ok");
-    client
-        .compare_and_swap(CasRequest {
-            key: "b".into(),
-            expected_value: b"".to_vec(),
-            new_value: b"v".to_vec(),
-            ..Default::default()
-        })
-        .await
-        .expect("cas ok");
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
 
-    let totals = counter_totals(snap);
-    let get = |m: &str, s: &str| *totals.get(&(m.to_string(), s.to_string())).unwrap_or(&0);
+    // ---------- Assertions ----------
+    let counts = duration_counts(snap);
+    assert_grpc_system(snap);
 
-    assert!(get("put", "Ok") >= 1, "put Ok missing: {totals:?}");
-    assert!(get("get", "Ok") >= 1, "get Ok missing: {totals:?}");
+    // KvService
     assert!(
-        get("get", "NotFound") >= 1,
-        "get NotFound missing: {totals:?}"
+        has(&counts, "ginnungagap.v1.KvService/Put", "0"),
+        "kv Put Ok: {counts:?}"
     );
     assert!(
-        get("put", "InvalidArgument") >= 1,
-        "put InvalidArgument missing: {totals:?}"
+        has(&counts, "ginnungagap.v1.KvService/Get", "0"),
+        "kv Get Ok: {counts:?}"
     );
     assert!(
-        get("put", "Aborted") >= 1,
-        "put Aborted missing: {totals:?}"
+        has(&counts, "ginnungagap.v1.KvService/Get", "5"),
+        "kv Get NotFound: {counts:?}"
     );
-    assert!(get("delete", "Ok") >= 1, "delete Ok missing: {totals:?}");
-    assert!(get("scan", "Ok") >= 1, "scan Ok missing: {totals:?}");
     assert!(
-        get("compare_and_swap", "Ok") >= 1,
-        "cas Ok missing: {totals:?}"
+        has(&counts, "ginnungagap.v1.KvService/Put", "3"),
+        "kv Put InvalidArgument: {counts:?}"
+    );
+    assert!(
+        has(&counts, "ginnungagap.v1.KvService/Put", "10"),
+        "kv Put Aborted: {counts:?}"
+    );
+    assert!(
+        has(&counts, "ginnungagap.v1.KvService/Delete", "0"),
+        "kv Delete Ok: {counts:?}"
+    );
+    assert!(
+        has(&counts, "ginnungagap.v1.KvService/Scan", "0"),
+        "kv Scan Ok: {counts:?}"
+    );
+    assert!(
+        has(&counts, "ginnungagap.v1.KvService/CompareAndSwap", "0"),
+        "kv Cas Ok: {counts:?}"
     );
 
-    // Histogram must emit for every (method, status) pair the counter saw.
-    let hist = histogram_method_statuses(snap);
-    for key in totals.keys() {
-        assert!(
-            hist.iter().any(|(m, s)| m == &key.0 && s == &key.1),
-            "histogram missing {key:?}; saw {hist:?}",
-        );
-    }
+    // AdminService
+    assert!(
+        has(&counts, "ginnungagap.v1.AdminService/ClusterStatus", "0"),
+        "admin ClusterStatus Ok: {counts:?}"
+    );
+    assert!(
+        has(&counts, "ginnungagap.v1.AdminService/ListShards", "0"),
+        "admin ListShards Ok: {counts:?}"
+    );
+    assert!(
+        has(&counts, "ginnungagap.v1.AdminService/AddLearner", "3"),
+        "admin AddLearner InvalidArgument: {counts:?}"
+    );
+
+    // RaftService
+    assert!(
+        has(&counts, "ginnungagap.v1.RaftService/Vote", "5"),
+        "raft Vote NotFound: {counts:?}"
+    );
 
     node.raft.shutdown().await.ok();
     for h in node._handles {

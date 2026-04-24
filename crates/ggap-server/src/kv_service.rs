@@ -229,14 +229,14 @@ impl KvService for KvServiceImpl {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_get(request.into_inner()).await;
-        record("get", &result, start.elapsed());
+        record("ginnungagap.v1.KvService/Get", &result, start.elapsed());
         result
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_put(request.into_inner()).await;
-        record("put", &result, start.elapsed());
+        record("ginnungagap.v1.KvService/Put", &result, start.elapsed());
         result
     }
 
@@ -246,14 +246,14 @@ impl KvService for KvServiceImpl {
     ) -> Result<Response<DeleteResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_delete(request.into_inner()).await;
-        record("delete", &result, start.elapsed());
+        record("ginnungagap.v1.KvService/Delete", &result, start.elapsed());
         result
     }
 
     async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_scan(request.into_inner()).await;
-        record("scan", &result, start.elapsed());
+        record("ginnungagap.v1.KvService/Scan", &result, start.elapsed());
         result
     }
 
@@ -263,12 +263,18 @@ impl KvService for KvServiceImpl {
     ) -> Result<Response<CasResponse>, Status> {
         let start = tokio::time::Instant::now();
         let result = self.do_compare_and_swap(request.into_inner()).await;
-        record("compare_and_swap", &result, start.elapsed());
+        record(
+            "ginnungagap.v1.KvService/CompareAndSwap",
+            &result,
+            start.elapsed(),
+        );
         result
     }
 
     type WatchStream = ReceiverStream<Result<WatchEvent, Status>>;
 
+    // Watch is intentionally uninstrumented: stream session lifetime is not
+    // an RPC request duration (mixing would skew p99).
     async fn watch(
         &self,
         request: Request<Streaming<WatchRequest>>,
