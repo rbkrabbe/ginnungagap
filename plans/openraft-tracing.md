@@ -4,74 +4,81 @@
 
 `crates/ggap-server/src/tracing_layer.rs:1-18` documents a known gap in the OpenTelemetry pipeline: when `KvService::put` calls `Raft::client_write`, openraft schedules its `AppendEntries` fan-out on internal tokio tasks that carry no tracing context. As a result, the leader's outbound `rpc.client.append_entries` span starts a **new trace** instead of chaining under the inbound `rpc.server` span, and per-entry apply work on the leader and on followers also runs detached. The follower's inbound server span chains under the leader's *new* outbound span (so the consensus leg is internally connected), but the connection back to the original user request is broken.
 
-The comment notes the fix requires plumbing trace context **into `KvCommand`**. This plan does exactly that: stamp W3C `traceparent`/`tracestate`/`baggage` onto each `KvCommand` at the gRPC handler, re-extract them on the leader's outbound `append_entries` span, and re-extract them on every replica's `apply` path. Result: a single trace (with baggage) from inbound user RPC → leader propose → outbound AppendEntries → follower server span → follower apply, plus leader apply.
+This plan fixes it by storing trace metadata in-memory on the leader, keyed by Raft log index. `KvCommand` itself stays unchanged — no trace data is serialized into the log or replicated to followers. When the leader applies or sends AppendEntries, it looks up the metadata from the store and re-anchors the span. Result: a single trace (with baggage) from inbound user RPC → leader propose → outbound AppendEntries → follower server span → follower apply, plus leader apply.
 
 Baggage is propagated through this same path; baggage propagation in unrelated paths (e.g. the inbound `OtelServerLayer`, generic outbound RPCs) is intentionally out of scope and remains missing for now.
 
 ## Approach
 
-**Add `traceparent: Option<String>`, `tracestate: Option<String>`, and `baggage: Option<String>` to each user-facing `KvCommand` variant (`Put`, `Delete`, `Cas`).** Leave `Split` unchanged (it's an internal split-coordinator entry, not user-traceable). Do **not** wrap `KvCommand` — that would change openraft's `D` type (in `GgapTypeConfig`) and ripple through every storage trait, every match arm, and every `From<KvCommand>` site across `ggap-consensus`/`ggap-storage`. Per-variant fields are mechanically additive: most existing match sites already use named-field destructuring so the change is local.
+**Store trace metadata in-memory on the leader, keyed by `(shard_id, log_index)`.** `KvCommand` remains untouched — no new fields, no serialization overhead, no log pollution or bincode compat issues.
 
-The new fields are plain `Option<String>`s — `ggap-types` keeps zero gRPC and zero opentelemetry deps (CLAUDE.md hard constraint).
+**Key insight:** Followers don't need trace metadata for their own applies. Their inbound `rpc.server` span is already chained to the leader's outbound `rpc.client.append_entries` span (which we re-anchor to the user trace), so the trace connection is preserved end-to-end. Only the leader needs to remember "this entry came from request X with trace Y" so it can re-anchor its own apply and network spans.
 
-The trace_context helpers (below) use a **locally-constructed composite propagator** (`TraceContextPropagator` + `BaggagePropagator`) for inject/extract, so capture and re-extraction of all three headers work regardless of what the global `TextMapPropagator` is set to. This matches the "in this path only" scope: we don't touch the global propagator or the inbound `OtelServerLayer`.
+The trace_context helpers use a **locally-constructed composite propagator** (`TraceContextPropagator` + `BaggagePropagator`) for inject/extract, so capture and re-extraction of all three headers work regardless of what the global `TextMapPropagator` is set to. This matches the "in this path only" scope: we don't touch the global propagator or the inbound `OtelServerLayer`.
 
 ### Trace context flow after the fix
 
-1. **Capture** in `KvServiceImpl::do_put` / `do_delete` / `do_compare_and_swap`: read `traceparent`/`tracestate`/`baggage` from the current span's OTel context (the `rpc.server` span set by `OtelServerLayer`) and stamp them onto the constructed `KvCommand`.
-2. **Replicate**: openraft serializes the command into the Raft log; followers receive identical bytes (deterministic).
-3. **Leader outbound span** in `GgapNetwork::append_entries`: scan `rpc.entries` for the first `EntryPayload::Normal(cmd)` with a non-`None` `traceparent`. Use it (plus `tracestate` and `baggage`) to extract a parent `opentelemetry::Context` and call `span.set_parent(parent_cx)` on the `rpc.client.append_entries` span before `.instrument(span).await`. The existing `MetadataInjector` then injects this re-rooted context into outbound gRPC metadata, so the follower's `rpc.server` span and downstream `apply.entry` span chain to the user trace (and carry baggage when the global propagator includes `BaggagePropagator`).
-4. **Apply-time re-anchor** in `GgapStateMachine::apply` (leader and every follower): for each `EntryPayload::Normal(cmd)`, build an `apply.entry` span, set its parent to the extracted context, and `.instrument` the `fsm.apply(...)` call. This is per-entry because a single batch may carry multiple distinct traces. Baggage from the original request is now in scope for any code that reads `Span::current().context()` during apply.
+1. **Capture on leader** in `KvServiceImpl::do_put` / `do_delete` / `do_compare_and_swap`: read `traceparent`/`tracestate`/`baggage` from the current span's OTel context (the `rpc.server` span set by `OtelServerLayer`). After `client_write()` returns with `LogId { index, ... }`, immediately store the captured context in `RequestMetadataStore`, keyed by `(shard_id, log_index)`.
+2. **Leader outbound span** in `GgapNetwork::append_entries`: scan `rpc.entries` for the first `EntryPayload::Normal` entry. For that entry's log index, look up the metadata in `RequestMetadataStore` (if present — it's only populated on the leader). If found, extract a parent `opentelemetry::Context` and call `span.set_parent(parent_cx)` on the `rpc.client.append_entries` span before `.instrument(span).await`. The existing `MetadataInjector` then injects this re-rooted context into outbound gRPC metadata, so the follower's `rpc.server` span chains to the user trace.
+3. **Apply-time re-anchor on leader** in `GgapStateMachine::apply`: for each `EntryPayload::Normal(cmd)`, look up the metadata for this entry's log index. Build an `apply.entry` span, set its parent to the extracted context (if found), and `.instrument` the `fsm.apply(...)` call. This is per-entry because a single batch may carry multiple distinct traces. Baggage from the original request is now in scope for any code that reads `Span::current().context()` during apply.
+4. **Followers apply unmodified**: Followers apply normally without metadata lookup (they didn't originate the request). Their spans are already chained to the user trace via the leader's outbound `rpc.client.append_entries` span + inbound `rpc.server` span.
 
 ## File changes
 
-### `crates/ggap-types/src/lib.rs:74-108`
-Add three fields to each of `Put`, `Delete`, `Cas`:
+### `crates/ggap-consensus/src/trace_context.rs` (new file)
+Three helpers + a shared composite propagator + private `Injector`/`Extractor`:
+
+- A module-private `fn composite_propagator() -> TextMapCompositePropagator` (or a `OnceLock`-cached instance) returning `TextMapCompositePropagator::new(vec![Box::new(TraceContextPropagator::new()), Box::new(BaggagePropagator::new())])`. Used for both helpers so capture/extract handle all three keys (`traceparent`, `tracestate`, `baggage`) regardless of the global propagator setup.
+
+- `pub fn capture_current_trace_context() -> (Option<String>, Option<String>, Option<String>)` — uses `Span::current().context()` + the local composite propagator's `inject_context(...)` into a `HashMap`-backed `Injector`. Returns `(traceparent, tracestate, baggage)`.
+
+- `pub(crate) fn extract_parent_context(traceparent: Option<&str>, tracestate: Option<&str>, baggage: Option<&str>) -> Option<opentelemetry::Context>` — short-circuits on all-`None`; otherwise wraps the strings in a `StaticExtractor` that returns `Some(&str)` for the three known keys and lets the local composite propagator extract a `Context`.
+
+- `struct StaticExtractor` (local, private).
+
+Crate dep additions in `crates/ggap-consensus/Cargo.toml`: `opentelemetry-sdk` (for `BaggagePropagator`) if not already present. Verify against current `Cargo.toml` during implementation.
+
+Re-export both helpers from `crates/ggap-consensus/src/lib.rs`.
+
+### `crates/ggap-server/src/metadata_store.rs` (new file)
+A thread-safe, in-memory cache of request metadata keyed by `(ShardId, log_index)`:
+
 ```rust
-traceparent: Option<String>,
-tracestate: Option<String>,
-baggage: Option<String>,
-```
-Leave `Split` unchanged. Add small accessor methods (also in this file, so zero new deps):
-```rust
-impl KvCommand {
-    pub fn traceparent(&self) -> Option<&str> {
-        match self {
-            KvCommand::Put { traceparent, .. }
-            | KvCommand::Delete { traceparent, .. }
-            | KvCommand::Cas { traceparent, .. } => traceparent.as_deref(),
-            KvCommand::Split { .. } => None,
-        }
-    }
-    pub fn tracestate(&self) -> Option<&str> { /* same shape */ }
-    pub fn baggage(&self) -> Option<&str> { /* same shape */ }
+pub struct RequestMetadataStore {
+    // Map<(ShardId, u64), (traceparent, tracestate, baggage)>
+    // Use a simple RwLock<HashMap>; entries are short-lived (lookup after apply completes)
+    // and the map can be cleared periodically or after apply
+}
+
+impl RequestMetadataStore {
+    pub fn new() -> Self { /* ... */ }
+    pub fn store(&self, shard_id: ShardId, log_index: u64, 
+                 traceparent: Option<String>, tracestate: Option<String>, baggage: Option<String>) { /* ... */ }
+    pub fn take(&self, shard_id: ShardId, log_index: u64) -> Option<(Option<String>, Option<String>, Option<String>)> { /* ... */ }
 }
 ```
 
-### `crates/ggap-consensus/src/trace_context.rs` (new file)
-Two helpers + a shared composite propagator + private `Injector`/`Extractor`:
-- A module-private `fn composite_propagator() -> TextMapCompositePropagator` (or a `OnceLock`-cached instance) returning `TextMapCompositePropagator::new(vec![Box::new(TraceContextPropagator::new()), Box::new(BaggagePropagator::new())])`. Used for both helpers so capture/extract handle all three keys (`traceparent`, `tracestate`, `baggage`) regardless of the global propagator setup.
-- `pub fn capture_current_trace_context() -> (Option<String>, Option<String>, Option<String>)` — uses `Span::current().context()` + the local composite propagator's `inject_context(...)` into a `HashMap`-backed `Injector`. Returns `(traceparent, tracestate, baggage)`.
-- `pub(crate) fn extract_parent_context(traceparent: Option<&str>, tracestate: Option<&str>, baggage: Option<&str>) -> Option<opentelemetry::Context>` — short-circuits on all-`None`; otherwise wraps the strings in a `StaticExtractor` that returns `Some(&str)` for the three known keys and lets the local composite propagator extract a `Context`.
-- `struct StaticExtractor` (local, private).
+The `take` method removes the entry after retrieving it, preventing unbounded growth. On the leader, callers store after `client_write()` returns and take at apply time.
 
-Crate dep additions in `crates/ggap-consensus/Cargo.toml`: `opentelemetry-sdk` (for `BaggagePropagator`) if not already present (`TraceContextPropagator` lives in `opentelemetry_sdk::propagation` too). Verify against the current `Cargo.toml` during implementation.
-
-Re-export from `crates/ggap-consensus/src/lib.rs` so `ggap-server` can call `capture_current_trace_context()`.
+Export from `crates/ggap-server/src/lib.rs` so `ggap-node` can instantiate and pass it to both the KvService and RaftNode.
 
 ### `crates/ggap-server/src/kv_service.rs:77-224`
-Before each `KvCommand::{Put,Delete,Cas} { ... }` literal in `do_put` / `do_delete` / `do_compare_and_swap`:
+After `client_write()` returns in `do_put` / `do_delete` / `do_compare_and_swap`:
 ```rust
 let (traceparent, tracestate, baggage) = ggap_consensus::capture_current_trace_context();
-let cmd = KvCommand::Put { /* existing fields */, traceparent, tracestate, baggage };
+self.metadata_store.store(self.shard_id, client_write_response.log_id().index,
+                          traceparent, tracestate, baggage);
 ```
 
+No changes to `KvCommand` construction.
+
 ### `crates/ggap-consensus/src/network.rs:108-149` (`append_entries` only)
-Before building the `rpc.client.append_entries` span, scan entries for the first user-traceable command:
+Before building the `rpc.client.append_entries` span, scan entries for the first `EntryPayload::Normal`:
 ```rust
 let parent_cx = rpc.entries.iter().find_map(|e| match &e.payload {
-    EntryPayload::Normal(cmd) => {
-        extract_parent_context(cmd.traceparent(), cmd.tracestate(), cmd.baggage())
+    EntryPayload::Normal(_) => {
+        self.metadata_store.lookup(self.shard_id, e.log_id.index)
+            .and_then(|(tp, ts, bg)| extract_parent_context(tp.as_deref(), ts.as_deref(), bg.as_deref()))
     }
     _ => None,
 });
@@ -83,10 +90,11 @@ let span = tracing::info_span!(
 );
 if let Some(cx) = parent_cx { span.set_parent(cx); }
 ```
-Leave `vote` and `install_snapshot` alone — votes have no client trace; snapshots are infrastructure.
+
+Note: `lookup` (not `take`) because we might need the metadata again for apply. Separate store, add a `lookup` method.
 
 ### `crates/ggap-consensus/src/state_machine.rs:89-103` (`EntryPayload::Normal` arm in `apply`)
-Wrap the `fsm.apply(...).await` in an `apply.entry` span whose parent is the entry's extracted context. Add `use tracing::Instrument;` and `use tracing_opentelemetry::OpenTelemetrySpanExt;`. Sketch:
+Wrap the `fsm.apply(...).await` in an `apply.entry` span, looking up the metadata for this entry's log index. Add `use tracing::Instrument;` and `use tracing_opentelemetry::OpenTelemetrySpanExt;`. Sketch:
 ```rust
 EntryPayload::Normal(cmd) => {
     let converted_log_id = convert::or_log_id_to_log_id(log_id);
@@ -94,8 +102,10 @@ EntryPayload::Normal(cmd) => {
         "apply.entry", otel.kind = "internal",
         shard_id, raft_index = converted_log_id.index,
     );
-    if let Some(cx) = extract_parent_context(cmd.traceparent(), cmd.tracestate(), cmd.baggage()) {
-        span.set_parent(cx);
+    if let Some((tp, ts, bg)) = self.metadata_store.take(self.shard_id, converted_log_id.index) {
+        if let Some(cx) = extract_parent_context(tp.as_deref(), ts.as_deref(), bg.as_deref()) {
+            span.set_parent(cx);
+        }
     }
     let resp = match self.fsm
         .apply(shard_id, converted_log_id, Some(cmd.clone()), None)
@@ -105,31 +115,20 @@ EntryPayload::Normal(cmd) => {
     responses.push(resp);
 }
 ```
-The tracing dispatch travels into `tokio::task::spawn_blocking` inside `FjallStateMachine::apply` automatically.
 
-### Mechanical match-site updates (add `..` or `traceparent: _, tracestate: _, baggage: _`)
-- `crates/ggap-consensus/src/lib.rs` (`StubRaftNode::propose` arms)
-- `crates/ggap-consensus/src/split.rs` (any `KvCommand` matches)
-- `crates/ggap-storage/src/mem.rs` (apply match arms)
-- `crates/ggap-storage/src/fjall.rs:415-585` (apply match arms)
-- `crates/ggap-storage/src/ttl.rs` — TTL-driven `KvCommand::Delete` construction stamps `traceparent: None, tracestate: None, baggage: None` (TTL GC isn't tied to a user request)
+The `take` call here removes the metadata after use, so it's not kept indefinitely. Note that `GgapStateMachine` already has a reference to the metadata store (it's part of the RaftNode builder).
 
-### Tests to update with `traceparent: None, tracestate: None, baggage: None` (or `..`)
-- `crates/ggap-consensus/tests/single_node.rs`
-- `crates/ggap-consensus/tests/sim_cluster.rs`
-- `crates/ggap-storage/tests/split_crash_bugs.rs`
-- `crates/ggap-server/tests/three_node_cluster.rs`
-- `crates/ggap-server/tests/split_single_node.rs`
+### No changes to `KvCommand`
+`KvCommand` and all its match sites remain untouched. No new fields, no serialization overhead.
 
 ### Comment update at `crates/ggap-server/src/tracing_layer.rs:1-18`
-Remove the "Limitation: openraft worker boundary" paragraph; add a one-sentence note that `KvService` handlers stamp `traceparent`/`tracestate`/`baggage` onto each `KvCommand`, and that the leader's outbound `rpc.client.append_entries` span and every `apply.entry` span re-extract that context as their parent (see `ggap_consensus::trace_context`).
+Remove the "Limitation: openraft worker boundary" paragraph; add a short note that `KvService` handlers capture trace context and store it by log index, then the leader's outbound `rpc.client.append_entries` span and `apply.entry` spans re-extract it to maintain the trace connection (see `ggap_consensus::trace_context` and `ggap_server::metadata_store`).
 
 ## Reused existing pieces
 
 - `MetadataInjector` and the `global::get_text_map_propagator(...).inject_context(...)` pattern at `crates/ggap-consensus/src/network.rs:23-33` (reused as the model for the new `HashMap`-backed `Injector`).
 - `OtelServerLayer` extraction at `crates/ggap-server/src/tracing_layer.rs:72-91` (already extracts inbound `traceparent`/`tracestate`; nothing to change in the layer itself for this phase).
 - `tracing_opentelemetry::OpenTelemetrySpanExt::{context, set_parent}` (already imported in `network.rs:4`; just add to `state_machine.rs` and `kv_service.rs`).
-- `bincode` derived from existing `serde::{Serialize, Deserialize}` on `KvCommand` — new fields ride on existing serialization.
 
 ## Verification
 
@@ -152,6 +151,8 @@ Remove the "Limitation: openraft worker boundary" paragraph; add a one-sentence 
 
 4. **Manual end-to-end smoke** via Kind + OTel Collector + Grafana (`scripts/local-deploy/`): `kubectl exec` a `grpcurl` Put with a synthetic `traceparent` header and confirm in Grafana Tempo (or the Collector debug exporter) that the trace shows: `rpc.server` (KvService/Put) → `rpc.client.append_entries` → `rpc.server` (RaftService/AppendEntries) → `apply.entry` on each replica.
 
-## Known risk to flag in the PR description
+## Architectural notes
 
-`KvCommand` is bincode-serialized into the Raft log. Bincode is positional, so adding fields to existing variants is **not backwards-compatible** with logs/snapshots written by older binaries. Per CLAUDE.md the project is in Phase 6 hardening and Phase 7 (multi-raft) is explicitly deferred — there is no documented log-compat policy and existing tests use tempdirs. Wipe-on-upgrade is acceptable for this phase. Call this out in the PR description so reviewers can sign off explicitly.
+- **Metadata store ownership**: `RequestMetadataStore` is instantiated in `ggap-node/src/main.rs` and passed (via `Arc`) to both `KvServiceImpl` (in `serve_client`) and `GgapNetwork` (in the RaftNode builder). This requires small signature changes to both but is mechanically straightforward.
+- **Metadata lifetime**: Entries are stored after `client_write()` returns and retrieved (via `take`) at apply time. Transient growth is bounded by replication latency (typically milliseconds). No explicit cleanup is needed; entries are removed on use.
+- **No log pollution**: Trace metadata never enters `KvCommand` or the Raft log, avoiding all serialization concerns and backwards-compatibility issues.
