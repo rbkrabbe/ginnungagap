@@ -15,6 +15,11 @@ tokio-stream   = { workspace = true }
 tower          = { workspace = true }
 async-trait    = { workspace = true }
 tracing        = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry  = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry-http = { workspace = true }
+http           = { workspace = true }
 anyhow         = { workspace = true }
 metrics        = { workspace = true }
 
@@ -26,6 +31,8 @@ futures       = { workspace = true }
 uuid          = { workspace = true }
 rand          = "0.10"
 metrics-util  = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name    = "kv_write"

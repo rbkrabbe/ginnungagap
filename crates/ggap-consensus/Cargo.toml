@@ -16,6 +16,9 @@ bincode = { workspace = true }
 tonic = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+http = { workspace = true }
 metrics = { workspace = true }
 tokio-util = { workspace = true }
 

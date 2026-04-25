@@ -312,7 +312,7 @@ turmoil                     = "0.6"   # dev-dependency; simulation harness (Phas
 - [x] **Deterministic simulation testing (DST)**: `sim_cluster.rs` harness — spawn N in-memory nodes, `FaultController` injects partitions/message drops/delays via configurable drop rates, seeded PRNG for reproducible fault sequences. 7 tests: `test_election_under_paused_time`, `test_leader_failure_and_reelection`, `test_partition_and_heal`, `test_message_drop_linearizability`, `test_message_drop_linearizability_concurrent`, `test_snapshot_catchup`, `test_membership_change_under_partition`
 - [x] Chaos tests: kill leader + verify re-election, network partition + heal, message drops with concurrent writes, membership change under partition — all covered by DST suite
 - [x] Prometheus metrics: request rate/latency p50/p99, Raft term, commit lag, match index
-- [ ] OpenTelemetry trace propagation (client → server → consensus)
+- [x] OpenTelemetry trace propagation (client → server → consensus)
 - [x] Admin RPCs: `ClusterStatus` (reads Raft metrics for term, leader, last_applied, voter membership), `AddLearner` (adds non-voting learner via openraft), `ChangeMembership` (replaces voter set via joint-consensus). All wired through `ShardRouter` → `OpenRaftNode` → openraft APIs
 
 ---
@@ -347,13 +347,13 @@ The single-raft implementation is deliberately shaped to make multi-raft a futur
 
 ## Test Summary
 
-67 tests across all crates, all passing. Zero clippy warnings.
+70 tests across all crates, all passing. Zero clippy warnings.
 
 | Crate | Tests | Scope |
 |-------|-------|-------|
 | `ggap-storage` | 39 | Log storage, SM apply, MVCC, snapshot, keys, shard map |
 | `ggap-consensus` | 11 | StubRaftNode (2), DST sim_cluster (7), single-node (1), raft metrics task (1) |
-| `ggap-server` | 17 | 3-node cluster (4), admin ops (5), shard split (5), watch (3) |
+| `ggap-server` | 20 | 3-node cluster + admin ops (9), shard split (5), watch (3), trace propagation (2), rpc metrics (1) |
 
 ## Verification Checklist
 

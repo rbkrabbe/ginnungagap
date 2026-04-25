@@ -129,21 +129,8 @@ async fn main() -> anyhow::Result<()> {
 
     validate_config(&config)?;
 
-    let log_format = config.observability.log_format.as_str();
-    match log_format {
-        "json" => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(&config.observability.log_level)
-                .init();
-        }
-        _ => {
-            tracing_subscriber::fmt()
-                .pretty()
-                .with_env_filter(&config.observability.log_level)
-                .init();
-        }
-    }
+    let trace_guard =
+        observability::init_tracing(&config.observability, cli.node_id).context("init tracing")?;
 
     tracing::info!(
         node_id = cli.node_id,
@@ -378,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
         serve_cluster(cluster_addr, router, split_coordinator, shard_map),
     )?;
 
+    trace_guard.shutdown();
     Ok(())
 }
 

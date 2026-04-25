@@ -3,6 +3,7 @@ mod convert;
 mod kv_service;
 mod metrics;
 mod raft_service;
+mod tracing_layer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tonic_reflection::server::Builder as ReflectionBuilder;
 use admin_service::AdminServiceImpl;
 use kv_service::KvServiceImpl;
 use raft_service::RaftServiceImpl;
+use tracing_layer::OtelServerLayer;
 
 /// Configuration for the client-facing KV service.
 #[derive(Clone, Debug)]
@@ -58,6 +60,7 @@ pub async fn serve_client(
         .expect("failed to build reflection service");
     tracing::info!(%addr, "client gRPC server starting");
     tonic::transport::Server::builder()
+        .layer(OtelServerLayer)
         .add_service(KvServiceServer::new(KvServiceImpl::new(
             router,
             node_id,
@@ -84,6 +87,7 @@ pub async fn serve_client_with_listener(
         .build_v1()
         .expect("failed to build reflection service");
     tonic::transport::Server::builder()
+        .layer(OtelServerLayer)
         .add_service(KvServiceServer::new(KvServiceImpl::new(
             router,
             node_id,
@@ -111,6 +115,7 @@ pub async fn serve_cluster(
     tracing::info!(%addr, "cluster gRPC server starting");
     let admin = AdminServiceImpl::new(router.clone(), split_coordinator, shard_map);
     tonic::transport::Server::builder()
+        .layer(OtelServerLayer)
         .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
         .add_service(AdminServiceServer::new(admin))
         .add_service(reflection)
@@ -132,6 +137,7 @@ pub async fn serve_cluster_with_listener(
         .expect("failed to build reflection service");
     let admin = AdminServiceImpl::new(router.clone(), split_coordinator, shard_map);
     tonic::transport::Server::builder()
+        .layer(OtelServerLayer)
         .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
         .add_service(AdminServiceServer::new(admin))
         .add_service(reflection)
