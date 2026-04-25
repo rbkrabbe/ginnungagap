@@ -16,8 +16,12 @@ bincode = { workspace = true }
 tonic = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 rand = "0.10.0"
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+metrics-util = { workspace = true }
+ggap-storage = { path = "../ggap-storage" }
