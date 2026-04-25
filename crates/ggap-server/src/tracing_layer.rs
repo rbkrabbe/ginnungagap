@@ -5,17 +5,23 @@
 //! tonic servers, so all inbound RPCs — including Raft peer-to-peer calls —
 //! participate in trace propagation.
 //!
-//! # Limitation: openraft worker boundary
+//! # Trace continuity across the openraft task boundary
 //!
-//! When a `KvService::put` triggers `Raft::client_write`, openraft schedules the
-//! actual `AppendEntries` RPCs on an internal tokio task spawned without a
-//! tracing span.  The outbound `rpc.client.*` spans emitted by `GgapNetwork`
-//! therefore start a **new trace** on the leader rather than appearing as
-//! children of the inbound `rpc.server` span.  However, the follower's
-//! `RaftService/AppendEntries` server span *does* chain under the leader's
-//! outbound client span, so the server→consensus→server leg is fully connected.
-//! Linking the original client trace through openraft's task boundary would
-//! require plumbing context into `KvCommand`; that is deferred to a future phase.
+//! When a `KvService::put` triggers `Raft::client_write`, openraft schedules its
+//! `AppendEntries` fan-out on internal tokio tasks that carry no tracing context.
+//! The trace gap is bridged without touching `KvCommand` (no log pollution):
+//!
+//! 1. `OpenRaftNode::propose()` captures `traceparent`/`tracestate`/`baggage`
+//!    from the active `rpc.server` span immediately after `client_write` returns,
+//!    and stores them in `RequestMetadataStore` keyed by `(shard_id, log_index)`.
+//! 2. `GgapNetwork::append_entries` looks up that context by the first Normal
+//!    entry's log index and calls `span.set_parent(cx)` before instrumenting the
+//!    outbound RPC — so the follower's inbound `rpc.server` span chains under the
+//!    original user trace.
+//! 3. `GgapStateMachine::apply` similarly re-anchors an `apply.entry` span for
+//!    each Normal entry on the leader, making baggage visible during apply.
+//!
+//! See `ggap_consensus::trace_context` and `ggap_consensus::metadata_store`.
 
 use std::{
     future::Future,

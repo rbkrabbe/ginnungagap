@@ -10,9 +10,13 @@ use openraft::{
     BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftSnapshotBuilder, RaftTypeConfig,
     Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
 };
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::config::GgapTypeConfig;
 use crate::convert::{self, decode, encode, log_id_to_or_log_id};
+use crate::metadata_store::RequestMetadataStore;
+use crate::trace_context::extract_parent_context;
 
 fn sto_err(msg: impl Into<String>) -> StorageError<u64> {
     let io = StorageIOError::new(
@@ -30,11 +34,21 @@ fn sto_err(msg: impl Into<String>) -> StorageError<u64> {
 pub struct GgapStateMachine {
     pub(crate) fsm: Arc<FjallStateMachine>,
     pub(crate) shard_id: ShardId,
+    metadata_store: Option<Arc<RequestMetadataStore>>,
 }
 
 impl GgapStateMachine {
     pub fn new(fsm: Arc<FjallStateMachine>, shard_id: ShardId) -> Self {
-        GgapStateMachine { fsm, shard_id }
+        GgapStateMachine {
+            fsm,
+            shard_id,
+            metadata_store: None,
+        }
+    }
+
+    pub fn with_metadata_store(mut self, store: Arc<RequestMetadataStore>) -> Self {
+        self.metadata_store = Some(store);
+        self
     }
 }
 
@@ -88,9 +102,31 @@ impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
                 }
                 EntryPayload::Normal(cmd) => {
                     let converted_log_id = convert::or_log_id_to_log_id(log_id);
+
+                    let span = tracing::info_span!(
+                        "apply.entry",
+                        otel.kind = "internal",
+                        shard_id,
+                        raft_index = converted_log_id.index,
+                    );
+                    // Look up trace context stored by the leader's propose() path.
+                    // For entries that originated on this leader, the metadata_store
+                    // may carry a pre-populated context (future: when pre-population
+                    // is implemented); for now this is a no-op on followers.
+                    if let Some(ms) = &self.metadata_store {
+                        if let Some((tp, ts, bg)) = ms.take(shard_id, converted_log_id.index) {
+                            if let Some(cx) =
+                                extract_parent_context(tp.as_deref(), ts.as_deref(), bg.as_deref())
+                            {
+                                span.set_parent(cx);
+                            }
+                        }
+                    }
+
                     let resp = match self
                         .fsm
                         .apply(shard_id, converted_log_id, cmd.clone().into(), None)
+                        .instrument(span)
                         .await
                     {
                         Ok(r) => r,

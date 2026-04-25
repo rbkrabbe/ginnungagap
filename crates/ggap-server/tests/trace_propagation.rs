@@ -31,7 +31,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    OpenRaftCluster, OpenRaftNode, RequestMetadataStore, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{kv_service_client::KvServiceClient, GetRequest, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
@@ -97,14 +98,15 @@ async fn start_single_node() -> TestNode {
     fsm_builder.set_shard_map(shard_map.clone());
     let fsm = Arc::new(fsm_builder);
 
+    let metadata_store = Arc::new(RequestMetadataStore::new());
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
-    let sm = GgapStateMachine::new(fsm.clone(), 0);
+    let sm = GgapStateMachine::new(fsm.clone(), 0).with_metadata_store(Arc::clone(&metadata_store));
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
         GgapRaft::new(
             1,
             raft_cfg.clone(),
-            GgapNetworkFactory::new(0),
+            GgapNetworkFactory::new(0).with_metadata_store(Arc::clone(&metadata_store)),
             log_store,
             sm,
         )
@@ -117,13 +119,16 @@ async fn start_single_node() -> TestNode {
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_addr = client_listener.local_addr().unwrap();
 
-    let raft_node = Arc::new(OpenRaftNode::new(
-        raft.clone(),
-        fsm.clone(),
-        0,
-        1,
-        tokio::time::Duration::from_millis(100),
-    ));
+    let raft_node = Arc::new(
+        OpenRaftNode::new(
+            raft.clone(),
+            fsm.clone(),
+            0,
+            1,
+            tokio::time::Duration::from_millis(100),
+        )
+        .with_metadata_store(Arc::clone(&metadata_store)),
+    );
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
     router.add_shard(0, raft_node, cluster).await;
@@ -286,16 +291,22 @@ async fn outbound_raft_rpc_carries_injected_trace_context() {
         trace_id_hex,
     );
 
-    // On a single-node cluster, openraft does not send AppendEntries to peers
-    // (there are none).  Verify instead that any rpc.client.* spans produced
-    // by GgapNetwork (e.g. from heartbeat/vote to self) carry a non-zero
-    // trace_id — confirming the MetadataInjector plumbing is active.
-    let spans = exporter.get_finished_spans().unwrap_or_else(|_| vec![]);
-    for span in spans.iter().filter(|s| s.name.starts_with("rpc.client.")) {
-        let tid = format!("{:032x}", span.span_context.trace_id());
-        assert_ne!(
-            tid, "00000000000000000000000000000000",
-            "outbound rpc.client span must have a non-zero trace_id"
+    // On a single-node cluster openraft does not send AppendEntries to peers,
+    // but the leader applies the entry locally.  Verify that the apply.entry
+    // span produced by GgapStateMachine carries the *same* injected trace_id,
+    // confirming that the metadata store re-anchored the span.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let spans = exporter.get_finished_spans().unwrap_or_else(|_| vec![]);
+        if spans.iter().any(|s| {
+            s.name == "apply.entry" && format!("{:032x}", s.span_context.trace_id()) == trace_id_hex
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no apply.entry span with the injected trace_id appeared within 5 s"
         );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
