@@ -1025,7 +1025,6 @@ dependencies = [
  "metrics-util",
  "openraft",
  "opentelemetry",
- "opentelemetry_sdk",
  "rand 0.10.0",
  "serde",
  "tempfile",

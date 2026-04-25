@@ -12,8 +12,8 @@ use serde::Deserialize;
 
 use ggap_consensus::{
     build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, RequestMetadataStore,
-    ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, ShardRouter,
+    SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -199,13 +199,10 @@ async fn main() -> anyhow::Result<()> {
     fsm_builder.set_shard_map(shard_map.clone());
     let fsm = Arc::new(fsm_builder);
 
-    // 4. Create shared trace metadata store (bridges KV handler → openraft boundary).
-    let metadata_store = Arc::new(RequestMetadataStore::new());
-
-    // 5. Create ShardRouter.
+    // 4. Create ShardRouter.
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
 
-    // 6. Start a Raft group for each shard in the ShardMap.
+    // 5. Start a Raft group for each shard in the ShardMap.
     let shards = shard_map.all_shards().await;
     let raft_cfg = build_raft_config(
         config.raft.heartbeat_interval_ms,
@@ -217,10 +214,8 @@ async fn main() -> anyhow::Result<()> {
     for shard_info in &shards {
         let shard_id = shard_info.shard_id;
         let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), shard_id);
-        let sm = GgapStateMachine::new(fsm.clone(), shard_id)
-            .with_metadata_store(Arc::clone(&metadata_store));
-        let net =
-            GgapNetworkFactory::new(shard_id).with_metadata_store(Arc::clone(&metadata_store));
+        let sm = GgapStateMachine::new(fsm.clone(), shard_id);
+        let net = GgapNetworkFactory::new(shard_id);
 
         let raft = Arc::new(
             GgapRaft::new(cli.node_id, raft_cfg.clone(), net, log_store, sm)
@@ -287,16 +282,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        let node = Arc::new(
-            OpenRaftNode::new(
-                raft.clone(),
-                fsm.clone(),
-                shard_id,
-                cli.node_id,
-                tokio::time::Duration::from_millis(config.consistency.lease_duration_ms),
-            )
-            .with_metadata_store(Arc::clone(&metadata_store)),
-        );
+        let node = Arc::new(OpenRaftNode::new(
+            raft.clone(),
+            fsm.clone(),
+            shard_id,
+            cli.node_id,
+            tokio::time::Duration::from_millis(config.consistency.lease_duration_ms),
+        ));
         let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
 
         router.add_shard(shard_id, node, cluster).await;

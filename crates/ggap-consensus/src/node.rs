@@ -12,8 +12,6 @@ use openraft::{
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::metadata_store::RequestMetadataStore;
-
 use crate::config::GgapTypeConfig;
 use crate::convert::{decode, encode};
 use crate::RaftNode;
@@ -67,7 +65,6 @@ pub struct OpenRaftNode {
     #[allow(dead_code)]
     node_id: u64,
     lease: tokio::sync::Mutex<LeaseManager>,
-    metadata_store: Option<Arc<RequestMetadataStore>>,
 }
 
 impl OpenRaftNode {
@@ -84,13 +81,7 @@ impl OpenRaftNode {
             shard_id,
             node_id,
             lease: tokio::sync::Mutex::new(LeaseManager::new(lease_duration)),
-            metadata_store: None,
         }
-    }
-
-    pub fn with_metadata_store(mut self, store: Arc<RequestMetadataStore>) -> Self {
-        self.metadata_store = Some(store);
-        self
     }
 
     /// Access the underlying Raft instance (e.g. for ensure_linearizable).
@@ -202,45 +193,32 @@ impl RaftNode for OpenRaftNode {
     }
 
     async fn propose(&self, cmd: KvCommand, _mode: WriteMode) -> Result<KvResponse, GgapError> {
-        let map_err = |e: openraft::error::RaftError<
-            u64,
-            openraft::error::ClientWriteError<u64, BasicNode>,
-        >| {
-            if let Some(fwd) = e.forward_to_leader() {
-                let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
-                return GgapError::NotLeader {
-                    leader: leader_addr,
-                };
-            }
-            GgapError::Consensus(e.to_string())
-        };
-
-        if self.metadata_store.is_some() {
-            // Create an apply.entry span anchored to the current rpc.server span.
-            // openraft's state machine apply runs inside client_write() on an
-            // internal task that doesn't carry the caller's trace context; creating
-            // the span here (before the await) bridges the gap without modifying
-            // KvCommand or the Raft log.
-            let span = tracing::info_span!(
-                "apply.entry",
-                otel.kind = "internal",
-                shard_id = self.shard_id,
-            );
-            span.set_parent(tracing::Span::current().context());
-            return self
-                .raft
-                .client_write(cmd)
-                .instrument(span)
-                .await
-                .map(|r| r.data)
-                .map_err(map_err);
-        }
+        // Create an apply.entry span anchored to the current rpc.server span.
+        // openraft's state machine apply runs inside client_write() on an
+        // internal task that doesn't carry the caller's trace context; creating
+        // the span here (before the await) bridges the trace gap without
+        // modifying KvCommand or the Raft log.
+        let span = tracing::info_span!(
+            "apply.entry",
+            otel.kind = "internal",
+            shard_id = self.shard_id,
+        );
+        span.set_parent(tracing::Span::current().context());
 
         self.raft
             .client_write(cmd)
+            .instrument(span)
             .await
             .map(|r| r.data)
-            .map_err(map_err)
+            .map_err(|e| {
+                if let Some(fwd) = e.forward_to_leader() {
+                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                    return GgapError::NotLeader {
+                        leader: leader_addr,
+                    };
+                }
+                GgapError::Consensus(e.to_string())
+            })
     }
 
     async fn read(

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use opentelemetry::global;
 use opentelemetry::propagation::Injector;
 use tracing::Instrument;
@@ -11,14 +9,12 @@ use openraft::{
     error::{NetworkError, RPCError, RaftError, Unreachable},
     network::RPCOption,
     raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse},
-    AnyError, BasicNode, EntryPayload, RaftNetwork, RaftNetworkFactory,
+    AnyError, BasicNode, RaftNetwork, RaftNetworkFactory,
 };
 use tonic::transport::Channel;
 
 use crate::config::GgapTypeConfig;
 use crate::convert::{decode, encode};
-use crate::metadata_store::RequestMetadataStore;
-use crate::trace_context::extract_parent_context;
 
 // ---------------------------------------------------------------------------
 // MetadataInjector — injects OTel context into outbound tonic request metadata
@@ -42,20 +38,11 @@ impl<'a> Injector for MetadataInjector<'a> {
 
 pub struct GgapNetworkFactory {
     pub shard_id: ShardId,
-    metadata_store: Option<Arc<RequestMetadataStore>>,
 }
 
 impl GgapNetworkFactory {
     pub fn new(shard_id: ShardId) -> Self {
-        GgapNetworkFactory {
-            shard_id,
-            metadata_store: None,
-        }
-    }
-
-    pub fn with_metadata_store(mut self, store: Arc<RequestMetadataStore>) -> Self {
-        self.metadata_store = Some(store);
-        self
+        GgapNetworkFactory { shard_id }
     }
 }
 
@@ -67,7 +54,6 @@ impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
             addr: node.addr.clone(),
             channel: None,
             shard_id: self.shard_id,
-            metadata_store: self.metadata_store.clone(),
         }
     }
 }
@@ -80,7 +66,6 @@ pub struct GgapNetwork {
     addr: String,
     channel: Option<RaftServiceClient<Channel>>,
     shard_id: ShardId,
-    metadata_store: Option<Arc<RequestMetadataStore>>,
 }
 
 impl GgapNetwork {
@@ -125,20 +110,6 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         rpc: AppendEntriesRequest<GgapTypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        // Re-anchor the outbound span under the original user request's trace
-        // by looking up the first Normal entry's log index in the metadata store.
-        let parent_cx = self.metadata_store.as_ref().and_then(|ms| {
-            rpc.entries.iter().find_map(|e| match &e.payload {
-                EntryPayload::Normal(_) => {
-                    ms.lookup(self.shard_id, e.log_id.index)
-                        .and_then(|(tp, ts, bg)| {
-                            extract_parent_context(tp.as_deref(), ts.as_deref(), bg.as_deref())
-                        })
-                }
-                _ => None,
-            })
-        });
-
         let span = tracing::info_span!(
             "rpc.client.append_entries",
             otel.kind = "client",
@@ -146,9 +117,6 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
             "rpc.method" = "ginnungagap.v1.RaftService/AppendEntries",
             shard_id = self.shard_id,
         );
-        if let Some(cx) = parent_cx {
-            span.set_parent(cx);
-        }
 
         async move {
             let payload = encode(&rpc).map_err(Self::to_net_err)?;
