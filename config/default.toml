@@ -25,4 +25,9 @@ request_timeout_ms       = 5000
 log_level             = "info"
 log_format            = "json"
 metrics_addr          = "0.0.0.0:9090"
+# OTLP gRPC collector endpoint (e.g. "http://otel-collector:4317").
+# Empty string disables tracing entirely; only the stdout fmt subscriber is
+# installed.  When set, a tracing-opentelemetry layer is added alongside the
+# fmt layer with ParentBased(AlwaysOn) sampling — honoring upstream
+# `traceparent` sampled-bit; emitting all spans for root requests on this node.
 tracing_otlp_endpoint = ""

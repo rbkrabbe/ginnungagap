@@ -2,8 +2,117 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{
+    runtime,
+    trace::{Sampler, TracerProvider},
+    Resource,
+};
+use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+use crate::ObservabilityConfig;
+
+// ---------------------------------------------------------------------------
+// TracingGuard — holds the OTel provider so we can flush on shutdown
+// ---------------------------------------------------------------------------
+
+pub enum TracingGuard {
+    None,
+    Otel(TracerProvider),
+}
+
+impl TracingGuard {
+    pub fn shutdown(self) {
+        if let TracingGuard::Otel(provider) = self {
+            if let Err(e) = provider.shutdown() {
+                eprintln!("OTLP tracer shutdown error: {e}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// init_tracing
+// ---------------------------------------------------------------------------
+
+/// Install the global tracing subscriber and, when `tracing_otlp_endpoint` is
+/// non-empty, also set up the OTLP gRPC exporter and attach a
+/// `tracing_opentelemetry` layer.
+///
+/// Returns a [`TracingGuard`] that **must** be held until the process is ready
+/// to exit and then dropped/shutdown to flush in-flight spans.
+pub fn init_tracing(config: &ObservabilityConfig, node_id: u64) -> anyhow::Result<TracingGuard> {
+    let json = config.log_format == "json";
+    let filter = EnvFilter::new(&config.log_level);
+
+    if config.tracing_otlp_endpoint.is_empty() {
+        // No OTLP endpoint — plain fmt subscriber only (today's behavior).
+        if json {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().json())
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().pretty())
+                .init();
+        }
+        return Ok(TracingGuard::None);
+    }
+
+    // Build OTLP gRPC span exporter.
+    let exporter = SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&config.tracing_otlp_endpoint)
+        .build()
+        .context("failed to build OTLP span exporter")?;
+
+    let resource = Resource::new_with_defaults([
+        KeyValue::new(SERVICE_NAME, "ginnungagap"),
+        KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
+        // service.instance.id uses the string constant directly because
+        // opentelemetry-semantic-conventions 0.27 gates it behind
+        // semconv_experimental.
+        KeyValue::new("service.instance.id", node_id.to_string()),
+    ]);
+
+    let provider = TracerProvider::builder()
+        .with_batch_exporter(exporter, runtime::Tokio)
+        .with_resource(resource)
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+        .build();
+
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    if json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ginnungagap")))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().pretty())
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ginnungagap")))
+            .init();
+    }
+
+    Ok(TracingGuard::Otel(provider))
+}
+
+// ---------------------------------------------------------------------------
+// init_metrics_recorder
+// ---------------------------------------------------------------------------
 
 /// Install a process-global Prometheus recorder and spawn the scrape endpoint.
 ///

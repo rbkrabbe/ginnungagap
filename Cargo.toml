@@ -28,6 +28,13 @@ figment = { version = "0.10", features = ["toml", "env"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-semantic-conventions = "0.27"
+opentelemetry-http = "0.27"
+http = "1"
 tower = "0.4"
 bytes = "1"
 dashmap = "5"
