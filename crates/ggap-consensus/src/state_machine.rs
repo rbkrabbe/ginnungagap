@@ -1,6 +1,8 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use crate::config::GgapTypeConfig;
+use crate::convert::{self, decode, encode, log_id_to_or_log_id};
 use ggap_storage::fjall::FjallStateMachine;
 use ggap_storage::traits::StateMachineStore;
 use ggap_types::{GgapError, KvResponse, ShardId};
@@ -10,9 +12,6 @@ use openraft::{
     BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftSnapshotBuilder, RaftTypeConfig,
     Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
 };
-
-use crate::config::GgapTypeConfig;
-use crate::convert::{self, decode, encode, log_id_to_or_log_id};
 
 fn sto_err(msg: impl Into<String>) -> StorageError<u64> {
     let io = StorageIOError::new(

@@ -286,16 +286,22 @@ async fn outbound_raft_rpc_carries_injected_trace_context() {
         trace_id_hex,
     );
 
-    // On a single-node cluster, openraft does not send AppendEntries to peers
-    // (there are none).  Verify instead that any rpc.client.* spans produced
-    // by GgapNetwork (e.g. from heartbeat/vote to self) carry a non-zero
-    // trace_id — confirming the MetadataInjector plumbing is active.
-    let spans = exporter.get_finished_spans().unwrap_or_else(|_| vec![]);
-    for span in spans.iter().filter(|s| s.name.starts_with("rpc.client.")) {
-        let tid = format!("{:032x}", span.span_context.trace_id());
-        assert_ne!(
-            tid, "00000000000000000000000000000000",
-            "outbound rpc.client span must have a non-zero trace_id"
+    // On a single-node cluster openraft does not send AppendEntries to peers,
+    // but the leader applies the entry locally.  Verify that the apply.entry
+    // span produced by OpenRaftNode::propose() carries the same injected
+    // trace_id, confirming that the span was anchored before client_write().
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let spans = exporter.get_finished_spans().unwrap_or_else(|_| vec![]);
+        if spans.iter().any(|s| {
+            s.name == "apply.entry" && format!("{:032x}", s.span_context.trace_id()) == trace_id_hex
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no apply.entry span with the injected trace_id appeared within 5 s"
         );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

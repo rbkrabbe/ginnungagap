@@ -9,6 +9,9 @@ use openraft::{
     BasicNode, ChangeMembers, Raft,
 };
 
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
 use crate::config::GgapTypeConfig;
 use crate::convert::{decode, encode};
 use crate::RaftNode;
@@ -190,12 +193,24 @@ impl RaftNode for OpenRaftNode {
     }
 
     async fn propose(&self, cmd: KvCommand, _mode: WriteMode) -> Result<KvResponse, GgapError> {
+        // Create an apply.entry span anchored to the current rpc.server span.
+        // openraft's state machine apply runs inside client_write() on an
+        // internal task that doesn't carry the caller's trace context; creating
+        // the span here (before the await) bridges the trace gap without
+        // modifying KvCommand or the Raft log.
+        let span = tracing::info_span!(
+            "apply.entry",
+            otel.kind = "internal",
+            shard_id = self.shard_id,
+        );
+        span.set_parent(tracing::Span::current().context());
+
         self.raft
             .client_write(cmd)
+            .instrument(span)
             .await
             .map(|r| r.data)
             .map_err(|e| {
-                // Check if it's a ForwardToLeader error.
                 if let Some(fwd) = e.forward_to_leader() {
                     let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
                     return GgapError::NotLeader {
