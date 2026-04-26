@@ -37,9 +37,6 @@ struct Cli {
     client_addr: String,
     #[arg(long, default_value = "0.0.0.0:17001")]
     cluster_addr: String,
-    /// Peer specs: "id=addr" format, repeatable
-    #[arg(long = "peer")]
-    peers: Vec<String>,
     /// Initialize shard 0 as a fresh single-voter Raft cluster on first boot.
     /// Exactly one node in a fresh deployment should run with this flag; other
     /// nodes start uninitialized and wait for `AdminService.AddLearner` +
