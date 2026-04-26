@@ -16,7 +16,7 @@ data:
     # Idempotent: if ClusterStatus already reports >= 3 voters, exits 0.
     set -eu
 
-    SEED=ggap-0.ggap-headless.ginnungagap.svc.cluster.local:17001
+    SEED=ggap-2.ggap-headless.ginnungagap.svc.cluster.local:17001
 
     echo "waiting for seed AdminService at ${SEED}..."
     i=0
@@ -43,7 +43,7 @@ data:
       exit 0
     fi
 
-    for id in 2 3; do
+    for id in 1 2; do
       ord=$((id - 1))
       addr="ggap-${ord}.ggap-headless.ginnungagap.svc.cluster.local:17001"
       echo "AddLearner node_id=${id} cluster_addr=${addr}"

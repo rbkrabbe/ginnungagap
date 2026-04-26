@@ -14,17 +14,14 @@ data:
     # ordinals 1 and 2 into voters. Restarts are no-ops because ggap-node
     # checks raft.is_initialized() before re-initializing.
     SEED_FLAG=""
-    if [ "${ORDINAL}" = "0" ]; then
+    if [ "${ORDINAL}" = "2" ]; then
       SEED_FLAG="--seed"
     fi
     echo "ggap-node starting: node_id=${NODE_ID} seed=${SEED_FLAG:-no}"
     exec /usr/local/bin/ggap-node \
       --node-id "${NODE_ID}" \
       --client-addr 0.0.0.0:17000 \
-      --cluster-addr $( hostname -i ):17001 \
+      --cluster-addr ggap-${ORDINAL}.ggap-headless.ginnungagap.svc.cluster.local:17001 \
       --data-dir /var/lib/ginnungagap \
       --metrics-addr 0.0.0.0:9090 \
-      ${SEED_FLAG} \
-      --peer 1=ggap-0.ggap-headless.ginnungagap.svc.cluster.local:17001 \
-      --peer 2=ggap-1.ggap-headless.ginnungagap.svc.cluster.local:17001 \
-      --peer 3=ggap-2.ggap-headless.ginnungagap.svc.cluster.local:17001
+      ${SEED_FLAG}
