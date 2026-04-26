@@ -4,6 +4,8 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - ggap/configmap.yaml
+  - tools/configmap.yaml
+  - tools/pod.yaml
   - ggap/service-headless.yaml
   - ggap/service-client.yaml
   - ggap/statefulset.yaml
