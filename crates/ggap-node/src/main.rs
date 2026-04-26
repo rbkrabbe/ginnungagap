@@ -37,6 +37,11 @@ struct Cli {
     client_addr: String,
     #[arg(long, default_value = "0.0.0.0:17001")]
     cluster_addr: String,
+    /// Address to bind the cluster gRPC listener to. Defaults to `--cluster-addr`
+    /// when omitted. Set this to `0.0.0.0:<port>` when `--cluster-addr` is a DNS
+    /// hostname that should only be used for Raft peer advertisement.
+    #[arg(long)]
+    cluster_listen_addr: Option<String>,
     /// Initialize shard 0 as a fresh single-voter Raft cluster on first boot.
     /// Exactly one node in a fresh deployment should run with this flag; other
     /// nodes start uninitialized and wait for `AdminService.AddLearner` +
@@ -157,10 +162,16 @@ async fn main() -> anyhow::Result<()> {
         .client_addr
         .parse()
         .with_context(|| format!("invalid client_addr: {}", cli.client_addr))?;
-    let cluster_addr: SocketAddr = cli
-        .cluster_addr
-        .parse()
-        .with_context(|| format!("invalid cluster_addr: {}", cli.cluster_addr))?;
+    let cluster_addr: SocketAddr = match &cli.cluster_listen_addr {
+        Some(listen) => listen
+            .parse()
+            .with_context(|| format!("invalid cluster_listen_addr: {listen}"))?,
+        None => tokio::net::lookup_host(&cli.cluster_addr)
+            .await
+            .with_context(|| format!("cannot resolve cluster_addr: {}", cli.cluster_addr))?
+            .next()
+            .with_context(|| format!("no addresses for cluster_addr: {}", cli.cluster_addr))?,
+    };
 
     // Use data_dir from CLI if provided (non-default), else fall back to config.
     let data_dir = if cli.data_dir == std::path::Path::new("/var/lib/ginnungagap") {
@@ -253,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(None) if cli.seed => Some(BTreeMap::from([(
                     cli.node_id,
                     BasicNode {
-                        addr: cluster_addr.to_string(),
+                        addr: cli.cluster_addr.clone(),
                     },
                 )])),
                 Ok(None) => None,
