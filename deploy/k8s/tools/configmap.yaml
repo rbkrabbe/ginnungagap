@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ggap-tools-scripts
+  namespace: ginnungagap
+data:
+  # Print ClusterStatus from all three nodes side-by-side.
+  status: |
+    #!/bin/sh
+    for i in 0 1 2; do
+      addr="ggap-${i}.ggap-headless.ginnungagap.svc.cluster.local:17001"
+      printf '\n=== ggap-%s ===\n' "$i"
+      grpcurl -plaintext -max-time 3 "$addr" \
+        ginnungagap.v1.AdminService/ClusterStatus 2>&1 || true
+    done
+
+  # Resolve the current leader and print its client address (host:17000).
+  # Exit 1 if no leader is elected yet.
+  leader: |
+    #!/bin/sh
+    SEED="ggap-0.ggap-headless.ginnungagap.svc.cluster.local:17001"
+    STATUS=$(grpcurl -plaintext -max-time 5 "$SEED" \
+               ginnungagap.v1.AdminService/ClusterStatus 2>&1)
+    LEADER_ID=$(printf '%s' "$STATUS" | grep '"leaderId"' | grep -o '[0-9]*' | head -1)
+    if [ -z "$LEADER_ID" ]; then
+      printf 'no leader elected yet\n%s\n' "$STATUS" >&2
+      exit 1
+    fi
+    ORDINAL=$((LEADER_ID - 1))
+    echo "ggap-${ORDINAL}.ggap-headless.ginnungagap.svc.cluster.local:17000"
+
+  # Store a UTF-8 value.  Usage: put <key> <value>
+  # gRPC bytes fields are base64 in JSON; this script encodes the value.
+  put: |
+    #!/bin/sh
+    if [ $# -lt 2 ]; then
+      echo "usage: put <key> <value>" >&2
+      exit 1
+    fi
+    KEY="$1"; VALUE="$2"
+    LEADER=$(leader)
+    VALUE_B64=$(printf '%s' "$VALUE" | base64 | tr -d '\n')
+    grpcurl -plaintext \
+      -d "{\"key\":\"${KEY}\",\"value\":\"${VALUE_B64}\"}" \
+      "$LEADER" ginnungagap.v1.KvService/Put
+
+  # Fetch a key and decode the bytes value back to a string.
+  # Usage: get <key> [linearizable|sequential|eventual]
+  get: |
+    #!/bin/sh
+    if [ $# -lt 1 ]; then
+      echo "usage: get <key> [linearizable|sequential|eventual]" >&2
+      exit 1
+    fi
+    KEY="$1"
+    CONSISTENCY="${2:-LINEARIZABLE}"
+    LEADER=$(leader)
+    RESP=$(grpcurl -plaintext \
+             -d "{\"key\":\"${KEY}\",\"consistency\":\"${CONSISTENCY}\"}" \
+             "$LEADER" ginnungagap.v1.KvService/Get)
+    echo "$RESP"
+    # Decode the raw bytes value for readability.
+    RAW=$(printf '%s' "$RESP" | grep '"value"' | sed 's/.*"value": "\([^"]*\)".*/\1/')
+    if [ -n "$RAW" ]; then
+      printf 'decoded value: %s\n' "$(printf '%s' "$RAW" | base64 -d 2>/dev/null)"
+    fi
+
+  # Scan a key range.  Usage: scan <start-key> <end-key> [limit]
+  scan: |
+    #!/bin/sh
+    if [ $# -lt 2 ]; then
+      echo "usage: scan <start-key> <end-key> [limit]" >&2
+      exit 1
+    fi
+    START="$1"; END="$2"; LIMIT="${3:-100}"
+    LEADER=$(leader)
+    grpcurl -plaintext \
+      -d "{\"startKey\":\"${START}\",\"endKey\":\"${END}\",\"limit\":${LIMIT}}" \
+      "$LEADER" ginnungagap.v1.KvService/Scan
+
+  # Delete a key.  Usage: del <key>
+  del: |
+    #!/bin/sh
+    if [ $# -lt 1 ]; then
+      echo "usage: del <key>" >&2
+      exit 1
+    fi
+    KEY="$1"
+    LEADER=$(leader)
+    grpcurl -plaintext \
+      -d "{\"key\":\"${KEY}\"}" \
+      "$LEADER" ginnungagap.v1.KvService/Delete
