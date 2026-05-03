@@ -388,10 +388,10 @@ Wire form: a single `u64` packing `(physical_ms << 16) | (logical & 0xFFFF)`. 16
 - `wait_until_applied(target: Hlc, deadline: Instant) -> Result<()>` — async wait for `applied_frontier ≥ target`.
 
 The clock is fed by:
-1. **Leader propose path**: leader calls `now()` and stamps the command before `client_write`.
-2. **Apply path** (every node): `apply()` calls `observe(commit_hlc)` so followers' clocks track the leader.
-3. **gRPC ingress**: `KvServiceImpl` calls `observe(request_header.commit_hlc)` so client-supplied HLCs propagate causality.
-4. **Idle heartbeat**: when `applied_frontier` lags `now()` by more than `idle_tick_ms`, the leader proposes a `KvCommand::ClockTick { hlc }` no-op so reads don't stall waiting for a quiet shard.
+1. **Leader propose path**: leader calls `now()` to capture `propose_hlc` and embeds it in the `KvCommand`. `commit_hlc` is NOT assigned here — it is assigned in apply (see below) to guarantee monotonicity with apply order.
+2. **Apply path** (every node): `apply()` computes `commit_hlc = max(propose_hlc, applied_hlc.successor())`, advances `applied_hlc` to `commit_hlc`, calls `clock.observe(commit_hlc)`, and writes the entry to storage under `commit_hlc`. This ensures `commit_hlc` is strictly monotonic in apply order on every replica, regardless of how concurrent proposes are serialized by the leader's Raft log.
+3. **gRPC ingress**: `KvServiceImpl` calls `observe(request_header.observed_hlc)` so client-supplied HLCs propagate causality.
+4. **On-demand clock advance for fresh reads**: rather than a periodic background tick, a `RaftService::AdvanceClock(shard_id, target_hlc)` RPC lets the cross-shard scan coordinator ask a lagging shard's leader to propose a `KvCommand::ClockTick` on demand. Default reads serve at `min(applied_frontier across shards)` with zero wait; only opt-in "fresh" reads pay the cost of one Raft commit on lagging shards. No log noise on idle clusters.
 
 **Determinism for DST**: `HybridClock` takes an injectable `NowFn` (already exists in `ggap-types`). Simulation tests pass a controlled clock; production uses `tokio::time` (which respects `start_paused`) wrapped to nanos. We never call `std::time::Instant` directly.
 
@@ -518,13 +518,13 @@ Each increment is sized to one PR. Every increment ends in a green `cargo fmt &&
 **Goal**: HLC starts being the single source of truth for "when did this commit happen", but the public-facing `version` field still uses `log_id.index`. This isolates the storage migration from the API migration.
 
 **Files**:
-- `crates/ggap-types/src/lib.rs` — add `KvCommand::ClockTick { hlc: u64 }`; extend every other `KvCommand` variant with no fields (the HLC isn't carried in the command, it's stamped at apply time on the leader).
-- `crates/ggap-consensus/src/node.rs` — `propose` calls `clock.now()` and passes it into `apply` via a side channel (an `Arc<HybridClock>` already shared with the FSM); the leader's `now()` becomes the entry's `commit_hlc` for that shard.
-- `crates/ggap-consensus/src/state_machine.rs` — `apply` receives `commit_hlc` (added to the FSM `apply` signature), calls `clock.observe(commit_hlc)`, and threads it into `FjallStateMachine::apply`.
-- `crates/ggap-storage/src/fjall.rs` — `KvEntry` gains `commit_hlc: u64` (default 0 to keep existing on-disk records readable). New writes populate it. `apply` persists per-shard `applied_hlc_frontier` in the `meta` keyspace alongside `last_applied`.
+- `crates/ggap-types/src/lib.rs` — add `propose_hlc: u64` field to `Put`, `Delete`, `Cas`, `Split`; add new variant `KvCommand::ClockTick { hlc: u64 }` (used by on-demand AdvanceClock in 7.5).
+- `crates/ggap-consensus/src/node.rs` — `propose` calls `clock.now()`, captures `propose_hlc`, sets it on the command, then calls `client_write`. `propose_hlc` travels through Raft as a floor hint.
+- `crates/ggap-consensus/src/state_machine.rs` — `apply` computes `commit_hlc = max(cmd.propose_hlc, self.applied_hlc.successor())`, updates `self.applied_hlc = commit_hlc`, calls `clock.observe(commit_hlc)`, threads `commit_hlc` into `FjallStateMachine::apply`. Returns `commit_hlc` as part of `KvResponse::Written { commit_hlc }` (flows back to caller via `ClientWriteResponse.data`).
+- `crates/ggap-storage/src/fjall.rs` — `KvEntry` gains `commit_hlc: u64` (default 0 on old records). `apply` persists per-shard `applied_hlc_frontier` in the `meta` keyspace alongside `last_applied`.
 - `crates/ggap-storage/src/keys.rs` — add `applied_hlc_key(shard_id) -> Vec<u8>`.
 
-**Decision: leader-only HLC stamping.** Followers don't re-tick on apply; they observe the leader's stamp. This guarantees byte-identical apply on every replica (deterministic state machine). The leader picks `commit_hlc` *before* `client_write`; if the proposing node loses leadership, openraft drops the proposal and the next leader re-proposes with its own (necessarily-later) HLC.
+**Decision: apply-time `commit_hlc` assignment.** `propose_hlc` is a floor; `commit_hlc` is computed in the serial apply path as `max(propose_hlc, applied_hlc.successor())`. This guarantees `commit_hlc` is strictly monotonic with apply order on every replica — regardless of how concurrent proposes are ordered by the Raft log. Followers compute the same `commit_hlc` deterministically (pure function of entry payload + replica's `applied_hlc`). The `commit_hlc` is returned to the writer and can be echoed by clients as `observed_hlc` for read-your-writes. This design is also forward-compatible with Phase 8 multi-shard transactions, which will supply an explicit `prepare_ts` floor via `KvCommand::PreparedPut`.
 
 **Tests**:
 - Extend `FjallStateMachine` apply tests: write three keys, assert `commit_hlc` strictly monotonic.
@@ -577,25 +577,29 @@ Each increment is sized to one PR. Every increment ends in a green `cargo fmt &&
 
 ---
 
-#### 7.5 — Read-wait barrier and idle-shard heartbeat
+#### 7.5 — Read-wait barrier and on-demand `AdvanceClock`
 
-**Goal**: a shard can serve "as of T" only after applying everything ≤ T. An idle shard mustn't make readers wait forever.
+**Goal**: a shard can serve "as of T" only after applying everything ≤ T. Default reads serve at `min(applied_frontier)` with **zero wait**. Opt-in "fresh" reads pay at most one Raft commit on any lagging shard — no periodic background ticking, no log noise on idle clusters.
+
+**Two read modes**:
+- **Default** (`snapshot_hlc` not set): coordinator picks `T = min(applied_frontier across involved shards)` — served immediately, no wait.
+- **Fresh** (`fresh: true` or explicit `snapshot_hlc`): coordinator picks `T = clock.now()` at the receiving node; for each shard with `applied_frontier < T`, issues `RaftService::AdvanceClock(shard_id, T)` to that shard's leader (on-demand, not periodic).
 
 **Files**:
-- `crates/ggap-consensus/src/clock.rs` — flesh out `wait_until_applied`: tokio notify, registered when `target > applied_frontier`, fired when `apply` advances the frontier past any waiter.
-- `crates/ggap-consensus/src/state_machine.rs` — `apply` calls `clock.set_applied(commit_hlc)` after persisting `applied_hlc_frontier`, which wakes waiters.
-- `crates/ggap-consensus/src/idle_tick.rs` (new) — background task per shard: if `clock.now() - applied_frontier > config.idle_tick_ms` and this node is leader, propose `KvCommand::ClockTick { hlc: clock.now() }`. Apply path simply advances the frontier; no data side effects.
-- `crates/ggap-consensus/src/state_machine.rs` — handle `KvCommand::ClockTick` (no-op except frontier advance).
-- `crates/ggap-server/src/raft_service.rs` — implement `WaitApplied` RPC by calling `clock.wait_until_applied`.
-- `config/default.toml` — add `[consistency] idle_tick_ms = 250`.
+- `crates/ggap-consensus/src/clock.rs` — flesh out `wait_until_applied`: `tokio::sync::watch`-based waker; registered when `target > applied_frontier`, fired when `advance_applied(commit_hlc)` is called from apply.
+- `crates/ggap-consensus/src/state_machine.rs` — `apply` calls `clock.advance_applied(commit_hlc)` after persisting `applied_hlc_frontier`, waking any waiters. Handle `KvCommand::ClockTick { hlc }`: apply just calls `advance_applied(max(applied_hlc, hlc))`, no storage write.
+- `proto/ginnungagap/v1/cluster.proto` — add `AdvanceClock(AdvanceClockRequest) -> AdvanceClockResponse` to `RaftService`. Request carries `shard_id` and `target_hlc`; response carries resulting `applied_frontier`.
+- `crates/ggap-server/src/raft_service.rs` — implement `AdvanceClock`: if `applied_frontier ≥ target_hlc`, return immediately; else if leader, propose `ClockTick { hlc: target_hlc }` and await `wait_until_applied(target_hlc)`; else return `NotLeader`.
+- `crates/ggap-server/src/raft_service.rs` — implement `WaitApplied` RPC (used by scan coordinator for remote shards that are already at T, just need to confirm).
 
 **Tests**:
-- `wait_until_applied_quiet_shard`: 3-node cluster, no writes for 2 idle-tick periods, then a remote `WaitApplied(target = clock.now())` returns within one tick.
-- `wait_until_applied_busy_shard`: with writes flowing, target = mid-write HLC; assert wait returns once that exact HLC has applied.
+- `default_read_zero_wait`: idle 3-shard cluster, default read completes instantly (no Raft propose fired).
+- `fresh_read_advances_idle_shard`: fresh read against idle shard — exactly one `ClockTick` propose fires, read completes within one Raft commit.
+- `wait_until_applied_busy_shard`: writes flowing, target = mid-write HLC; wait returns once that HLC has applied.
 - `wait_until_applied_timeout`: target far in the future, deadline 100ms; returns `timed_out = true`.
-- DST: idle-tick under partitioned leader (no quorum) — assert no infinite loop, no spurious commits.
+- DST: `AdvanceClock` to a partitioned leader returns `NotLeader`; coordinator retries against new leader after election.
 
-**Done when**: a shard can be asked "are you caught up to T?" and answer correctly, even if it's been idle.
+**Done when**: default reads are zero-latency; fresh reads on idle shards pay ≤ one Raft commit; no periodic ClockTick entries appear in a quiescent cluster's log.
 
 ---
 
@@ -726,13 +730,13 @@ A passing run of all three families is the Phase 7 acceptance bar.
 | Risk | Mitigation | Status |
 |------|------------|--------|
 | HLC clock skew between physical machines exceeds `max_skew_ms` and a `ConsistentScan` returns "future" timestamp errors | `max_skew_ms` configurable; default 500ms; document NTP requirement; metric `hlc_skew_observed_ms` | accepted, documented |
-| Idle-tick proposes a `ClockTick` while the leader is partitioned, log fills with no-ops once it rejoins | Idle-tick only runs while `is_leader && lease_valid`; ticks are dedup'd by checking `applied_frontier` first | mitigated in 7.5 |
+| `AdvanceClock` to a partitioned leader goes unanswered | Coordinator uses `deadline_ms`; on timeout, retries against new leader after election. Same failure mode as any write. | mitigated in 7.5 |
 | Storage format change in 7.3 breaks restart for nodes that have written under earlier phases | We have no production data; bump `STORAGE_FORMAT_VERSION` and refuse mixed-version directories with a clear error | accepted |
 | `ConsistentScan` mid-scan split forces full-scan retry — bad for very large scans | Phase 7 ships the simple "abort + retry from `last_key`" path; Phase 8 can add per-shard cursor stitching if needed | accepted |
 | Watch events now carry both `raft_index` and `commit_hlc`; clients keying on one or the other may break | Both fields exist; document that `commit_hlc` is the cross-shard ordering field, `raft_index` is per-shard. Client SDK guidance updated | accepted |
-| HLC stamped before `client_write` — if the proposal is rejected and re-proposed under a new leader, the original HLC is wasted | Wasted HLCs are fine (HLC is monotonic, gaps are allowed). Observed value is non-issue. | accepted |
-| Read-wait deadlocks if a remote `WaitApplied` RPC is itself routed through a stalled shard | `WaitApplied` is a non-Raft RPC: it only reads the local clock, never proposes. No deadlock possible. | by design |
-| `KvCommand::ClockTick` makes the Raft log grow under low write load | Tick interval is conservative (250ms default); compaction unaffected since ticks are normal log entries | accepted |
+| `commit_hlc` assigned in apply — concurrent proposes can have propose_hlc out of apply order | By design: `commit_hlc = max(propose_hlc, applied_hlc.successor())` in the serial apply path; strictly monotonic regardless of propose ordering. | by design |
+| Read-wait deadlocks if a remote `AdvanceClock` or `WaitApplied` RPC is routed through a stalled shard | Both are non-blocking: `WaitApplied` only reads the local clock; `AdvanceClock` proposes a `ClockTick` no-op. Neither waits on another shard. | by design |
+| `KvCommand::ClockTick` fired on demand could flood a shard under a stampede of fresh reads | Coordinator deduplicates: issues `AdvanceClock` once per shard per scan, then waits. At most one in-flight `ClockTick` per shard per scan. | by design |
 
 **Open questions** (resolve during implementation, not during planning):
 - Should `WaitApplied` be exposed on `RaftService` (internal port) or as a method on `AdminService`? Leaning internal — it's a hot path for cross-shard reads, not an admin op.
