@@ -90,3 +90,56 @@ data:
     grpcurl -plaintext \
       -d "{\"key\":\"${KEY}\"}" \
       "$LEADER" ginnungagap.v1.KvService/Delete
+
+  # Drive continuous random traffic.  Usage: load [qps]   (default: 10)
+  #
+  # Mix: ~10% Put, ~80% linearizable Get, ~10% Delete.
+  # The inter-request sleep is 1/qps seconds; actual throughput may be slightly
+  # lower at high QPS because request latency is not subtracted from the interval.
+  # On any gRPC error the leader is re-resolved automatically before the next op.
+  #
+  # Example — 50 QPS:  load 50
+  load: |
+    #!/bin/sh
+    QPS="${1:-10}"
+    INTERVAL=$(awk "BEGIN{printf \"%.4f\", 1/$QPS}")
+    LEADER=""
+    OPS=0
+    ERRORS=0
+    printf 'load: target=%s QPS  interval=%ss  mix=10%% put / 80%% get / 10%% del\n' \
+      "$QPS" "$INTERVAL"
+    printf 'load: Ctrl-C to stop\n'
+    while true; do
+      if [ -z "$LEADER" ]; then
+        LEADER=$(leader 2>/dev/null)
+        if [ -z "$LEADER" ]; then
+          printf 'load: no leader yet, retrying in 2s ...\n'
+          sleep 2
+          continue
+        fi
+        printf 'load: leader -> %s\n' "$LEADER"
+      fi
+      KEY="load-$(printf '%04x%04x' $RANDOM $RANDOM)"
+      OP=$((RANDOM % 10))
+      if [ "$OP" -eq 0 ]; then
+        VAL_B64=$(printf 'v-%x%x' $RANDOM $RANDOM | base64 | tr -d '\n')
+        grpcurl -plaintext -max-time 3 \
+          -d "{\"key\":\"${KEY}\",\"value\":\"${VAL_B64}\"}" \
+          "$LEADER" ginnungagap.v1.KvService/Put >/dev/null 2>&1 \
+          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
+      elif [ "$OP" -le 8 ]; then
+        grpcurl -plaintext -max-time 3 \
+          -d "{\"key\":\"${KEY}\",\"consistency\":\"LINEARIZABLE\"}" \
+          "$LEADER" ginnungagap.v1.KvService/Get >/dev/null 2>&1 \
+          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
+      else
+        grpcurl -plaintext -max-time 3 \
+          -d "{\"key\":\"${KEY}\"}" \
+          "$LEADER" ginnungagap.v1.KvService/Delete >/dev/null 2>&1 \
+          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
+      fi
+      if [ "$((OPS % 100))" -eq 0 ] && [ "$OPS" -gt 0 ]; then
+        printf 'load: ops=%d errors=%d\n' "$OPS" "$ERRORS"
+      fi
+      sleep "$INTERVAL"
+    done
