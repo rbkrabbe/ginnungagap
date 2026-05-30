@@ -203,3 +203,68 @@ pub enum GgapError {
     #[error("shard not found: {0}")]
     ShardNotFound(ShardId),
 }
+
+// ---------------------------------------------------------------------------
+// Scan continuation token
+// ---------------------------------------------------------------------------
+
+/// Opaque cursor returned in `ScanResponse.next_page_token`. Clients must
+/// pass it back unmodified; the structure is not stable across server
+/// versions. Cross-shard scans hop server-side and encode the next key
+/// (plus a shard hint) here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScanContinuation {
+    /// Inclusive start key for the next page.
+    pub next_key: String,
+    /// Shard the cursor was last positioned in. Informational; the router
+    /// resolves the actual owning shard from `next_key` on each request, so
+    /// this remains correct even if a split changes the boundary.
+    pub shard_id_hint: ShardId,
+}
+
+impl ScanContinuation {
+    pub fn encode(&self) -> Result<Vec<u8>, GgapError> {
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| GgapError::InvalidArgument(format!("encode page_token: {e}")))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, GgapError> {
+        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .map(|(v, _)| v)
+            .map_err(|_| GgapError::InvalidArgument("invalid page_token".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_continuation_roundtrip() {
+        let c = ScanContinuation {
+            next_key: "hello".into(),
+            shard_id_hint: 7,
+        };
+        let bytes = c.encode().unwrap();
+        let back = ScanContinuation::decode(&bytes).unwrap();
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn scan_continuation_roundtrip_empty_key() {
+        let c = ScanContinuation {
+            next_key: String::new(),
+            shard_id_hint: 0,
+        };
+        let bytes = c.encode().unwrap();
+        assert_eq!(ScanContinuation::decode(&bytes).unwrap(), c);
+    }
+
+    #[test]
+    fn scan_continuation_decode_rejects_garbage() {
+        // A short prefix that's nowhere near a valid bincode-serialized
+        // ScanContinuation should be rejected as InvalidArgument.
+        let err = ScanContinuation::decode(b"\xff\xff\xff").unwrap_err();
+        assert!(matches!(err, GgapError::InvalidArgument(_)));
+    }
+}

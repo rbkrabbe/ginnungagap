@@ -115,6 +115,22 @@ impl ShardMap {
         self.shards.read().await.values().cloned().collect()
     }
 
+    /// Return the shard whose `range.start` is strictly greater than `key`,
+    /// i.e. the shard that begins after `key`. Returns `None` if no shard
+    /// starts after `key` (i.e. `key` is at or past the last shard's start).
+    ///
+    /// Used to advance a cross-shard scan cursor when one shard is exhausted
+    /// and the scan still has range remaining. O(N) over shards; fine at the
+    /// current scale.
+    pub async fn next_shard_after(&self, key: &str) -> Option<ShardInfo> {
+        let shards = self.shards.read().await;
+        shards
+            .values()
+            .filter(|s| s.range.start.as_str() > key)
+            .min_by(|a, b| a.range.start.cmp(&b.range.start))
+            .cloned()
+    }
+
     /// Allocate the next shard_id (max existing + 1).
     pub async fn next_shard_id(&self) -> ShardId {
         let shards = self.shards.read().await;
@@ -227,6 +243,50 @@ mod tests {
         assert_eq!(map.next_shard_id().await, 0);
         map.initialize_default().await.unwrap();
         assert_eq!(map.next_shard_id().await, 1);
+    }
+
+    #[tokio::test]
+    async fn next_shard_after_empty_map_returns_none() {
+        let (_dir, store) = open_store();
+        let map = ShardMap::load(store).unwrap();
+        assert!(map.next_shard_after("anything").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn next_shard_after_traversal() {
+        let (_dir, store) = open_store();
+        let map = ShardMap::load(store).unwrap();
+
+        // Three shards: ["", "m"), ["m", "s"), ["s", "")
+        for (id, start, end) in [(0u64, "", "m"), (1, "m", "s"), (2, "s", "")] {
+            map.put_shard(ShardInfo {
+                shard_id: id,
+                range: KeyRange {
+                    start: start.into(),
+                    end: end.into(),
+                },
+                state: ShardState::Active,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Key before the first shard's start ("") still returns the first
+        // shard whose start is strictly > key. Only shards with start > ""
+        // are eligible — so we get shard 1 (start "m").
+        let s = map.next_shard_after("").await.unwrap();
+        assert_eq!(s.shard_id, 1);
+
+        // Key inside shard 0 → next shard is shard 1.
+        let s = map.next_shard_after("a").await.unwrap();
+        assert_eq!(s.shard_id, 1);
+
+        // Key inside shard 1 → next shard is shard 2.
+        let s = map.next_shard_after("n").await.unwrap();
+        assert_eq!(s.shard_id, 2);
+
+        // Key inside shard 2 → no following shard.
+        assert!(map.next_shard_after("zebra").await.is_none());
     }
 
     #[test]

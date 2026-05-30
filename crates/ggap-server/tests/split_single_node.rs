@@ -356,14 +356,14 @@ async fn scan_within_shard_works_after_split() {
     s.split_coordinator.split(0, "m").await.unwrap();
 
     // Scan within shard 0 (keys < "m").
-    let node0 = s.router.route_scan("a", "m").await.unwrap();
+    let node0 = s.router.route_scan("a").await.unwrap();
     assert_eq!(node0.shard_id(), 0);
     let (entries, _) = node0.scan("a", "m", 100, ReadMode::Eventual).await.unwrap();
     let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
     assert_eq!(keys, vec!["a", "b", "c"]);
 
     // Scan within shard 1 (keys >= "m").
-    let node1 = s.router.route_scan("m", "").await.unwrap();
+    let node1 = s.router.route_scan("m").await.unwrap();
     assert_eq!(node1.shard_id(), 1);
     let (entries, _) = node1.scan("m", "", 100, ReadMode::Eventual).await.unwrap();
     let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();

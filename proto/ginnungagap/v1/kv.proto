@@ -51,6 +51,9 @@ message ScanRequest {
   string start_key = 1;
   string end_key = 2;
   uint32 limit = 3;
+  // Opaque server-issued cursor. Pass back unmodified to fetch the next
+  // page. Format is not stable across server versions and is NOT a UTF-8
+  // key — clients must treat it as opaque bytes. Empty on the first page.
   bytes page_token = 4;
   ReadConsistency consistency = 5;
 }
