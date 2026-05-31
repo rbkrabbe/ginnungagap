@@ -38,6 +38,9 @@ message ClusterStatusResponse {
 
 message AddLearnerRequest {
   NodeInfo node = 1;
+  // Which shard's Raft group to add the learner to. Defaults to 0
+  // (preserves previous behavior); required to be meaningful post multi-raft.
+  optional uint64 shard_id = 2;
 }
 
 message AddLearnerResponse {
@@ -47,6 +50,9 @@ message AddLearnerResponse {
 
 message ChangeMembershipRequest {
   repeated uint64 node_ids = 1;
+  // Which shard's Raft group to reconfigure. Defaults to 0 (preserves
+  // previous behavior); required to be meaningful post multi-raft.
+  optional uint64 shard_id = 2;
 }
 
 message ChangeMembershipResponse {

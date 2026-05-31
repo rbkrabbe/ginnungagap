@@ -294,6 +294,7 @@ async fn all_services_emit_rpc_server_call_duration_metrics() {
                 client_addr: String::new(),
                 cluster_addr: "127.0.0.1:1".into(),
             }),
+            shard_id: None,
         })
         .await
         .unwrap_err();

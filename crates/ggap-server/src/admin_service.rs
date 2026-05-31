@@ -77,7 +77,7 @@ impl AdminServiceImpl {
             return Err(Status::invalid_argument("cluster_addr must not be empty"));
         }
 
-        let raft_node = self.node_for_shard(0).await?;
+        let raft_node = self.node_for_shard(req.shard_id.unwrap_or(0)).await?;
         match raft_node
             .add_learner(node_info.node_id, node_info.cluster_addr)
             .await
@@ -109,8 +109,9 @@ impl AdminServiceImpl {
             ));
         }
 
+        let shard_id = req.shard_id.unwrap_or(0);
         let node_ids: BTreeSet<u64> = req.node_ids.into_iter().collect();
-        let raft_node = self.node_for_shard(0).await?;
+        let raft_node = self.node_for_shard(shard_id).await?;
         match raft_node.change_membership(node_ids).await {
             Ok(()) => Ok(Response::new(ChangeMembershipResponse {
                 ok: true,
