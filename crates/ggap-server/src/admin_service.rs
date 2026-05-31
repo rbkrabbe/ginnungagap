@@ -33,21 +33,19 @@ impl AdminServiceImpl {
         }
     }
 
-    /// Look up the `OpenRaftNode` for shard 0 (the default shard in Phases 1–6).
-    ///
-    /// Admin operations target shard 0 because multi-raft (Phase 7) is deferred.
-    async fn shard0_node(&self) -> Result<Arc<OpenRaftNode>, Status> {
+    async fn node_for_shard(&self, shard_id: u64) -> Result<Arc<OpenRaftNode>, Status> {
         self.router
-            .get_node(0)
+            .get_node(shard_id)
             .await
-            .ok_or_else(|| Status::internal("shard 0 not found in router"))
+            .ok_or_else(|| Status::not_found(format!("shard {shard_id} not found in router")))
     }
 
     async fn do_cluster_status(
         &self,
-        _req: ClusterStatusRequest,
+        req: ClusterStatusRequest,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
-        let node = self.shard0_node().await?;
+        let shard_id = req.shard_id.unwrap_or(0);
+        let node = self.node_for_shard(shard_id).await?;
         let status = node.cluster_status();
 
         let to_node_info = |(node_id, cluster_addr): (u64, String)| NodeInfo {
@@ -79,7 +77,7 @@ impl AdminServiceImpl {
             return Err(Status::invalid_argument("cluster_addr must not be empty"));
         }
 
-        let raft_node = self.shard0_node().await?;
+        let raft_node = self.node_for_shard(0).await?;
         match raft_node
             .add_learner(node_info.node_id, node_info.cluster_addr)
             .await
@@ -112,7 +110,7 @@ impl AdminServiceImpl {
         }
 
         let node_ids: BTreeSet<u64> = req.node_ids.into_iter().collect();
-        let raft_node = self.shard0_node().await?;
+        let raft_node = self.node_for_shard(0).await?;
         match raft_node.change_membership(node_ids).await {
             Ok(()) => Ok(Response::new(ChangeMembershipResponse {
                 ok: true,
@@ -166,15 +164,35 @@ impl AdminServiceImpl {
         _req: ListShardsRequest,
     ) -> Result<Response<ListShardsResponse>, Status> {
         let shards = self.shard_map.all_shards().await;
-        let protos = shards
-            .into_iter()
-            .map(|s| ShardInfoProto {
+        let mut protos = Vec::with_capacity(shards.len());
+        for s in shards {
+            let consensus = self
+                .router
+                .get_node(s.shard_id)
+                .await
+                .map(|n| n.cluster_status());
+            let (leader_id, voters, learners, term, last_applied) = match consensus {
+                Some(cs) => (
+                    cs.leader_id,
+                    cs.voters.into_iter().map(|(id, _)| id).collect(),
+                    cs.learners.into_iter().map(|(id, _)| id).collect(),
+                    cs.term,
+                    cs.last_applied,
+                ),
+                None => (None, vec![], vec![], 0, 0),
+            };
+            protos.push(ShardInfoProto {
                 shard_id: s.shard_id,
                 range_start: s.range.start,
                 range_end: s.range.end,
                 state: format!("{:?}", s.state),
-            })
-            .collect();
+                leader_id,
+                voters,
+                learners,
+                term,
+                last_applied,
+            });
+        }
         Ok(Response::new(ListShardsResponse { shards: protos }))
     }
 }

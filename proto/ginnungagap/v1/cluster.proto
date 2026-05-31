@@ -23,7 +23,10 @@ message RaftMessage {
   bytes data = 2;
 }
 
-message ClusterStatusRequest {}
+message ClusterStatusRequest {
+  // Which shard to query. Defaults to 0 (preserves previous behavior).
+  optional uint64 shard_id = 1;
+}
 
 message ClusterStatusResponse {
   repeated NodeInfo nodes = 1;
@@ -69,6 +72,12 @@ message ShardInfoProto {
   string range_start = 2;
   string range_end = 3;
   string state = 4;
+  // Raft consensus fields — populated when the node hosts this shard locally.
+  optional uint64 leader_id = 5;
+  repeated uint64 voters = 6;
+  repeated uint64 learners = 7;
+  uint64 term = 8;
+  uint64 last_applied = 9;
 }
 
 message ListShardsResponse {

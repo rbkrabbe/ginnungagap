@@ -280,7 +280,7 @@ async fn all_services_emit_rpc_server_call_duration_metrics() {
         .await
         .expect("connect to admin service");
     admin
-        .cluster_status(ClusterStatusRequest {})
+        .cluster_status(ClusterStatusRequest { shard_id: None })
         .await
         .expect("cluster_status ok");
     admin
