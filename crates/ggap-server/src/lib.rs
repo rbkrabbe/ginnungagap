@@ -24,6 +24,10 @@ use kv_service::KvServiceImpl;
 use raft_service::RaftServiceImpl;
 use tracing_layer::OtelServerLayer;
 
+// Re-exported so integration tests can construct the service and exercise
+// cross-shard scan hopping without spinning up a real gRPC server.
+pub use kv_service::KvServiceImpl as KvServiceForTesting;
+
 /// Configuration for the client-facing KV service.
 #[derive(Clone, Debug)]
 pub struct KvServiceConfig {

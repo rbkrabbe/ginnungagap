@@ -7,3 +7,4 @@ edition = "2021"
 thiserror = { workspace = true }
 serde = { workspace = true }
 bytes = { workspace = true }
+bincode = { workspace = true }

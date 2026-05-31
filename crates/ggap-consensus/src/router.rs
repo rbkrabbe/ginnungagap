@@ -85,13 +85,15 @@ impl ShardRouter {
             })
     }
 
-    /// Look up the RaftNode for a scan operation.
-    /// For correctness, the entire scan range must be within a single shard.
-    pub async fn route_scan(
-        &self,
-        start_key: &str,
-        end_key: &str,
-    ) -> Result<Arc<OpenRaftNode>, GgapError> {
+    /// Look up the RaftNode that owns `start_key`.
+    ///
+    /// Cross-shard scans are allowed: the service layer is responsible for
+    /// bounding each per-shard scan call to the owning shard's `range.end`
+    /// and advancing the cursor across shards via continuation tokens.
+    /// `Splitting` shards still serve scans — a cursor that lands in a
+    /// post-split child shard on the next RPC is routed naturally by
+    /// `lookup_shard(next_key)`.
+    pub async fn route_scan(&self, start_key: &str) -> Result<Arc<OpenRaftNode>, GgapError> {
         let info = self
             .shard_map
             .lookup_shard(start_key)
@@ -99,17 +101,6 @@ impl ShardRouter {
             .ok_or_else(|| {
                 GgapError::InvalidArgument(format!("no shard found for key '{start_key}'"))
             })?;
-
-        // If end_key is specified and falls outside this shard's range, reject
-        if !end_key.is_empty() && !info.range.contains(end_key) {
-            // Check that end_key is at most the shard boundary
-            // (end_key == shard.range.end is acceptable as an exclusive bound)
-            if !info.range.end.is_empty() && end_key > info.range.end.as_str() {
-                return Err(GgapError::InvalidArgument(
-                    "scan range spans multiple shards".into(),
-                ));
-            }
-        }
 
         let nodes = self.nodes.read().await;
         nodes
