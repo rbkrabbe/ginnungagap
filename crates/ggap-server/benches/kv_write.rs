@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{kv_service_client::KvServiceClient, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
@@ -92,11 +93,12 @@ async fn start_node(id: u64) -> BenchNode {
 
     let mut handles = Vec::new();
 
+    let registry = Arc::new(ShardRegistry::new(id, [(id, cluster_addr.to_string())]));
     let r = router.clone();
     let sc = split_coordinator.clone();
     let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2).await {
+        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry).await {
             eprintln!("node {id} cluster: {e}");
         }
     }));

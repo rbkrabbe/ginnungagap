@@ -31,7 +31,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{kv_service_client::KvServiceClient, GetRequest, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
@@ -133,12 +134,13 @@ async fn start_single_node() -> TestNode {
         shard_map: shard_map.clone(),
     }));
 
+    let registry = Arc::new(ShardRegistry::new(1, [(1, cluster_addr.to_string())]));
     let mut handles = Vec::new();
     let r = router.clone();
     let sc = split_coordinator;
     let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        let _ = serve_cluster_with_listener(cluster_listener, r, sc, sm2).await;
+        let _ = serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry).await;
     }));
     let r2 = router.clone();
     handles.push(tokio::spawn(async move {

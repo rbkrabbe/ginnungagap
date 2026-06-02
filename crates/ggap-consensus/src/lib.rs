@@ -1,9 +1,11 @@
 pub mod config;
 pub mod convert;
+pub mod gossip;
 pub mod log_store;
 pub mod metrics_task;
 pub mod network;
 pub mod node;
+pub mod registry;
 pub mod router;
 pub mod split;
 pub mod state_machine;
@@ -22,10 +24,12 @@ use ggap_types::{
 // ---------------------------------------------------------------------------
 
 pub use config::{build_raft_config, GgapTypeConfig};
+pub use gossip::{merge_gossip_state, GossipTask};
 pub use log_store::GgapLogStorage;
 pub use metrics_task::RaftMetricsTask;
 pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, ClusterStatus, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
+pub use registry::{ShardEntry, ShardRegistry};
 pub use router::ShardRouter;
 pub use split::{run_split_handler, SplitCoordinator, SplitCoordinatorConfig};
 pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};

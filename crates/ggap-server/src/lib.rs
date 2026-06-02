@@ -1,5 +1,6 @@
 mod admin_service;
 mod convert;
+mod gossip_service;
 mod kv_service;
 mod metrics;
 mod raft_service;
@@ -11,15 +12,16 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
-use ggap_consensus::{ShardRouter, SplitCoordinator};
+use ggap_consensus::{ShardRegistry, ShardRouter, SplitCoordinator};
 use ggap_proto::v1::{
-    admin_service_server::AdminServiceServer, kv_service_server::KvServiceServer,
-    raft_service_server::RaftServiceServer,
+    admin_service_server::AdminServiceServer, gossip_service_server::GossipServiceServer,
+    kv_service_server::KvServiceServer, raft_service_server::RaftServiceServer,
 };
 use ggap_storage::ShardMap;
 use tonic_reflection::server::Builder as ReflectionBuilder;
 
 use admin_service::AdminServiceImpl;
+use gossip_service::GossipServiceImpl;
 use kv_service::KvServiceImpl;
 use raft_service::RaftServiceImpl;
 use tracing_layer::OtelServerLayer;
@@ -27,6 +29,10 @@ use tracing_layer::OtelServerLayer;
 // Re-exported so integration tests can construct the service and exercise
 // cross-shard scan hopping without spinning up a real gRPC server.
 pub use kv_service::KvServiceImpl as KvServiceForTesting;
+
+// Re-exported so integration tests can query the admin status RPCs in-process
+// (e.g. to assert gossip-derived consensus state for a non-hosted shard).
+pub use admin_service::AdminServiceImpl as AdminServiceForTesting;
 
 /// Configuration for the client-facing KV service.
 #[derive(Clone, Debug)]
@@ -111,17 +117,24 @@ pub async fn serve_cluster(
     router: Arc<ShardRouter>,
     split_coordinator: Arc<SplitCoordinator>,
     shard_map: Arc<ShardMap>,
+    registry: Arc<ShardRegistry>,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
     tracing::info!(%addr, "cluster gRPC server starting");
-    let admin = AdminServiceImpl::new(router.clone(), split_coordinator, shard_map);
+    let admin = AdminServiceImpl::new(
+        router.clone(),
+        split_coordinator,
+        shard_map,
+        registry.clone(),
+    );
     tonic::transport::Server::builder()
         .layer(OtelServerLayer)
         .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
         .add_service(AdminServiceServer::new(admin))
+        .add_service(GossipServiceServer::new(GossipServiceImpl::new(registry)))
         .add_service(reflection)
         .serve(addr)
         .await
@@ -134,16 +147,23 @@ pub async fn serve_cluster_with_listener(
     router: Arc<ShardRouter>,
     split_coordinator: Arc<SplitCoordinator>,
     shard_map: Arc<ShardMap>,
+    registry: Arc<ShardRegistry>,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
-    let admin = AdminServiceImpl::new(router.clone(), split_coordinator, shard_map);
+    let admin = AdminServiceImpl::new(
+        router.clone(),
+        split_coordinator,
+        shard_map,
+        registry.clone(),
+    );
     tonic::transport::Server::builder()
         .layer(OtelServerLayer)
         .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
         .add_service(AdminServiceServer::new(admin))
+        .add_service(GossipServiceServer::new(GossipServiceImpl::new(registry)))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await

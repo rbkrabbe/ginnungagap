@@ -18,6 +18,15 @@ service AdminService {
   rpc ListShards       (ListShardsRequest)        returns (ListShardsResponse);
 }
 
+// Cluster-wide shard placement/status gossip. Served on the cluster port
+// alongside RaftService and AdminService. Push-pull anti-entropy: a node sends
+// its known view (node directory + per-shard status), the responder merges it
+// and returns its own full view, so every node converges on a coherent
+// (eventually-consistent) global picture without on-demand fan-out.
+service GossipService {
+  rpc Exchange (GossipState) returns (GossipState);
+}
+
 message RaftMessage {
   uint64 shard_id = 1;
   bytes data = 2;
@@ -34,6 +43,12 @@ message ClusterStatusResponse {
   uint64 term = 3;
   uint64 last_applied = 4;
   repeated NodeInfo learners = 5;
+  // Age (ms) of the consensus snapshot from the responding node's view.
+  // 0 means the responder hosts the shard locally (read live). A large value
+  // means the snapshot was learned via gossip and may be stale. Unset means the
+  // shard is known to exist but no consensus snapshot has been observed yet
+  // (distinguishes "no data" from a genuinely leaderless shard).
+  optional uint64 last_observed_age_ms = 6;
 }
 
 message AddLearnerRequest {
@@ -78,14 +93,54 @@ message ShardInfoProto {
   string range_start = 2;
   string range_end = 3;
   string state = 4;
-  // Raft consensus fields — populated when the node hosts this shard locally.
+  // Raft consensus fields. Populated from local openraft metrics when this node
+  // hosts the shard, otherwise from the gossiped shard registry. See
+  // last_observed_age_ms for provenance/freshness.
   optional uint64 leader_id = 5;
   repeated uint64 voters = 6;
   repeated uint64 learners = 7;
   uint64 term = 8;
   uint64 last_applied = 9;
+  // Age (ms) of the consensus snapshot. 0 = hosted locally (live). Larger =
+  // learned via gossip (older = host likely unreachable). Unset = no snapshot
+  // observed yet, so the consensus fields above are absent-of-data, not real
+  // "leaderless / term 0" state.
+  optional uint64 last_observed_age_ms = 10;
 }
 
 message ListShardsResponse {
   repeated ShardInfoProto shards = 1;
+}
+
+// One node's identity plus reachable cluster gRPC address, for transitive peer
+// discovery: a node learns about peers it doesn't directly co-host a shard with
+// by receiving their directory entries through gossip.
+message GossipNode {
+  uint64 node_id = 1;
+  string cluster_addr = 2;
+}
+
+// One shard's placement + lightweight Raft status as known by some origin node.
+// The hosting set is exactly the Raft membership (voters ∪ learners); there is
+// no separate "hosting_node_ids".
+message GossipShardEntry {
+  uint64 shard_id = 1;
+  string range_start = 2;
+  string range_end = 3;
+  string state = 4;
+  optional uint64 leader_id = 5;
+  repeated uint64 voters = 6;
+  repeated uint64 learners = 7;
+  uint64 term = 8;
+  uint64 last_applied = 9;
+  // Conflict-resolution metadata: version is a monotonic heartbeat counter at
+  // the origin node; origin_node_id is the node that produced this record.
+  uint64 version = 10;
+  uint64 origin_node_id = 11;
+}
+
+message GossipState {
+  uint64 sender_node_id = 1;
+  repeated GossipNode directory = 2;
+  repeated GossipShardEntry shards = 3;
 }

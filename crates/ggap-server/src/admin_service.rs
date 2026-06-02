@@ -1,7 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use ggap_consensus::{OpenRaftNode, ShardRouter, SplitCoordinator};
+use ggap_consensus::{OpenRaftNode, ShardEntry, ShardRegistry, ShardRouter, SplitCoordinator};
 use ggap_proto::v1::{
     admin_service_server::AdminService, AddLearnerRequest, AddLearnerResponse,
     ChangeMembershipRequest, ChangeMembershipResponse, ClusterStatusRequest, ClusterStatusResponse,
@@ -18,6 +18,9 @@ pub struct AdminServiceImpl {
     router: Arc<ShardRouter>,
     split_coordinator: Arc<SplitCoordinator>,
     shard_map: Arc<ShardMap>,
+    /// Cluster-wide gossiped view, used to answer status for shards this node
+    /// does not host locally.
+    registry: Arc<ShardRegistry>,
 }
 
 impl AdminServiceImpl {
@@ -25,11 +28,13 @@ impl AdminServiceImpl {
         router: Arc<ShardRouter>,
         split_coordinator: Arc<SplitCoordinator>,
         shard_map: Arc<ShardMap>,
+        registry: Arc<ShardRegistry>,
     ) -> Self {
         AdminServiceImpl {
             router,
             split_coordinator,
             shard_map,
+            registry,
         }
     }
 
@@ -45,8 +50,6 @@ impl AdminServiceImpl {
         req: ClusterStatusRequest,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         let shard_id = req.shard_id.unwrap_or(0);
-        let node = self.node_for_shard(shard_id).await?;
-        let status = node.cluster_status();
 
         let to_node_info = |(node_id, cluster_addr): (u64, String)| NodeInfo {
             node_id,
@@ -54,13 +57,62 @@ impl AdminServiceImpl {
             cluster_addr,
         };
 
-        Ok(Response::new(ClusterStatusResponse {
-            nodes: status.voters.into_iter().map(to_node_info).collect(),
-            leader_id: status.leader_id,
-            term: status.term,
-            last_applied: status.last_applied,
-            learners: status.learners.into_iter().map(to_node_info).collect(),
-        }))
+        // Prefer fresh local openraft metrics when we host the shard.
+        if let Some(node) = self.router.get_node(shard_id).await {
+            let status = node.cluster_status();
+            return Ok(Response::new(ClusterStatusResponse {
+                nodes: status.voters.into_iter().map(to_node_info).collect(),
+                leader_id: status.leader_id,
+                term: status.term,
+                last_applied: status.last_applied,
+                learners: status.learners.into_iter().map(to_node_info).collect(),
+                last_observed_age_ms: Some(0),
+            }));
+        }
+
+        // Otherwise answer from the gossiped registry. A miss is not an error:
+        // return zeroed consensus with `last_observed_age_ms = None` so any
+        // shard is answerable from any node and consumers can tell "no snapshot"
+        // from a real leaderless state.
+        match self.registry.lookup(shard_id).await {
+            Some(entry) => {
+                let age = entry.age_ms();
+                Ok(Response::new(ClusterStatusResponse {
+                    nodes: self.ids_to_node_infos(&entry.voters).await,
+                    leader_id: entry.leader_id,
+                    term: entry.term,
+                    last_applied: entry.last_applied,
+                    learners: self.ids_to_node_infos(&entry.learners).await,
+                    last_observed_age_ms: Some(age),
+                }))
+            }
+            None => Ok(Response::new(ClusterStatusResponse {
+                nodes: vec![],
+                leader_id: None,
+                term: 0,
+                last_applied: 0,
+                learners: vec![],
+                last_observed_age_ms: None,
+            })),
+        }
+    }
+
+    /// Resolve node ids to `NodeInfo`, filling `cluster_addr` from the gossiped
+    /// directory where known (empty otherwise).
+    async fn ids_to_node_infos(&self, ids: &[u64]) -> Vec<NodeInfo> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &node_id in ids {
+            out.push(NodeInfo {
+                node_id,
+                client_addr: String::new(),
+                cluster_addr: self
+                    .registry
+                    .directory_addr(node_id)
+                    .await
+                    .unwrap_or_default(),
+            });
+        }
+        out
     }
 
     async fn do_add_learner(
@@ -164,37 +216,82 @@ impl AdminServiceImpl {
         &self,
         _req: ListShardsRequest,
     ) -> Result<Response<ListShardsResponse>, Status> {
-        let shards = self.shard_map.all_shards().await;
-        let mut protos = Vec::with_capacity(shards.len());
-        for s in shards {
-            let consensus = self
-                .router
-                .get_node(s.shard_id)
-                .await
-                .map(|n| n.cluster_status());
-            let (leader_id, voters, learners, term, last_applied) = match consensus {
-                Some(cs) => (
-                    cs.leader_id,
-                    cs.voters.into_iter().map(|(id, _)| id).collect(),
-                    cs.learners.into_iter().map(|(id, _)| id).collect(),
-                    cs.term,
-                    cs.last_applied,
-                ),
-                None => (None, vec![], vec![], 0, 0),
+        // Authoritative shard list = union of the local shard map and shards we
+        // only know about via gossip. Local shard-map metadata (range/state)
+        // wins where both are present.
+        let mut meta: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
+        for e in self.registry.all().await {
+            meta.entry(e.shard_id)
+                .or_insert((e.range_start, e.range_end, e.state));
+        }
+        for s in self.shard_map.all_shards().await {
+            meta.insert(
+                s.shard_id,
+                (s.range.start, s.range.end, format!("{:?}", s.state)),
+            );
+        }
+
+        let mut protos = Vec::with_capacity(meta.len());
+        for (shard_id, (range_start, range_end, state)) in meta {
+            // Prefer fresh local openraft metrics; fall back to gossip; else
+            // honest zeros with `last_observed_age_ms = None`.
+            let proto = if let Some(node) = self.router.get_node(shard_id).await {
+                let cs = node.cluster_status();
+                ShardInfoProto {
+                    shard_id,
+                    range_start,
+                    range_end,
+                    state,
+                    leader_id: cs.leader_id,
+                    voters: cs.voters.into_iter().map(|(id, _)| id).collect(),
+                    learners: cs.learners.into_iter().map(|(id, _)| id).collect(),
+                    term: cs.term,
+                    last_applied: cs.last_applied,
+                    last_observed_age_ms: Some(0),
+                }
+            } else if let Some(entry) = self.registry.lookup(shard_id).await {
+                entry_to_shard_info(shard_id, range_start, range_end, state, entry)
+            } else {
+                ShardInfoProto {
+                    shard_id,
+                    range_start,
+                    range_end,
+                    state,
+                    leader_id: None,
+                    voters: vec![],
+                    learners: vec![],
+                    term: 0,
+                    last_applied: 0,
+                    last_observed_age_ms: None,
+                }
             };
-            protos.push(ShardInfoProto {
-                shard_id: s.shard_id,
-                range_start: s.range.start,
-                range_end: s.range.end,
-                state: format!("{:?}", s.state),
-                leader_id,
-                voters,
-                learners,
-                term,
-                last_applied,
-            });
+            protos.push(proto);
         }
         Ok(Response::new(ListShardsResponse { shards: protos }))
+    }
+}
+
+/// Build a `ShardInfoProto` from a gossiped registry entry, stamping the
+/// snapshot age so consumers can judge freshness.
+fn entry_to_shard_info(
+    shard_id: u64,
+    range_start: String,
+    range_end: String,
+    state: String,
+    entry: ShardEntry,
+) -> ShardInfoProto {
+    let age = entry.age_ms();
+    ShardInfoProto {
+        shard_id,
+        range_start,
+        range_end,
+        state,
+        leader_id: entry.leader_id,
+        voters: entry.voters,
+        learners: entry.learners,
+        term: entry.term,
+        last_applied: entry.last_applied,
+        last_observed_age_ms: Some(age),
     }
 }
 

@@ -121,4 +121,10 @@ impl ShardRouter {
     pub async fn get_node(&self, shard_id: ShardId) -> Option<Arc<OpenRaftNode>> {
         self.nodes.read().await.get(&shard_id).cloned()
     }
+
+    /// Ids of every shard this node currently hosts (a `RaftNode` is
+    /// registered). Used by the gossip task to publish local shard status.
+    pub async fn local_shard_ids(&self) -> Vec<ShardId> {
+        self.nodes.read().await.keys().copied().collect()
+    }
 }
