@@ -91,47 +91,40 @@ data:
       -d "{\"key\":\"${KEY}\"}" \
       "$LEADER" ginnungagap.v1.KvService/Delete
 
-  # Drive continuous random traffic.  Usage: load [qps]   (default: 10)
+  # Drive constant-rate read-heavy load with ghz.
+  # Usage: load [qps] [duration]   (defaults: 200 QPS, 24h)
   #
-  # Mix: ~10% Put, ~80% linearizable Get, ~10% Delete.
-  # The inter-request sleep is 1/qps seconds; actual throughput may be slightly
-  # lower at high QPS because request latency is not subtracted from the interval.
-  # On any gRPC error the leader is re-resolved automatically before the next op.
+  # Seeds 64 keys (load-0 .. load-63) with a Put, then hammers Get at the
+  # target rate. ghz keeps a worker pool open against the leader, so it sustains
+  # rates the per-call grpcurl loop never could. Each request picks a random
+  # seeded key, so reads hit existing values instead of returning NOT_FOUND.
   #
-  # Example — 50 QPS:  load 50
+  # The keys are unpadded on purpose: ghz unmarshals -d as JSON before
+  # rendering the template, so the template must not contain quotes that would
+  # close the JSON string early. {{randomInt 0 64}} renders a bare integer.
+  #
+  # ghz prints a live report and a summary on exit; Ctrl-C stops it early.
+  # Example — 1000 QPS for 5 minutes:  load 1000 5m
   load: |
     #!/bin/sh
-    QPS="${1:-10}"
-    INTERVAL=$(awk "BEGIN{printf \"%.4f\", 1/$QPS}")
-    LEADER=""
-    OPS=0
-    ERRORS=0
-    printf 'load: %s QPS\n' "$QPS"
-    while true; do
-      if [ -z "$LEADER" ]; then
-        LEADER=$(leader 2>/dev/null) || { sleep 2; continue; }
-      fi
-      KEY="load-$(printf '%03d' $((RANDOM % 64)))"
-      OP=$((RANDOM % 10))
-      if [ "$OP" -eq 0 ]; then
-        VAL_B64=$(printf 'v-%x%x' $RANDOM $RANDOM | base64 | tr -d '\n')
-        grpcurl -plaintext -max-time 3 \
-          -d "{\"key\":\"${KEY}\",\"value\":\"${VAL_B64}\"}" \
-          "$LEADER" ginnungagap.v1.KvService/Put >/dev/null 2>&1 \
-          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
-      elif [ "$OP" -le 8 ]; then
-        grpcurl -plaintext -max-time 3 \
-          -d "{\"key\":\"${KEY}\",\"consistency\":\"LINEARIZABLE\"}" \
-          "$LEADER" ginnungagap.v1.KvService/Get >/dev/null 2>&1 \
-          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
-      else
-        grpcurl -plaintext -max-time 3 \
-          -d "{\"key\":\"${KEY}\"}" \
-          "$LEADER" ginnungagap.v1.KvService/Delete >/dev/null 2>&1 \
-          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
-      fi
-      if [ "$((OPS % 1000))" -eq 0 ] && [ "$OPS" -gt 0 ]; then
-        printf 'load: ops=%d errors=%d\n' "$OPS" "$ERRORS"
-      fi
-      sleep "$INTERVAL"
+    set -eu
+    QPS="${1:-200}"
+    DURATION="${2:-24h}"
+    LEADER=$(leader)
+    echo "load: seeding 64 keys via $LEADER"
+    i=0
+    while [ "$i" -lt 64 ]; do
+      KEY="load-${i}"
+      VAL_B64=$(printf 'seed-%d' "$i" | base64 | tr -d '\n')
+      grpcurl -plaintext \
+        -d "{\"key\":\"${KEY}\",\"value\":\"${VAL_B64}\"}" \
+        "$LEADER" ginnungagap.v1.KvService/Put >/dev/null
+      i=$((i + 1))
     done
+    echo "load: ghz Get @ ${QPS} rps for ${DURATION} -> $LEADER"
+    exec ghz --insecure \
+      --call ginnungagap.v1.KvService/Get \
+      --rps "$QPS" \
+      -z "$DURATION" \
+      -d '{"key":"load-{{randomInt 0 64}}","consistency":"LINEARIZABLE"}' \
+      "$LEADER"

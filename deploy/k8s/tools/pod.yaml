@@ -15,6 +15,33 @@ spec:
       labels:
         app.kubernetes.io/name: ggap-tools
     spec:
+      initContainers:
+        # Fetch the static ghz binary into a shared volume so the tools
+        # container can drive high-QPS load (grpcurl spawns one process per
+        # call and can't sustain ~100 QPS). Arch is detected so this works on
+        # both arm64 and x86_64 Kind nodes.
+        - name: install-ghz
+          image: alpine:3.20
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              apk add --no-cache --quiet ca-certificates
+              case "$(uname -m)" in
+                aarch64|arm64) arch=arm64 ;;
+                x86_64|amd64)  arch=x86_64 ;;
+                *) echo "ghz: unsupported arch $(uname -m)" >&2; exit 1 ;;
+              esac
+              url="https://github.com/bojand/ghz/releases/download/v0.121.0/ghz-linux-${arch}.tar.gz"
+              echo "ghz: downloading $url"
+              wget -qO /tmp/ghz.tar.gz "$url"
+              tar -xzf /tmp/ghz.tar.gz -C /opt/ghz ghz
+              chmod 0755 /opt/ghz/ghz
+              /opt/ghz/ghz --version
+          volumeMounts:
+            - name: ghz-bin
+              mountPath: /opt/ghz
       containers:
         - name: tools
           # Same image as the bootstrap job: grpcurl + Alpine shell.
@@ -22,20 +49,25 @@ spec:
           command: ["sh", "-c", "while true; do sleep 3600; done"]
           env:
             - name: PATH
-              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/scripts
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/scripts:/opt/ghz
           volumeMounts:
             - name: scripts
               mountPath: /scripts
+              readOnly: true
+            - name: ghz-bin
+              mountPath: /opt/ghz
               readOnly: true
           resources:
             requests:
               cpu: 10m
               memory: 16Mi
             limits:
-              cpu: 200m
-              memory: 64Mi
+              cpu: 500m
+              memory: 128Mi
       volumes:
         - name: scripts
           configMap:
             name: ggap-tools-scripts
             defaultMode: 0555
+        - name: ghz-bin
+          emptyDir: {}
