@@ -130,6 +130,14 @@ pub fn init_metrics_recorder(
 
     let (recorder, exporter) = PrometheusBuilder::new()
         .with_http_listener(addr)
+        .set_buckets(&[
+            // 5 steps/decade: 0.1ms – 100ms
+            0.0001, 0.000158, 0.000251, 0.000398, 0.000631, //
+            0.001, 0.00158, 0.00251, 0.00398, 0.00631, //
+            0.01, 0.0158, 0.0251, 0.0398, 0.0631, 0.1, //
+            // 3 steps/decade: 100ms – 5s
+            0.215, 0.464, 1.0, 2.15, 4.64,
+        ])?
         .build()
         .context("failed to build Prometheus exporter")?;
 
