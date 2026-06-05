@@ -119,7 +119,7 @@ data:
         fi
         printf 'load: leader -> %s\n' "$LEADER"
       fi
-      KEY="load-$(printf '%04x%04x' $RANDOM $RANDOM)"
+      KEY="load-$(printf '%03d' $((RANDOM % 64)))"
       OP=$((RANDOM % 10))
       if [ "$OP" -eq 0 ]; then
         VAL_B64=$(printf 'v-%x%x' $RANDOM $RANDOM | base64 | tr -d '\n')
