@@ -94,37 +94,58 @@ data:
   # Drive constant-rate read-heavy load with ghz.
   # Usage: load [qps] [duration]   (defaults: 200 QPS, 24h)
   #
-  # Seeds 64 keys (load-0 .. load-63) with a Put, then hammers Get at the
-  # target rate. ghz keeps a worker pool open against the leader, so it sustains
-  # rates the per-call grpcurl loop never could. Each request picks a random
-  # seeded key, so reads hit existing values instead of returning NOT_FOUND.
+  # Usage: load [qps] [write_pct] [duration]
+  #   qps        total target QPS              (default 200)
+  #   write_pct  percent of ops that are Puts  (default 20, i.e. read-heavy)
+  #   duration   how long to run               (default 24h)
   #
-  # The keys are unpadded on purpose: ghz unmarshals -d as JSON before
-  # rendering the template, so the template must not contain quotes that would
-  # close the JSON string early. {{randomInt 0 64}} renders a bare integer.
+  # Seeds 64 keys (load-0 .. load-63), then runs up to two ghz workers in
+  # parallel over that key space: a Get benchmark at the read rate and a Put
+  # benchmark at the write rate. Reads therefore hit existing values instead of
+  # returning NOT_FOUND. ghz keeps a worker pool open against the leader, so it
+  # sustains rates the per-call grpcurl loop never could.
   #
-  # ghz prints a live report and a summary on exit; Ctrl-C stops it early.
-  # Example — 1000 QPS for 5 minutes:  load 1000 5m
+  # Keys are unpadded on purpose: ghz unmarshals -d as JSON before rendering the
+  # template, so the template must not contain quotes that would close the JSON
+  # string early. {{randomInt 0 64}} renders a bare integer; {{b64enc ...}}
+  # renders a quote-free base64 value for the bytes field.
+  #
+  # ghz prints a report per worker on exit; Ctrl-C stops it early.
+  # Examples:  load 1000 0 5m   # pure read, 1000 rps for 5 min
+  #            load 500 50      # 50/50 read/write at 500 rps
   load: |
     #!/bin/sh
     set -eu
     QPS="${1:-200}"
-    DURATION="${2:-24h}"
+    WRITE_PCT="${2:-20}"
+    DURATION="${3:-24h}"
+    WRITE_QPS=$(( QPS * WRITE_PCT / 100 ))
+    READ_QPS=$(( QPS - WRITE_QPS ))
     LEADER=$(leader)
     echo "load: seeding 64 keys via $LEADER"
     i=0
     while [ "$i" -lt 64 ]; do
-      KEY="load-${i}"
       VAL_B64=$(printf 'seed-%d' "$i" | base64 | tr -d '\n')
       grpcurl -plaintext \
-        -d "{\"key\":\"${KEY}\",\"value\":\"${VAL_B64}\"}" \
+        -d "{\"key\":\"load-${i}\",\"value\":\"${VAL_B64}\"}" \
         "$LEADER" ginnungagap.v1.KvService/Put >/dev/null
       i=$((i + 1))
     done
-    echo "load: ghz Get @ ${QPS} rps for ${DURATION} -> $LEADER"
-    exec ghz --insecure \
-      --call ginnungagap.v1.KvService/Get \
-      --rps "$QPS" \
-      -z "$DURATION" \
-      -d '{"key":"load-{{randomInt 0 64}}","consistency":"LINEARIZABLE"}' \
-      "$LEADER"
+    echo "load: ${QPS} rps for ${DURATION} -> $LEADER  (read=${READ_QPS} write=${WRITE_QPS})"
+    pids=""
+    trap 'kill $pids 2>/dev/null' INT TERM
+    if [ "$READ_QPS" -gt 0 ]; then
+      ghz --insecure --call ginnungagap.v1.KvService/Get \
+        --rps "$READ_QPS" -z "$DURATION" \
+        -d '{"key":"load-{{randomInt 0 64}}","consistency":"LINEARIZABLE"}' \
+        "$LEADER" &
+      pids="$pids $!"
+    fi
+    if [ "$WRITE_QPS" -gt 0 ]; then
+      ghz --insecure --call ginnungagap.v1.KvService/Put \
+        --rps "$WRITE_QPS" -z "$DURATION" \
+        -d '{"key":"load-{{randomInt 0 64}}","value":"{{b64enc (toString (randomInt 0 1000000))}}"}' \
+        "$LEADER" &
+      pids="$pids $!"
+    fi
+    wait $pids
