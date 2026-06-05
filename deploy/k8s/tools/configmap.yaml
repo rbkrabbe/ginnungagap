@@ -106,18 +106,10 @@ data:
     LEADER=""
     OPS=0
     ERRORS=0
-    printf 'load: target=%s QPS  interval=%ss  mix=10%% put / 80%% get / 10%% del\n' \
-      "$QPS" "$INTERVAL"
-    printf 'load: Ctrl-C to stop\n'
+    printf 'load: %s QPS\n' "$QPS"
     while true; do
       if [ -z "$LEADER" ]; then
-        LEADER=$(leader 2>/dev/null)
-        if [ -z "$LEADER" ]; then
-          printf 'load: no leader yet, retrying in 2s ...\n'
-          sleep 2
-          continue
-        fi
-        printf 'load: leader -> %s\n' "$LEADER"
+        LEADER=$(leader 2>/dev/null) || { sleep 2; continue; }
       fi
       KEY="load-$(printf '%03d' $((RANDOM % 64)))"
       OP=$((RANDOM % 10))
@@ -138,7 +130,7 @@ data:
           "$LEADER" ginnungagap.v1.KvService/Delete >/dev/null 2>&1 \
           && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
       fi
-      if [ "$((OPS % 100))" -eq 0 ] && [ "$OPS" -gt 0 ]; then
+      if [ "$((OPS % 1000))" -eq 0 ] && [ "$OPS" -gt 0 ]; then
         printf 'load: ops=%d errors=%d\n' "$OPS" "$ERRORS"
       fi
       sleep "$INTERVAL"
