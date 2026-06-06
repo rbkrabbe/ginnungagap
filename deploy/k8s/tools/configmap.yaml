@@ -91,55 +91,98 @@ data:
       -d "{\"key\":\"${KEY}\"}" \
       "$LEADER" ginnungagap.v1.KvService/Delete
 
-  # Drive continuous random traffic.  Usage: load [qps]   (default: 10)
+  # Drive constant-rate read-heavy load with ghz.
+  # Usage: load [qps] [duration]   (defaults: 200 QPS, 24h)
   #
-  # Mix: ~10% Put, ~80% linearizable Get, ~10% Delete.
-  # The inter-request sleep is 1/qps seconds; actual throughput may be slightly
-  # lower at high QPS because request latency is not subtracted from the interval.
-  # On any gRPC error the leader is re-resolved automatically before the next op.
+  # Usage: load [qps] [write_pct] [duration]
+  #   qps        total target QPS              (default 200)
+  #   write_pct  percent of ops that are Puts  (default 20, i.e. read-heavy)
+  #   duration   how long to run               (default 24h)
   #
-  # Example — 50 QPS:  load 50
+  # Seeds 64 keys (load-0 .. load-63), then runs up to two ghz workers in
+  # parallel over that key space: a Get benchmark at the read rate and a Put
+  # benchmark at the write rate. Reads therefore hit existing values instead of
+  # returning NOT_FOUND. ghz keeps a worker pool open against the leader, so it
+  # sustains rates the per-call grpcurl loop never could.
+  #
+  # ghz holds every request's data in memory for its end-of-run report, so a
+  # single multi-hour run grows without bound and the container gets OOMKilled
+  # (which also surfaces as "fsnotify: too many open files" under memory
+  # pressure). We therefore drive the load in short WINDOW-second bursts and let
+  # each burst's data be freed between runs, keeping memory flat. The leader is
+  # re-resolved every window so the load follows leadership changes.
+  #
+  # Keys are unpadded on purpose: ghz unmarshals -d as JSON before rendering the
+  # template, so the template must not contain quotes that would close the JSON
+  # string early. {{randomInt 0 64}} renders a bare integer; {{b64enc ...}}
+  # renders a quote-free base64 value for the bytes field.
+  #
+  # Ctrl-C stops it early.
+  # Examples:  load 1000 0 5m   # pure read, 1000 rps for 5 min
+  #            load 500 50      # 50/50 read/write at 500 rps
   load: |
     #!/bin/sh
-    QPS="${1:-10}"
-    INTERVAL=$(awk "BEGIN{printf \"%.4f\", 1/$QPS}")
-    LEADER=""
-    OPS=0
-    ERRORS=0
-    printf 'load: target=%s QPS  interval=%ss  mix=10%% put / 80%% get / 10%% del\n' \
-      "$QPS" "$INTERVAL"
-    printf 'load: Ctrl-C to stop\n'
-    while true; do
-      if [ -z "$LEADER" ]; then
-        LEADER=$(leader 2>/dev/null)
-        if [ -z "$LEADER" ]; then
-          printf 'load: no leader yet, retrying in 2s ...\n'
-          sleep 2
-          continue
-        fi
-        printf 'load: leader -> %s\n' "$LEADER"
-      fi
-      KEY="load-$(printf '%04x%04x' $RANDOM $RANDOM)"
-      OP=$((RANDOM % 10))
-      if [ "$OP" -eq 0 ]; then
-        VAL_B64=$(printf 'v-%x%x' $RANDOM $RANDOM | base64 | tr -d '\n')
-        grpcurl -plaintext -max-time 3 \
-          -d "{\"key\":\"${KEY}\",\"value\":\"${VAL_B64}\"}" \
-          "$LEADER" ginnungagap.v1.KvService/Put >/dev/null 2>&1 \
-          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
-      elif [ "$OP" -le 8 ]; then
-        grpcurl -plaintext -max-time 3 \
-          -d "{\"key\":\"${KEY}\",\"consistency\":\"LINEARIZABLE\"}" \
-          "$LEADER" ginnungagap.v1.KvService/Get >/dev/null 2>&1 \
-          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
-      else
-        grpcurl -plaintext -max-time 3 \
-          -d "{\"key\":\"${KEY}\"}" \
-          "$LEADER" ginnungagap.v1.KvService/Delete >/dev/null 2>&1 \
-          && OPS=$((OPS+1)) || { ERRORS=$((ERRORS+1)); LEADER=; }
-      fi
-      if [ "$((OPS % 100))" -eq 0 ] && [ "$OPS" -gt 0 ]; then
-        printf 'load: ops=%d errors=%d\n' "$OPS" "$ERRORS"
-      fi
-      sleep "$INTERVAL"
+    set -eu
+    QPS="${1:-200}"
+    WRITE_PCT="${2:-20}"
+    DURATION="${3:-24h}"
+    WINDOW=30
+    WRITE_QPS=$(( QPS * WRITE_PCT / 100 ))
+    READ_QPS=$(( QPS - WRITE_QPS ))
+
+    # Parse a single-unit Go-style duration (e.g. 24h, 5m, 30s) into seconds.
+    to_secs() {
+      n="${1%[hmsHMS]}"; u="${1#"$n"}"
+      case "$u" in
+        h|H) echo $(( n * 3600 )) ;;
+        m|M) echo $(( n * 60 )) ;;
+        *)   echo "$n" ;;
+      esac
+    }
+    TOTAL=$(to_secs "$DURATION")
+
+    LEADER=$(leader)
+    echo "load: seeding 64 keys via $LEADER"
+    i=0
+    while [ "$i" -lt 64 ]; do
+      VAL_B64=$(printf 'seed-%d' "$i" | base64 | tr -d '\n')
+      grpcurl -plaintext \
+        -d "{\"key\":\"load-${i}\",\"value\":\"${VAL_B64}\"}" \
+        "$LEADER" ginnungagap.v1.KvService/Put >/dev/null
+      i=$((i + 1))
     done
+    echo "load: ${QPS} rps for ${TOTAL}s (read=${READ_QPS} write=${WRITE_QPS}, ${WINDOW}s windows)"
+
+    TMP=/tmp/ghz.$$
+    PIDS=""
+    trap 'kill $PIDS 2>/dev/null; rm -f "$TMP"; exit 0' INT TERM
+    END=$(( $(date +%s) + TOTAL ))
+    while [ "$(date +%s)" -lt "$END" ]; do
+      LEADER=$(leader 2>/dev/null) || { echo "load: leader unavailable, retrying"; sleep 2; continue; }
+      remaining=$(( END - $(date +%s) ))
+      w=$WINDOW
+      [ "$remaining" -lt "$w" ] && w=$remaining
+      : > "$TMP"
+      PIDS=""
+      if [ "$READ_QPS" -gt 0 ]; then
+        ghz --insecure --call ginnungagap.v1.KvService/Get \
+          --rps "$READ_QPS" -z "${w}s" \
+          -d '{"key":"load-{{randomInt 0 64}}","consistency":"LINEARIZABLE"}' \
+          "$LEADER" >> "$TMP" 2>&1 &
+        PIDS="$PIDS $!"
+      fi
+      if [ "$WRITE_QPS" -gt 0 ]; then
+        ghz --insecure --call ginnungagap.v1.KvService/Put \
+          --rps "$WRITE_QPS" -z "${w}s" \
+          -d '{"key":"load-{{randomInt 0 64}}","value":"{{b64enc (toString (randomInt 0 1000000))}}"}' \
+          "$LEADER" >> "$TMP" 2>&1 &
+        PIDS="$PIDS $!"
+      fi
+      wait $PIDS || true
+      # One concise heartbeat: achieved rate(s), plus any non-OK status lines.
+      RATES=$(grep 'Requests/sec' "$TMP" | awk '{printf "%s ", $2}')
+      printf 'load: t=%ss rps=[ %s] left=%ss\n' \
+        "$(( TOTAL - (END - $(date +%s)) ))" "$RATES" "$(( END - $(date +%s) ))"
+      grep -E 'Unavailable|Internal|NotFound|InvalidArgument|DeadlineExceeded|ResourceExhausted' "$TMP" || true
+    done
+    rm -f "$TMP"
