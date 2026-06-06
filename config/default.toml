@@ -22,7 +22,7 @@ watch_broadcast_capacity = 1024
 request_timeout_ms       = 5000
 # Origins allowed for CORS preflight on both gRPC ports.
 # Add the console dev-server origin here; set to [] to disable CORS entirely.
-cors_allowed_origins = ["http://localhost:5173"]
+cors_allowed_origins = ["http://localhost:5173", "http://localhost:8080"]
 
 [observability]
 log_level             = "info"
