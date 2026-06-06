@@ -60,10 +60,12 @@ spec:
           resources:
             requests:
               cpu: 10m
-              memory: 16Mi
+              memory: 32Mi
             limits:
               cpu: 500m
-              memory: 128Mi
+              # ghz buffers per-request data for its report; windowed runs keep
+              # this bounded, but give headroom for high-rate bursts.
+              memory: 256Mi
       volumes:
         - name: scripts
           configMap:
