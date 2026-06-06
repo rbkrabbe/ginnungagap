@@ -319,55 +319,59 @@ async fn all_services_emit_rpc_server_call_duration_metrics() {
 
     // KvService
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/Put", "0"),
+        has(&counts, "ginnungagap.v1.KvService/Put", "OK"),
         "kv Put Ok: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/Get", "0"),
+        has(&counts, "ginnungagap.v1.KvService/Get", "OK"),
         "kv Get Ok: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/Get", "5"),
+        has(&counts, "ginnungagap.v1.KvService/Get", "NOT_FOUND"),
         "kv Get NotFound: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/Put", "3"),
+        has(&counts, "ginnungagap.v1.KvService/Put", "INVALID_ARGUMENT"),
         "kv Put InvalidArgument: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/Put", "10"),
+        has(&counts, "ginnungagap.v1.KvService/Put", "ABORTED"),
         "kv Put Aborted: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/Delete", "0"),
+        has(&counts, "ginnungagap.v1.KvService/Delete", "OK"),
         "kv Delete Ok: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/Scan", "0"),
+        has(&counts, "ginnungagap.v1.KvService/Scan", "OK"),
         "kv Scan Ok: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.KvService/CompareAndSwap", "0"),
+        has(&counts, "ginnungagap.v1.KvService/CompareAndSwap", "OK"),
         "kv Cas Ok: {counts:?}"
     );
 
     // AdminService
     assert!(
-        has(&counts, "ginnungagap.v1.AdminService/ClusterStatus", "0"),
+        has(&counts, "ginnungagap.v1.AdminService/ClusterStatus", "OK"),
         "admin ClusterStatus Ok: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.AdminService/ListShards", "0"),
+        has(&counts, "ginnungagap.v1.AdminService/ListShards", "OK"),
         "admin ListShards Ok: {counts:?}"
     );
     assert!(
-        has(&counts, "ginnungagap.v1.AdminService/AddLearner", "3"),
+        has(
+            &counts,
+            "ginnungagap.v1.AdminService/AddLearner",
+            "INVALID_ARGUMENT"
+        ),
         "admin AddLearner InvalidArgument: {counts:?}"
     );
 
     // RaftService
     assert!(
-        has(&counts, "ginnungagap.v1.RaftService/Vote", "5"),
+        has(&counts, "ginnungagap.v1.RaftService/Vote", "NOT_FOUND"),
         "raft Vote NotFound: {counts:?}"
     );
 
