@@ -21,7 +21,8 @@ use tokio::net::TcpListener;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{
     admin_service_client::AdminServiceClient, kv_service_client::KvServiceClient,
@@ -105,12 +106,13 @@ async fn start_single_node() -> TestNode {
         shard_map: shard_map.clone(),
     }));
 
+    let registry = Arc::new(ShardRegistry::new(1, [(1, cluster_addr.to_string())]));
     let mut handles = Vec::new();
     let r = router.clone();
     let sc = split_coordinator;
     let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        let _ = serve_cluster_with_listener(cluster_listener, r, sc, sm2).await;
+        let _ = serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry).await;
     }));
     let r = router.clone();
     handles.push(tokio::spawn(async move {

@@ -16,17 +16,24 @@ use std::time::Duration;
 use openraft::{BasicNode, ServerState};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 use ggap_consensus::{
     build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator,
-    SplitCoordinatorConfig,
+    GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRegistry,
+    ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
-use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
+use ggap_server::{
+    serve_client_with_listener, serve_cluster_with_listener, AdminServiceForTesting,
+    KvServiceConfig,
+};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
 use ggap_types::{GgapError, KvCommand, KvResponse, ReadMode, WriteMode};
+
+use ggap_proto::v1::admin_service_server::AdminService;
+use ggap_proto::v1::{ClusterStatusRequest, ListShardsRequest, ShardInfoProto};
 
 // ---------------------------------------------------------------------------
 // TestNode — a single in-process Raft node with gRPC servers running
@@ -109,13 +116,30 @@ async fn start_node(id: u64) -> TestNode {
         shard_map: shard_map.clone(),
     }));
 
+    // Cluster registry + fast gossip task (short interval for snappy tests).
+    let registry = Arc::new(ShardRegistry::new(id, [(id, cluster_addr.to_string())]));
+
     let mut handles = Vec::new();
+
+    handles.push(tokio::spawn(
+        GossipTask::new(
+            router.clone(),
+            registry.clone(),
+            id,
+            cluster_addr.to_string(),
+            CancellationToken::new(),
+        )
+        .with_interval(Duration::from_millis(50))
+        .with_rpc_timeout(Duration::from_secs(1))
+        .run(),
+    ));
 
     let r = router.clone();
     let sc = split_coordinator.clone();
     let sm2 = shard_map.clone();
+    let reg = registry.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2).await {
+        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, reg).await {
             eprintln!("node {id} cluster server: {e}");
         }
     }));
@@ -727,4 +751,216 @@ async fn change_membership_on_follower_returns_not_leader() {
     );
 
     cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Gossip / shard-registry tests
+// ---------------------------------------------------------------------------
+
+/// A lightweight node that hosts no shard. It runs only a gossip task (dialing
+/// a seed peer) and exposes an in-process AdminService backed by its registry,
+/// so we can assert it learns remote shard status purely via gossip.
+struct Observer {
+    admin: AdminServiceForTesting,
+    handle: tokio::task::JoinHandle<()>,
+    _tempdir: TempDir,
+}
+
+async fn start_observer(id: u64, seed_id: u64, seed_addr: SocketAddr) -> Observer {
+    let tempdir = TempDir::new().unwrap();
+    let store = FjallStore::open(tempdir.path()).unwrap();
+    // No initialize_default: this node's shard map is empty, so any shard it
+    // reports must have been learned via gossip.
+    let shard_map = Arc::new(ShardMap::load(store).unwrap());
+    let router = Arc::new(ShardRouter::new(shard_map.clone()));
+    let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
+        router: router.clone(),
+        shard_map: shard_map.clone(),
+    }));
+    // Self addr is a dummy (the observer serves nothing and never dials itself);
+    // the seed gives it an entry point into the cluster's gossip directory.
+    let self_addr = format!("127.0.0.1:1{id}");
+    let registry = Arc::new(ShardRegistry::new(
+        id,
+        [(id, self_addr.clone()), (seed_id, seed_addr.to_string())],
+    ));
+    let handle = tokio::spawn(
+        GossipTask::new(
+            router.clone(),
+            registry.clone(),
+            id,
+            self_addr,
+            CancellationToken::new(),
+        )
+        .with_interval(Duration::from_millis(50))
+        .with_rpc_timeout(Duration::from_secs(1))
+        .run(),
+    );
+    let admin = AdminServiceForTesting::new(router, split_coordinator, shard_map, registry);
+    Observer {
+        admin,
+        handle,
+        _tempdir: tempdir,
+    }
+}
+
+async fn list_shard(admin: &AdminServiceForTesting, shard_id: u64) -> Option<ShardInfoProto> {
+    let resp = admin
+        .list_shards(tonic::Request::new(ListShardsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    resp.shards.into_iter().find(|s| s.shard_id == shard_id)
+}
+
+/// A node that does not host a shard can still report that shard's correct
+/// consensus state once gossip converges, and reports an explicit "no snapshot"
+/// marker (age = None) for a shard it has never heard of — distinct from a real
+/// leaderless/zero state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossip_reports_remote_shard_status_from_non_hosting_node() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let leader = &cluster.nodes[leader_idx];
+
+    // A write so last_applied > 0 and there is real consensus state to gossip.
+    let resp = leader
+        .raft
+        .client_write(KvCommand::Put {
+            key: "k".into(),
+            value: b"v".to_vec(),
+            ttl_ns: None,
+            expect_version: 0,
+        })
+        .await
+        .unwrap();
+    cluster.wait_for_all_applied(resp.log_id().index).await;
+    let expected = leader.raft_node.cluster_status();
+
+    // Observer hosts no shard; seed it with the leader's cluster address.
+    let observer = start_observer(99, leader.id, leader.cluster_addr).await;
+
+    // Poll until the observer has learned shard 0 via gossip.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let info = loop {
+        if let Some(info) = list_shard(&observer.admin, 0).await {
+            if info.leader_id.is_some() && info.last_applied >= expected.last_applied {
+                break info;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "observer did not learn shard 0 via gossip"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(
+        info.leader_id,
+        Some(leader.id),
+        "observer should see the real leader"
+    );
+    assert_eq!(
+        info.term, expected.term,
+        "observer should see the real term"
+    );
+    let voters: BTreeSet<u64> = info.voters.iter().copied().collect();
+    assert_eq!(
+        voters,
+        BTreeSet::from([1, 2, 3]),
+        "observer should see all voters"
+    );
+    // Remote data carries a real (gossip-derived) age, not "no snapshot".
+    assert!(
+        info.last_observed_age_ms.is_some(),
+        "remote shard must carry a snapshot age"
+    );
+
+    // ClusterStatus for the remote shard also works (not NotFound).
+    let cs = observer
+        .admin
+        .cluster_status(tonic::Request::new(ClusterStatusRequest {
+            shard_id: Some(0),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(cs.leader_id, Some(leader.id));
+    assert!(cs.last_observed_age_ms.is_some());
+
+    // A shard the observer has never heard of: honest zeros + age = None,
+    // distinguishable from a genuinely leaderless shard (which would carry an age).
+    let unknown = observer
+        .admin
+        .cluster_status(tonic::Request::new(ClusterStatusRequest {
+            shard_id: Some(12345),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(unknown.leader_id, None);
+    assert_eq!(unknown.term, 0);
+    assert_eq!(
+        unknown.last_observed_age_ms, None,
+        "unknown shard must be distinguishable from leaderless"
+    );
+
+    observer.handle.abort();
+    cluster.shutdown().await;
+}
+
+/// When every host of a shard becomes unreachable, a non-hosting node keeps
+/// answering with the last-known consensus state and a growing age, rather than
+/// failing the RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossip_degrades_to_stale_when_hosts_unreachable() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let leader_id = cluster.nodes[leader_idx].id;
+    let leader_addr = cluster.nodes[leader_idx].cluster_addr;
+
+    let observer = start_observer(99, leader_id, leader_addr).await;
+
+    // Converge first.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(info) = list_shard(&observer.admin, 0).await {
+            if info.last_observed_age_ms.is_some() && info.leader_id.is_some() {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "observer never converged on shard 0"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Take the whole cluster down — no host remains reachable.
+    cluster.shutdown().await;
+
+    // The observer must keep answering (Ok) with a growing age rather than
+    // failing the RPC, and must not fabricate fresh state.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = list_shard(&observer.admin, 0)
+            .await
+            .expect("shard 0 should still be listed after hosts go down");
+        assert!(
+            info.last_observed_age_ms.is_some(),
+            "stale entry should still carry an age"
+        );
+        if info.last_observed_age_ms.unwrap() >= 500 {
+            // Still reports the last-known leader (stale, not fabricated/zeroed).
+            assert_eq!(info.leader_id, Some(leader_id));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "snapshot age never grew after all hosts went down"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    observer.handle.abort();
 }

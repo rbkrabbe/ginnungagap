@@ -12,8 +12,8 @@ use serde::Deserialize;
 
 use ggap_consensus::{
     build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, ShardRouter,
-    SplitCoordinator, SplitCoordinatorConfig,
+    GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, ShardRegistry,
+    ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -340,6 +340,24 @@ async fn main() -> anyhow::Result<()> {
         shard_map: shard_map.clone(),
     }));
 
+    // 7b. Cluster-wide shard registry + gossip task. Seeded with self; the node
+    //     directory grows transitively from each shard's Raft membership, so any
+    //     node can report consensus state for shards it does not host locally.
+    let registry = Arc::new(ShardRegistry::new(
+        cli.node_id,
+        [(cli.node_id, cli.cluster_addr.clone())],
+    ));
+    tokio::spawn(
+        GossipTask::new(
+            router.clone(),
+            registry.clone(),
+            cli.node_id,
+            cli.cluster_addr.clone(),
+            shutdown.child_token(),
+        )
+        .run(),
+    );
+
     // 8. Serve with graceful shutdown on SIGINT / SIGTERM.
     let kv_config = KvServiceConfig {
         max_key_bytes: config.storage.max_key_bytes,
@@ -370,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::try_join!(
         serve_client(client_addr, router.clone(), cli.node_id, kv_config),
-        serve_cluster(cluster_addr, router, split_coordinator, shard_map),
+        serve_cluster(cluster_addr, router, split_coordinator, shard_map, registry),
     )?;
 
     trace_guard.shutdown();
