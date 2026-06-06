@@ -1,8 +1,8 @@
 # Ginnungagap on Kind
 
 Local 3-node Ginnungagap cluster with an OpenTelemetry Collector scraping
-Prometheus metrics from every pod, a minimal Prometheus for PromQL, and
-Grafana with a provisioned dashboard.
+Prometheus metrics from every pod, a minimal Prometheus for PromQL,
+Grafana with a provisioned dashboard, and the admin console.
 
 ## Prerequisites
 
@@ -20,17 +20,18 @@ make up
 That runs:
 
 1. `make kind-up` — create a 1 control-plane + 3 worker Kind cluster named `ggap`
-2. `make build` — build the `ggap-node` image and `kind load` it
+2. `make build` — build the `ggap-node` and `ginnungagap-console` images and `kind load` both
 3. `make deploy` — `kubectl apply -k deploy/k8s`
-4. `make wait` — wait for ggap / OTel / Prometheus / Grafana rollouts
+4. `make wait` — wait for ggap / OTel / Prometheus / Grafana / console rollouts
 5. `make bootstrap` — run a Job that forms the 3-voter Raft cluster on shard 0
 
 After it completes:
 
-- Grafana: <http://localhost:3000> (admin / admin). Folder **Ginnungagap**
+- **Console**: <http://localhost:8080> — Shards, Nodes, Membership, KV browser screens
+- **Grafana**: <http://localhost:3000> (admin / admin). Folder **Ginnungagap**
   holds the provisioned **Ginnungagap — Overview** dashboard.
-- ggap client gRPC on `localhost:17000` (NodePort 30700 on the control-plane
-  node, mapped to host port 17000 via Kind `extraPortMappings`).
+- ggap KvService gRPC on `localhost:17000` (NodePort 30700)
+- ggap AdminService gRPC on `localhost:17001` (NodePort 30701)
 
 ## Pipeline
 
@@ -56,8 +57,13 @@ The metrics endpoint on `ggap-node` is `/`, not `/metrics` —
 ```
 make status         # pods
 make logs           # follow ggap-0
+make urls           # print all service URLs
 make reset          # delete StatefulSet + PVCs and redeploy
 make down           # delete the Kind cluster
+
+# Rebuild only the console after frontend changes:
+make build-console
+kubectl -n ginnungagap rollout restart deploy/console
 ```
 
 Try a Put/Get through the NodePort:

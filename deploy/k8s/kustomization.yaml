@@ -8,7 +8,10 @@ resources:
   - tools/pod.yaml
   - ggap/service-headless.yaml
   - ggap/service-client.yaml
+  - ggap/service-admin.yaml
   - ggap/statefulset.yaml
+  - console/deployment.yaml
+  - console/service.yaml
   - otel/rbac.yaml
   - otel/configmap.yaml
   - otel/deployment.yaml

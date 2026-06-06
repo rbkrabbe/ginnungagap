@@ -98,7 +98,9 @@ async fn start_node(id: u64) -> BenchNode {
     let sc = split_coordinator.clone();
     let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry).await {
+        if let Err(e) =
+            serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry, vec![]).await
+        {
             eprintln!("node {id} cluster: {e}");
         }
     }));
@@ -106,7 +108,8 @@ async fn start_node(id: u64) -> BenchNode {
     let r = router.clone();
     handles.push(tokio::spawn(async move {
         if let Err(e) =
-            serve_client_with_listener(client_listener, r, id, KvServiceConfig::default()).await
+            serve_client_with_listener(client_listener, r, id, KvServiceConfig::default(), vec![])
+                .await
         {
             eprintln!("node {id} client: {e}");
         }

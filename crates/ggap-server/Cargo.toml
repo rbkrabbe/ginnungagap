@@ -10,6 +10,8 @@ ggap-storage   = { path = "../ggap-storage" }
 ggap-proto     = { path = "../ggap-proto" }
 tonic             = { workspace = true }
 tonic-reflection  = { workspace = true }
+tonic-web         = { workspace = true }
+tower-http        = { workspace = true }
 tokio          = { workspace = true }
 tokio-stream   = { workspace = true }
 tower          = { workspace = true }
