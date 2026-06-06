@@ -96,7 +96,7 @@ async fn start_watch_node(broadcast_capacity: usize) -> TestNode {
 
     let mut handles = Vec::new();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_client_with_listener(client_listener, r, 1, kv_config).await {
+        if let Err(e) = serve_client_with_listener(client_listener, r, 1, kv_config, vec![]).await {
             eprintln!("client server: {e}");
         }
     }));

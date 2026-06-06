@@ -139,7 +139,8 @@ async fn start_node(id: u64) -> TestNode {
     let sm2 = shard_map.clone();
     let reg = registry.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, reg).await {
+        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, reg, vec![]).await
+        {
             eprintln!("node {id} cluster server: {e}");
         }
     }));
@@ -147,7 +148,8 @@ async fn start_node(id: u64) -> TestNode {
     let r = router.clone();
     handles.push(tokio::spawn(async move {
         if let Err(e) =
-            serve_client_with_listener(client_listener, r, id, KvServiceConfig::default()).await
+            serve_client_with_listener(client_listener, r, id, KvServiceConfig::default(), vec![])
+                .await
         {
             eprintln!("node {id} client server: {e}");
         }

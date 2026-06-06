@@ -140,12 +140,13 @@ async fn start_single_node() -> TestNode {
     let sc = split_coordinator;
     let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        let _ = serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry).await;
+        let _ = serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry, vec![]).await;
     }));
     let r2 = router.clone();
     handles.push(tokio::spawn(async move {
         let _ =
-            serve_client_with_listener(client_listener, r2, 1, KvServiceConfig::default()).await;
+            serve_client_with_listener(client_listener, r2, 1, KvServiceConfig::default(), vec![])
+                .await;
     }));
 
     let members: BTreeMap<u64, BasicNode> = BTreeMap::from([(

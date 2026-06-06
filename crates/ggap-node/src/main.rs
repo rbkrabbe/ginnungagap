@@ -91,6 +91,8 @@ struct ConsistencyConfig {
 struct ServerConfig {
     watch_broadcast_capacity: usize,
     request_timeout_ms: u64,
+    #[serde(default)]
+    cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +158,11 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("invalid metrics_addr: {raw_metrics_addr}"))?,
         )
     };
-    let _metrics_handle = observability::init_metrics_recorder(metrics_addr, shutdown.clone())?;
+    // `_metrics_handle` retains the PrometheusHandle for the lifetime of the
+    // process. Nothing consumes it yet; the Overview screen and a metrics-read
+    // transport will use it in a follow-up.
+    let (_metrics_handle, _metrics_task) =
+        observability::init_metrics_recorder(metrics_addr, shutdown.clone())?;
 
     let client_addr: SocketAddr = cli
         .client_addr
@@ -387,8 +393,21 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tokio::try_join!(
-        serve_client(client_addr, router.clone(), cli.node_id, kv_config),
-        serve_cluster(cluster_addr, router, split_coordinator, shard_map, registry),
+        serve_client(
+            client_addr,
+            router.clone(),
+            cli.node_id,
+            kv_config,
+            config.server.cors_allowed_origins.clone(),
+        ),
+        serve_cluster(
+            cluster_addr,
+            router,
+            split_coordinator,
+            shard_map,
+            registry,
+            config.server.cors_allowed_origins,
+        ),
     )?;
 
     trace_guard.shutdown();

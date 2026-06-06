@@ -9,8 +9,10 @@ mod tracing_layer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use http::{HeaderName, HeaderValue, Method};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tower_http::cors::CorsLayer;
 
 use ggap_consensus::{ShardRegistry, ShardRouter, SplitCoordinator};
 use ggap_proto::v1::{
@@ -58,27 +60,62 @@ impl Default for KvServiceConfig {
     }
 }
 
+/// Build a CORS layer for the given allowed origins.
+///
+/// An empty `origins` list produces a restrictive layer (no origins allowed),
+/// which is fine for the native h2 path where CORS is irrelevant.
+fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    let allow_headers = [
+        HeaderName::from_static("content-type"),
+        HeaderName::from_static("x-grpc-web"),
+        HeaderName::from_static("x-user-agent"),
+        HeaderName::from_static("grpc-timeout"),
+    ];
+    let expose_headers = [
+        HeaderName::from_static("grpc-status"),
+        HeaderName::from_static("grpc-message"),
+        HeaderName::from_static("grpc-status-details-bin"),
+    ];
+
+    let layer = CorsLayer::new()
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers(allow_headers)
+        .expose_headers(expose_headers);
+
+    if origins.is_empty() {
+        return layer;
+    }
+
+    let parsed: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
+
+    layer.allow_origin(parsed)
+}
+
 pub async fn serve_client(
     addr: SocketAddr,
     router: Arc<ShardRouter>,
     node_id: u64,
     config: KvServiceConfig,
+    cors_origins: Vec<String>,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
+    let cors = build_cors_layer(&cors_origins);
     tracing::info!(%addr, "client gRPC server starting");
     tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(KvServiceServer::new(KvServiceImpl::new(
+        .add_service(tonic_web::enable(KvServiceServer::new(KvServiceImpl::new(
             router,
             node_id,
             config.max_key_bytes,
             config.max_value_bytes,
             config.watch_tx,
             config.watch_output_buffer,
-        )))
+        ))))
         .add_service(reflection)
         .serve(addr)
         .await
@@ -91,21 +128,25 @@ pub async fn serve_client_with_listener(
     router: Arc<ShardRouter>,
     node_id: u64,
     config: KvServiceConfig,
+    cors_origins: Vec<String>,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
+    let cors = build_cors_layer(&cors_origins);
     tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(KvServiceServer::new(KvServiceImpl::new(
+        .add_service(tonic_web::enable(KvServiceServer::new(KvServiceImpl::new(
             router,
             node_id,
             config.max_key_bytes,
             config.max_value_bytes,
             config.watch_tx,
             config.watch_output_buffer,
-        )))
+        ))))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await
@@ -118,11 +159,13 @@ pub async fn serve_cluster(
     split_coordinator: Arc<SplitCoordinator>,
     shard_map: Arc<ShardMap>,
     registry: Arc<ShardRegistry>,
+    cors_origins: Vec<String>,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
+    let cors = build_cors_layer(&cors_origins);
     tracing::info!(%addr, "cluster gRPC server starting");
     let admin = AdminServiceImpl::new(
         router.clone(),
@@ -131,10 +174,16 @@ pub async fn serve_cluster(
         registry.clone(),
     );
     tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
-        .add_service(AdminServiceServer::new(admin))
-        .add_service(GossipServiceServer::new(GossipServiceImpl::new(registry)))
+        .add_service(tonic_web::enable(RaftServiceServer::new(
+            RaftServiceImpl::new(router),
+        )))
+        .add_service(tonic_web::enable(AdminServiceServer::new(admin)))
+        .add_service(tonic_web::enable(GossipServiceServer::new(
+            GossipServiceImpl::new(registry),
+        )))
         .add_service(reflection)
         .serve(addr)
         .await
@@ -148,11 +197,13 @@ pub async fn serve_cluster_with_listener(
     split_coordinator: Arc<SplitCoordinator>,
     shard_map: Arc<ShardMap>,
     registry: Arc<ShardRegistry>,
+    cors_origins: Vec<String>,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
+    let cors = build_cors_layer(&cors_origins);
     let admin = AdminServiceImpl::new(
         router.clone(),
         split_coordinator,
@@ -160,10 +211,16 @@ pub async fn serve_cluster_with_listener(
         registry.clone(),
     );
     tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(RaftServiceServer::new(RaftServiceImpl::new(router)))
-        .add_service(AdminServiceServer::new(admin))
-        .add_service(GossipServiceServer::new(GossipServiceImpl::new(registry)))
+        .add_service(tonic_web::enable(RaftServiceServer::new(
+            RaftServiceImpl::new(router),
+        )))
+        .add_service(tonic_web::enable(AdminServiceServer::new(admin)))
+        .add_service(tonic_web::enable(GossipServiceServer::new(
+            GossipServiceImpl::new(registry),
+        )))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await
