@@ -37,15 +37,14 @@ crates/
 
 ## Status
 
-| Phase | Description | Status |
-|---|---|---|
-| 1 | Skeleton — workspace, protos, domain types, CLI + config | Done |
-| 2 | gRPC layer — KvService, RaftService, AdminService with server reflection | Done |
-| 3 | Storage — `MemLogStorage` / `MemStateMachine`, then `Fjall*` impls | Done |
-| 4 | Consensus — real `OpenRaftNode`; swap out `StubRaftNode` | Done |
-| 5 | Advanced — Watch, MVCC reads, snapshots, TTL GC | Pending |
-| 6 | Hardening — chaos tests, metrics, TLS, tracing | Pending |
-| 7 | Multi-raft — shard routing, manual range splitting | Done |
+A working multi-shard, multi-raft KV store: `fjall`-backed shard-prefixed storage with
+MVCC reads and TTL GC, real openraft consensus, per-shard routing via `ShardRouter`,
+manual range splitting, and a shard-aware gRPC surface (Kv + Admin) with Watch, snapshots,
+metrics, and tracing. Deterministic simulation tests cover election, failover, partition,
+message loss, and snapshot catch-up.
+
+Not yet built: a cluster-wide membership/placement view (nodes report Raft status only for
+locally hosted shards) and an automatic placement driver (`ggap-pd`).
 
 ## Multi-Raft Architecture
 

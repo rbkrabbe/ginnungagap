@@ -17,7 +17,7 @@ pub enum LogPayload {
     /// A key-value command to apply to the state machine.
     Normal(KvCommand),
     /// Raw bytes for membership changes and other openraft internals.
-    /// Phase 4 owns the deserialization of this variant.
+    /// The consensus layer (`ggap-consensus`) owns the deserialization of this variant.
     Raw(Vec<u8>),
 }
 

@@ -27,14 +27,14 @@ can introspect the schema at runtime.
 | `Put` | `expect_version = 0` is unconditional; non-zero enforces optimistic concurrency. `ttl_secs = 0` means no TTL. |
 | `Delete` | Always succeeds; `found = false` when the key was already absent. |
 | `Scan` | Keyed pagination via `page_token` (opaque bytes = UTF-8 continuation key). |
-| `Watch` | Bidirectional stream — Phase 5. Currently returns `UNIMPLEMENTED`. |
+| `Watch` | Server-streaming key/prefix change notifications, fed by a broadcast fan-out in the state machine. |
 | `CompareAndSwap` | Value-level swap; returns current value regardless of success. |
 
 **`RaftService`** and **`AdminService`** are exposed on the cluster-facing port
 (default `:17001`) and are not reachable from outside the cluster.
 
 `RaftMessage` carries opaque bytes so the openraft wire format does not bleed
-into the proto schema. Phase 4 is responsible for encoding/decoding.
+into the proto schema. Encoding/decoding happens entirely inside `ggap-consensus`.
 
 ## Versioning invariant
 

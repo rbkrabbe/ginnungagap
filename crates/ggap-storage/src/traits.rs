@@ -10,7 +10,7 @@ use crate::types::{LogEntry, LogState, Snapshot, Vote};
 /// style in `ggap-consensus`. This avoids any `async-trait` dependency.
 ///
 /// `ggap-storage` deliberately does **not** depend on `openraft`. The
-/// openraft adapter shim lives in `ggap-consensus` (Phase 4).
+/// openraft adapter shim lives in `ggap-consensus`.
 pub trait LogStorage: Send + Sync + 'static {
     /// Return first index, last index, and last purged index for the shard.
     fn log_state(

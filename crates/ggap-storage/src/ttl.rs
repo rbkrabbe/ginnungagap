@@ -11,14 +11,13 @@ use crate::keys::ttl_shard_prefix;
 const GC_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Scans the `ttl_index` keyspace for keys that have expired and emits
-/// `KvCommand::Delete` through `cmd_tx`.
-///
-/// **Phase 3 skeleton** — `cmd_tx` is wired to `openraft::Raft::client_write`
-/// in Phase 4. Until then the task is not spawned.
+/// `KvCommand::Delete` through `cmd_tx`. The consumer wires `cmd_tx` to
+/// `openraft::Raft::client_write` so expiry is a replicated command, not a local
+/// side effect.
 pub struct TtlGcTask {
     store: Arc<FjallStateMachine>,
     shard_id: ShardId,
-    /// Consumer wires this to the Raft client_write path in Phase 4.
+    /// Consumer wires this to the Raft `client_write` path.
     cmd_tx: tokio::sync::mpsc::Sender<KvCommand>,
     cancel: CancellationToken,
     now_fn: NowFn,
@@ -114,7 +113,7 @@ impl TtlGcTask {
                         tokio::time::sleep(Duration::from_nanos(wait_ns)).await;
                     }
 
-                    // Route the delete through Raft (Phase 4 wires this).
+                    // Route the delete through Raft so it replicates.
                     // The state machine apply path removes the TTL index entry
                     // atomically with the data deletion, so we do NOT remove it
                     // eagerly here. If Raft rejects the delete, the entry stays
