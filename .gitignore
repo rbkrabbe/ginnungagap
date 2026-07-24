@@ -1,2 +1,6 @@
 /target
 .claude/
+
+.tasks/.claims.json
+.tasks/.claims.lock
+.tasks/.state/

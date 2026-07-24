@@ -1,0 +1,7 @@
+prefix = "tk"
+spec_required_for = ["l"]
+review_required_for = ["m", "l"]
+guarded_globs = ["src/**", "lib/**", "app/**"]
+scope_limit_s = 2
+scope_limit_m = 6
+scope_limit_l = 15

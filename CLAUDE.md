@@ -60,3 +60,30 @@ report Raft status for the shards it hosts locally; `AdminService` "zeroes out" 
 than fabricates) consensus fields for non-hosted shards. Closing this needs a gossip /
 shard-registry layer — see the open issue tracking it. A placement driver (`ggap-pd`) for
 automatic rebalancing is also still future work.
+# Task tracking
+
+All work is tracked in `.tasks/` via the `tk` CLI. This file is loaded into every
+session, so it holds only what is true every time. Procedures live in skills.
+
+- Start work by running `tk ready`, then `tk claim <id>`. Hooks will refuse edits
+  to guarded source paths until a task is claimed.
+- Never invent or guess a task id. Ids come from `tk ready`, `tk list` or `tk new`.
+- A request to build something is not yet a task. Size it first with the
+  **size-the-work** skill, even when it is phrased as small or urgent. If it is
+  days of work rather than hours, use **plan-an-epic** instead.
+- Shared design belongs on the epic, not copied into its children — `tk show`
+  gives a child its epic's design, non-goals, vocabulary and settled decisions.
+  Anything still true after the epic ships belongs in this file instead.
+- When a choice has two defensible answers and outlives the code, it is the
+  human's: `tk ask <id> "<question>" -o "<option — consequence>" -o "..."`. Record
+  their answer with `tk answer`. Do not proceed on an assumption you could check.
+- File work you discover instead of doing it inline:
+  `tk new "title" --discovered-from <current-id>`. Small and specific beats big.
+- Tasks sized `l` need a human-approved spec before they can be claimed. Use the
+  **spec-a-task** skill. You may not run `tk approve-spec` — that is the human's.
+- Tasks sized `m` or `l` need a passing adversarial review before commit. Dispatch
+  the `adversarial-reviewer` subagent, then commit.
+- Commit `.tasks/*.md` in the same commit as the code it describes, so reverting
+  the code reverts the task state with it.
+- If a review comes back `fail`, fix the code. Do not re-run the reviewer hoping
+  for a different verdict.

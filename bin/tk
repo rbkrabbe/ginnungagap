@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""tk — a tiny git-native task tracker for coding agents.
+
+Design notes:
+  * Durable state (status, deps, spec, review verdict) lives in .tasks/<id>.md
+    and is committed to git alongside the code it describes.
+  * Ephemeral state (who is holding a task right now) lives in .tasks/.claims.json
+    which is gitignored. Claims expire, so a crashed agent doesn't wedge the queue.
+  * Every command is designed to emit as few tokens as possible. `tk ready` is
+    the hot path: it is what an agent reads at the start of every task.
+
+Runs on Python 3.8+. No third-party dependencies, no runtime beyond stdlib.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import secrets
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows: no flock. Atomic writes still prevent torn reads,
+    fcntl = None     # but concurrent claims from two agents can race. See claims_lock.
+
+def parse_toml(text: str) -> dict:
+    """Parse the flat TOML subset this tool writes: `key = <json value>`.
+
+    Deliberately not tomllib, which is Python 3.11+ and would put a version floor
+    on a tool whose hooks run via whatever bare `python3` resolves to on the
+    machine. Every value toml_dump emits is valid JSON, so json.loads does the
+    real work and the whole thing runs on 3.8.
+
+    Handles comments, blank lines, and single-quoted strings for hand-edited
+    config files. Anything it can't parse is kept as a bare string rather than
+    raising, so one odd line in config.toml doesn't take down every hook.
+    """
+    out = {}
+    decoder = json.JSONDecoder()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("["):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        try:
+            # raw_decode parses a valid JSON prefix and ignores whatever follows,
+            # so `key = ["a"]  # note` works without guessing where a comment
+            # starts — which naive splitting on '#' gets wrong for values
+            # containing one.
+            out[key] = decoder.raw_decode(val)[0]
+        except ValueError:
+            out[key] = val.split("#", 1)[0].strip().strip("'\"")
+    return out
+
+
+FM = "+++"
+LEASE_SECONDS = 90 * 60
+STATUSES = ("open", "in_progress", "blocked", "review", "done", "dropped")
+SIZES = ("s", "m", "l")
+
+DEFAULT_CONFIG = {
+    "prefix": "tk",
+    # sizes that must have a human-approved spec before they can be claimed
+    "spec_required_for": ["l"],
+    # sizes that must have a passing adversarial review before commit
+    "review_required_for": ["m", "l"],
+    # paths the "claim before you edit" hook enforces on
+    "guarded_globs": ["src/**", "lib/**", "app/**"],
+    # how many files a task of each size may touch before it is declared mis-sized
+    "scope_limit_s": 2,
+    "scope_limit_m": 6,
+    "scope_limit_l": 15,
+}
+
+
+# ---------------------------------------------------------------- storage ---
+
+def repo_root(start: Path | None = None) -> Path:
+    p = (start or Path.cwd()).resolve()
+    for cand in [p, *p.parents]:
+        if (cand / ".tasks").is_dir() or (cand / ".git").is_dir():
+            return cand
+    return p
+
+
+ROOT = repo_root(Path(os.environ.get("CLAUDE_PROJECT_DIR", ".")))
+TASKS = ROOT / ".tasks"
+
+
+def config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    f = TASKS / "config.toml"
+    if f.exists():
+        cfg.update(parse_toml(f.read_text()))
+    return cfg
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def toml_dump(d: dict) -> str:
+    out = []
+    for k, v in d.items():
+        if isinstance(v, bool):
+            out.append(f"{k} = {'true' if v else 'false'}")
+        elif isinstance(v, int):
+            out.append(f"{k} = {v}")
+        elif isinstance(v, list):
+            items = ", ".join(json.dumps(str(x)) for x in v)
+            out.append(f"{k} = [{items}]")
+        else:
+            out.append(f"{k} = {json.dumps(str(v))}")
+    return "\n".join(out)
+
+
+class Task:
+    def __init__(self, meta: dict, body: str, path: Path):
+        self.meta, self.body, self.path = meta, body, path
+
+    @property
+    def id(self) -> str:
+        return self.meta["id"]
+
+    def __getitem__(self, k):
+        return self.meta.get(k)
+
+    def save(self) -> None:
+        self.path.write_text(f"{FM}\n{toml_dump(self.meta)}\n{FM}\n{self.body.lstrip()}")
+
+    @classmethod
+    def load(cls, path: Path) -> "Task":
+        raw = path.read_text()
+        if not raw.startswith(FM):
+            raise SystemExit(f"{path}: missing {FM} frontmatter")
+        _, fm, body = raw.split(FM, 2)
+        return cls(parse_toml(fm), body, path)
+
+
+def all_tasks() -> list[Task]:
+    if not TASKS.is_dir():
+        return []
+    return sorted(
+        (Task.load(p) for p in TASKS.glob("*.md")),
+        key=lambda t: (t["priority"] if t["priority"] is not None else 2, t.id),
+    )
+
+
+def get(task_id: str) -> Task:
+    p = TASKS / f"{task_id}.md"
+    if not p.exists():
+        raise SystemExit(f"no such task: {task_id}")
+    return Task.load(p)
+
+
+# ----------------------------------------------------------------- claims ---
+
+CLAIMS = TASKS / ".claims.json"
+LOCK = TASKS / ".claims.lock"
+
+
+@contextlib.contextmanager
+def claims_lock():
+    """Hold an exclusive lock across a read-modify-write of the claims file.
+
+    Without this, two agents claiming in the same instant both read the same
+    state and the second write silently erases the first — two sessions then
+    believe they hold the same task. flock is released automatically if the
+    process dies, which matters because these are short-lived CLI invocations
+    fired from hooks.
+    """
+    if fcntl is None:
+        yield
+        return
+    TASKS.mkdir(exist_ok=True)
+    with open(LOCK, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def read_claims() -> dict:
+    if not CLAIMS.exists():
+        return {}
+    try:
+        claims = json.loads(CLAIMS.read_text())
+    except json.JSONDecodeError:
+        return {}
+    cutoff = time.time() - LEASE_SECONDS
+    return {k: v for k, v in claims.items() if v["at"] > cutoff}
+
+
+def write_claims(c: dict) -> None:
+    """Write via temp file + rename, so a reader never sees a half-written file
+    and a crash mid-write can't corrupt the claims."""
+    TASKS.mkdir(exist_ok=True)
+    tmp = CLAIMS.with_suffix(f".json.tmp{os.getpid()}")
+    tmp.write_text(json.dumps(c, indent=2))
+    os.replace(tmp, CLAIMS)
+
+
+def session_id() -> str:
+    return os.environ.get("TK_SESSION") or os.environ.get("CLAUDE_SESSION_ID") or "local"
+
+
+def my_claim() -> str | None:
+    me = session_id()
+    for tid, c in read_claims().items():
+        if c["session"] == me:
+            return tid
+    return None
+
+
+# ------------------------------------------------------------ ready logic ---
+
+def is_ready(t: Task, claims: dict) -> bool:
+    if t["status"] not in ("open", "blocked"):
+        return False
+    if t.id in claims and claims[t.id]["session"] != session_id():
+        return False
+    for dep in t["blocked_by"] or []:
+        p = TASKS / f"{dep}.md"
+        if not p.exists() or Task.load(p)["status"] != "done":
+            return False
+    return True
+
+
+# ------------------------------------------------------- open decisions ---
+
+Q_RE = re.compile(r"^### Q(\d+) \[(open|answered[^\]]*)\] (.+)$", re.M)
+
+
+def questions(t: Task) -> list[tuple[int, str, str]]:
+    return [(int(m[1]), m[2], m[3]) for m in Q_RE.finditer(t.body)]
+
+
+def open_questions(t: Task) -> list[tuple[int, str, str]]:
+    return [q for q in questions(t) if q[1] == "open"]
+
+
+def line(t: Task) -> str:
+    flags = ["epic"] if t["kind"] == "epic" else []
+    if n := len(open_questions(t)):
+        flags.append(f"{n}-open-question{'s' if n > 1 else ''}")
+    if t["size"] == "l" and not t["spec_approved"] and not t["spec_skipped"]:
+        flags.append("needs-spec")
+    if t["spec_skipped"]:
+        flags.append("unspecced")
+    if t["review"] == "fail":
+        flags.append("review-failed")
+    suffix = f"  [{','.join(flags)}]" if flags else ""
+    return f"{t.id}  P{t['priority']}  {t['size']}  {t['title']}{suffix}"
+
+
+# --------------------------------------------------------------- commands ---
+
+def cmd_init(a):
+    TASKS.mkdir(exist_ok=True)
+    (TASKS / "config.toml").write_text(toml_dump(DEFAULT_CONFIG) + "\n")
+    gi = ROOT / ".gitignore"
+    if ".tasks/.claims.json" not in (gi.read_text() if gi.exists() else ""):
+        with gi.open("a") as f:
+            f.write("\n.tasks/.claims.json\n.tasks/.claims.lock\n.tasks/.state/\n")
+    print(f"initialised {TASKS}")
+
+
+def cmd_new(a):
+    TASKS.mkdir(exist_ok=True)
+    cfg = config()
+    while True:
+        tid = f"{cfg['prefix']}-{secrets.token_hex(2)}"
+        if not (TASKS / f"{tid}.md").exists():
+            break
+    meta = {
+        "id": tid,
+        "title": a.title,
+        "kind": a.kind,
+        "status": "open",
+        "size": a.size,
+        "priority": a.priority,
+        "blocked_by": a.blocked_by or [],
+        "tags": a.tag or [],
+        "created": now(),
+        "spec_approved": False,
+        "review": "none",
+        "touched": [],
+    }
+    if a.discovered_from:
+        meta["discovered_from"] = a.discovered_from
+    if a.parent:
+        get(a.parent)  # fail loudly rather than creating an orphan
+        meta["parent"] = a.parent
+    if a.kind == "epic":
+        body = ("## Goal\n\n" + (a.body or "_TODO_") + "\n\n## Target design\n\n_TODO_\n\n"
+                "## Non-goals\n\nThings a reader would assume are included but are not.\n\n"
+                "## Vocabulary\n\nDomain terms this epic uses and what they mean here.\n")
+    else:
+        body = "## Context\n\n" + (a.body or "_TODO_") + "\n\n## Acceptance\n\n- [ ] TODO\n"
+    Task(meta, body, TASKS / f"{tid}.md").save()
+    print(tid)
+
+
+def cmd_epic(a):
+    """An epic is where shared design lives. It is size l by definition, so it
+    cannot be claimed without an approved spec — and its children inherit that."""
+    a.size, a.kind, a.parent = "l", "epic", None
+    a.blocked_by, a.tag, a.discovered_from = None, None, None
+    cmd_new(a)
+
+
+def cmd_tree(a):
+    tasks = all_tasks()
+    kids = {}
+    for t in tasks:
+        kids.setdefault(t["parent"], []).append(t)
+    for t in kids.get(None, []):
+        mark = "x" if t["status"] == "done" else " "
+        print(f"[{mark}] {t.id}  {t['title']}")
+        for c in kids.get(t.id, []):
+            cm = "x" if c["status"] == "done" else " "
+            print(f"    [{cm}] {c.id}  {c['status']:<12} {c['title']}")
+
+
+def cmd_ready(a):
+    claims = read_claims()
+    rows = [t for t in all_tasks() if is_ready(t, claims)][: a.n]
+    if a.json:
+        print(json.dumps([{"id": t.id, **t.meta} for t in rows], indent=2))
+        return
+    if not rows:
+        print("no ready work")
+        return
+    print("\n".join(line(t) for t in rows))
+
+
+def cmd_list(a):
+    rows = [t for t in all_tasks() if not a.status or t["status"] == a.status]
+    for t in rows:
+        print(f"{t.id}  {t['status']:<12} P{t['priority']}  {t['title']}")
+
+
+def cmd_show(a):
+    t = get(a.id)
+    print(f"{FM}\n{toml_dump(t.meta)}\n{FM}\n{t.body.strip()}")
+    if not t["parent"]:
+        return
+    # A child task is deliberately terse. What makes it actionable is the design
+    # and the settled decisions from its epic, pulled in here rather than copied
+    # into every child where they would drift.
+    p = get(t["parent"])
+    print(f"\n\n--- inherited from {p.id} ({p['title']}) ---")
+    for section in ("## Target design", "## Non-goals", "## Vocabulary"):
+        if section in p.body:
+            chunk = re.split(r"\n#{2,4} ", p.body.split(section, 1)[1], 1)[0].strip()
+            if chunk and chunk != "_TODO_":
+                print(f"\n{section}\n\n{chunk}")
+    answered = [q for q in questions(p) if q[1] != "open"]
+    if answered:
+        print("\n## Decisions already settled\n")
+        for n, _, text in answered:
+            body_after = p.body.split(f"### Q{n} ", 1)[1]
+            ans = next((l[2:] for l in body_after.splitlines() if l.startswith("> ")), "")
+            print(f"- {text}\n  -> {ans}")
+
+
+def cmd_claim(a):
+    t, cfg = get(a.id), config()
+    with claims_lock():
+        claims = read_claims()
+        holder = claims.get(t.id)
+        if holder and holder["session"] != session_id():
+            raise SystemExit(f"{t.id} is claimed by another session (expires in "
+                             f"{int((holder['at'] + LEASE_SECONDS - time.time()) / 60)}m)")
+        if t["status"] == "done":
+            raise SystemExit(f"{t.id} is already done")
+        for dep in t["blocked_by"] or []:
+            if Task.load(TASKS / f"{dep}.md")["status"] != "done":
+                raise SystemExit(f"{t.id} is blocked by {dep}")
+        if t["parent"]:
+            p = get(t["parent"])
+            if not p["spec_approved"] and not p["spec_skipped"]:
+                raise SystemExit(
+                    f"{t.id} belongs to epic {p.id} ({p['title']}), whose design is not "
+                    f"approved yet. Spec the epic first — that is where the shared "
+                    f"thinking goes, so its children can stay small.")
+            if po := open_questions(p):
+                raise SystemExit(
+                    f"{t.id} belongs to epic {p.id}, which has {len(po)} unanswered "
+                    f"decision(s). Answering them once at the epic settles them for "
+                    f"every child.")
+        if pending := open_questions(t):
+            qs = "\n".join(f"  Q{n}: {text}" for n, _, text in pending)
+            raise SystemExit(
+                f"{t.id} has {len(pending)} unanswered decision(s):\n{qs}\n"
+                f"These are for the human, not for you. Ask them in chat, then record the "
+                f"answer with `tk answer {t.id} <n> \"<choice> — <reason>\"`.")
+        if (t["size"] in cfg["spec_required_for"] and not t["spec_approved"]
+                and not t["spec_skipped"]):
+            raise SystemExit(
+                f"{t.id} is size '{t['size']}' and has no approved spec.\n"
+                f"Use the spec-a-task skill: write the spec into {t.path}, then ask the "
+                f"human to run `tk approve-spec {t.id}` themselves. Do not run it for them.\n"
+                f"If they want to skip speccing, that is theirs to decide: "
+                f"`tk override-spec {t.id}`.")
+        claims[t.id] = {"session": session_id(), "at": time.time(), "cwd": str(Path.cwd())}
+        write_claims(claims)
+    t.meta["status"] = "in_progress"
+    t.save()
+    print(f"claimed {t.id}: {t['title']}")
+
+
+def cmd_release(a):
+    with claims_lock():
+        claims = read_claims()
+        claims.pop(a.id, None)
+        write_claims(claims)
+    t = get(a.id)
+    if t["status"] == "in_progress":
+        t.meta["status"] = "open"
+        t.save()
+    print(f"released {a.id}")
+
+
+def cmd_current(a):
+    tid = my_claim()
+    if not tid:
+        print("no task claimed")
+        return
+    t = get(tid)
+    print(f"{t.id}  {t['status']}  {t['title']}")
+
+
+def cmd_status(a):
+    if a.status not in STATUSES:
+        raise SystemExit(f"status must be one of {STATUSES}")
+    t = get(a.id)
+    t.meta["status"] = a.status
+    t.save()
+    print(f"{t.id} -> {a.status}")
+
+
+def cmd_done(a):
+    t, cfg = get(a.id), config()
+    if t["size"] in cfg["review_required_for"] and t["review"] != "pass":
+        raise SystemExit(f"{t.id} needs a passing adversarial review first "
+                         f"(currently: {t['review']})")
+    t.meta["status"] = "done"
+    t.meta["closed"] = now()
+    t.save()
+    with claims_lock():
+        claims = read_claims()
+        claims.pop(t.id, None)
+        write_claims(claims)
+    print(f"closed {t.id}")
+
+
+def cmd_block(a):
+    t = get(a.id)
+    deps = list(t["blocked_by"] or [])
+    if a.on not in deps:
+        deps.append(a.on)
+    t.meta["blocked_by"] = deps
+    t.save()
+    print(f"{t.id} blocked by {a.on}")
+
+
+def cmd_touch(a):
+    tid = my_claim()
+    if not tid:
+        return
+    t = get(tid)
+    rel = os.path.relpath(a.path, ROOT)
+    touched = list(t["touched"] or [])
+    if rel not in touched:
+        touched.append(rel)
+        t.meta["touched"] = touched
+        t.save()
+
+
+def cmd_ask(a):
+    """File a decision that only the human can make. Blocks the claim until answered."""
+    t = get(a.id)
+    n = max([q[0] for q in questions(t)], default=0) + 1
+    opts = "\n".join(f"- {chr(97 + i)}) {o}" for i, o in enumerate(a.option or []))
+    if len(a.option or []) < 2:
+        raise SystemExit("a decision needs at least two options with their consequences; "
+                         "if there is only one option it is not a decision, just do it")
+    t.body = t.body.rstrip() + (
+        f"\n\n### Q{n} [open] {a.question}\n{opts}\n> unanswered\n")
+    t.save()
+    print(f"{t.id} Q{n} filed — needs a human answer before this task can be claimed")
+
+
+def cmd_answer(a):
+    t = get(a.id)
+    hit = [q for q in questions(t) if q[0] == a.n]
+    if not hit:
+        raise SystemExit(f"{t.id} has no Q{a.n}")
+    if hit[0][1] != "open":
+        raise SystemExit(f"{t.id} Q{a.n} is already answered; file a new question instead "
+                         f"of rewriting the old one")
+    t.body = t.body.replace(f"### Q{a.n} [open]", f"### Q{a.n} [answered {now()}]")
+    t.body = re.sub(rf"(### Q{a.n} \[answered[^\]]*\].*?)\n> unanswered",
+                    rf"\1\n> {a.answer}", t.body, flags=re.S)
+    t.save()
+    print(f"{t.id} Q{a.n} answered ({len(open_questions(t))} still open)")
+
+
+def cmd_size(a):
+    t = get(a.id)
+    old = t["size"]
+    t.meta["size"] = a.size
+    if a.size != old:
+        t.meta["resized_from"] = old
+        if a.size == "l":
+            t.meta["spec_approved"] = False
+    t.save()
+    print(f"{t.id}: {old} -> {a.size}"
+          + ("  (now needs a spec before it can be re-claimed)" if a.size == "l" else ""))
+
+
+def cmd_override_spec(a):
+    """Human-only escape hatch. Skipping the spec does not remove the check, it
+    moves it downstream: an unspecced task always needs an adversarial review."""
+    if not sys.stdin.isatty():
+        raise SystemExit("tk override-spec must be run by a human in an interactive "
+                         "terminal. Agents may not waive their own specs.")
+    t = get(a.id)
+    print(f"{t.id}: {t['title']} (size {t['size']})\n")
+    print("Skipping the spec means: no agreed acceptance criteria, no recorded "
+          "alternatives, and a mandatory adversarial review before commit regardless "
+          "of size.")
+    if input(f"\nProceed unspecced? type the task id ({t.id}) to confirm: ").strip() != t.id:
+        raise SystemExit("not overridden")
+    t.meta["spec_skipped"] = True
+    t.meta["spec_skipped_at"] = now()
+    t.save()
+    print(f"{t.id} will proceed without a spec; review is now mandatory")
+
+
+def cmd_scope(a):
+    """Is the claimed task still the size it claims to be? Used by the scope hook."""
+    tid = a.id or my_claim()
+    if not tid:
+        sys.exit(0)
+    t, cfg = get(tid), config()
+    limit = cfg.get(f"scope_limit_{t['size']}", 99)
+    n = len(t["touched"] or [])
+    if n <= limit:
+        print(f"{t.id} within scope ({n}/{limit} files)")
+        sys.exit(0)
+    print(f"{t.id} is sized '{t['size']}' but has touched {n} files (limit {limit}): "
+          f"{', '.join(t['touched'])}")
+    sys.exit(1)
+
+
+def cmd_edited(a):
+    """Record an edit and report scope in one process.
+
+    Exists purely to collapse what the PostToolUse hook used to do with four
+    separate `tk` invocations. Claude Code blocks on that hook, so every spawn
+    was ~40ms of dead time on every file write. Emits JSON on stdout so the hook
+    stays a thin formatter and this command stays generic.
+    """
+    tid = my_claim()
+    if not tid:
+        sys.exit(0)
+    t, cfg = get(tid), config()
+
+    rel = os.path.relpath(a.path, ROOT)
+    touched = list(t["touched"] or [])
+    if rel not in touched:
+        touched.append(rel)
+        t.meta["touched"] = touched
+        t.save()
+
+    limit = cfg.get(f"scope_limit_{t['size']}", 99)
+    over = len(touched) > limit
+    print(json.dumps({"id": t.id, "size": t["size"], "touched": len(touched),
+                      "limit": limit, "over": over, "files": touched}))
+    sys.exit(1 if over else 0)
+
+
+def cmd_approve_spec(a):
+    """Human-only. The Bash tool has no controlling terminal, so an agent that
+    tries to run this gets refused even if it bypasses the permission deny rule."""
+    if not sys.stdin.isatty():
+        raise SystemExit("tk approve-spec must be run by a human in an interactive "
+                         "terminal. Agents may not approve their own specs.")
+    t = get(a.id)
+    print(f"{t.id}: {t['title']}\n")
+    print(t.body.strip()[:2000])
+    if input(f"\nApprove this spec? type the task id ({t.id}) to confirm: ").strip() != t.id:
+        raise SystemExit("not approved")
+    t.meta["spec_approved"] = True
+    t.meta["spec_approved_at"] = now()
+    t.save()
+    print(f"approved {t.id}")
+
+
+def cmd_review(a):
+    t = get(a.id)
+    t.meta["review"] = "pass" if a.verdict == "pass" else "fail"
+    t.meta["reviewed_at"] = now()
+    t.save()
+    if a.notes:
+        t.body = t.body.rstrip() + f"\n\n## Review {now()} — {t.meta['review']}\n\n{a.notes}\n"
+        t.save()
+    print(f"{t.id} review: {t.meta['review']}")
+
+
+def cmd_gate(a):
+    """Machine-readable pre-commit gate used by the hook. Exit 0 = allow."""
+    tid = my_claim()
+    cfg = config()
+    if not tid:
+        print("no task claimed; run `tk ready` then `tk claim <id>`")
+        sys.exit(1)
+    t = get(tid)
+    if (t["size"] in cfg["spec_required_for"] and not t["spec_approved"]
+            and not t["spec_skipped"]):
+        print(f"{t.id} has no human-approved spec")
+        sys.exit(1)
+    if pending := open_questions(t):
+        print(f"{t.id} has {len(pending)} unanswered decision(s); "
+              f"committing would bake in a guess")
+        sys.exit(1)
+    needs_review = t["size"] in cfg["review_required_for"] or t["spec_skipped"]
+    if needs_review and t["review"] != "pass":
+        why = "it skipped speccing" if t["spec_skipped"] else f"it is size '{t['size']}'"
+        print(f"{t.id} has not passed adversarial review ({why}, review={t['review']})")
+        sys.exit(1)
+    print(f"{t.id} ok")
+
+
+def cmd_doctor(a):
+    ids = {t.id for t in all_tasks()}
+    problems = []
+    for t in all_tasks():
+        for dep in t["blocked_by"] or []:
+            if dep not in ids:
+                problems.append(f"{t.id}: dangling dep {dep}")
+        if t["status"] not in STATUSES:
+            problems.append(f"{t.id}: bad status {t['status']}")
+    # cycle check
+    graph = {t.id: list(t["blocked_by"] or []) for t in all_tasks()}
+    seen, stack = set(), set()
+
+    def visit(n):
+        if n in stack:
+            problems.append(f"cycle at {n}")
+            return
+        if n in seen:
+            return
+        seen.add(n); stack.add(n)
+        for m in graph.get(n, []):
+            visit(m)
+        stack.discard(n)
+
+    for n in graph:
+        visit(n)
+    print("\n".join(problems) if problems else "ok")
+
+
+# ------------------------------------------------------------------- main ---
+
+def main():
+    p = argparse.ArgumentParser(prog="tk")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init").set_defaults(fn=cmd_init)
+
+    n = sub.add_parser("new"); n.set_defaults(fn=cmd_new)
+    n.add_argument("title")
+    n.add_argument("--size", choices=SIZES, default="m")
+    n.add_argument("--priority", type=int, default=2)
+    n.add_argument("--blocked-by", action="append")
+    n.add_argument("--tag", action="append")
+    n.add_argument("--body", default="")
+    n.add_argument("--discovered-from")
+    n.add_argument("--parent", help="epic this task belongs to")
+    n.add_argument("--kind", choices=["task", "epic"], default="task")
+
+    r = sub.add_parser("ready"); r.set_defaults(fn=cmd_ready)
+    r.add_argument("-n", type=int, default=8)
+    r.add_argument("--json", action="store_true")
+
+    ls = sub.add_parser("list"); ls.set_defaults(fn=cmd_list)
+    ls.add_argument("--status")
+
+    for name, fn in (("show", cmd_show), ("claim", cmd_claim), ("release", cmd_release)):
+        s = sub.add_parser(name); s.set_defaults(fn=fn); s.add_argument("id")
+
+    st = sub.add_parser("status"); st.set_defaults(fn=cmd_status)
+    st.add_argument("id"); st.add_argument("status")
+
+    d = sub.add_parser("done"); d.set_defaults(fn=cmd_done); d.add_argument("id")
+
+    b = sub.add_parser("block"); b.set_defaults(fn=cmd_block)
+    b.add_argument("id"); b.add_argument("--on", required=True)
+
+    t = sub.add_parser("touch"); t.set_defaults(fn=cmd_touch); t.add_argument("path")
+
+    ap = sub.add_parser("approve-spec"); ap.set_defaults(fn=cmd_approve_spec)
+    ap.add_argument("id")
+
+    ov = sub.add_parser("override-spec"); ov.set_defaults(fn=cmd_override_spec)
+    ov.add_argument("id")
+
+    q = sub.add_parser("ask"); q.set_defaults(fn=cmd_ask)
+    q.add_argument("id"); q.add_argument("question")
+    q.add_argument("-o", "--option", action="append",
+                   help="an option and its consequence; at least two required")
+
+    an = sub.add_parser("answer"); an.set_defaults(fn=cmd_answer)
+    an.add_argument("id"); an.add_argument("n", type=int); an.add_argument("answer")
+
+    sz = sub.add_parser("size"); sz.set_defaults(fn=cmd_size)
+    sz.add_argument("id"); sz.add_argument("size", choices=SIZES)
+
+    sc = sub.add_parser("scope"); sc.set_defaults(fn=cmd_scope)
+    sc.add_argument("id", nargs="?")
+
+    ed = sub.add_parser("edited"); ed.set_defaults(fn=cmd_edited)
+    ed.add_argument("path")
+
+    ep = sub.add_parser("epic"); ep.set_defaults(fn=cmd_epic)
+    ep.add_argument("title"); ep.add_argument("--body", default="")
+    ep.add_argument("--priority", type=int, default=1)
+
+    sub.add_parser("tree").set_defaults(fn=cmd_tree)
+
+    rv = sub.add_parser("review"); rv.set_defaults(fn=cmd_review)
+    rv.add_argument("id"); rv.add_argument("verdict", choices=["pass", "fail"])
+    rv.add_argument("--notes")
+
+    sub.add_parser("current").set_defaults(fn=cmd_current)
+    sub.add_parser("gate").set_defaults(fn=cmd_gate)
+    sub.add_parser("doctor").set_defaults(fn=cmd_doctor)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
