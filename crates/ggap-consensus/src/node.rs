@@ -101,10 +101,15 @@ impl OpenRaftNode {
         if is_leader && self.lease.lock().await.is_valid(metrics.current_term) {
             return Ok(());
         }
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|e| GgapError::Consensus(e.to_string()))?;
+        self.raft.ensure_linearizable().await.map_err(|e| {
+            if let Some(fwd) = e.forward_to_leader() {
+                let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
+                return GgapError::NotLeader {
+                    leader: leader_addr,
+                };
+            }
+            GgapError::Consensus(e.to_string())
+        })?;
         let term = self.raft.metrics().borrow().current_term;
         self.lease.lock().await.renew(term);
         Ok(())
