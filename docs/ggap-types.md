@@ -7,7 +7,7 @@ Shared domain types imported by every other crate. Has no workspace dependencies
 | Alias | Underlying | Invariant |
 |-------|-----------|-----------|
 | `NodeId` | `u64` | Opaque node identity. 0 is not reserved but not conventionally assigned. |
-| `ShardId` | `u64` | Always `0` in Phases 1–6. Phase 7 (multi-raft) will use non-zero values. All storage keys are prefixed with the shard id regardless. |
+| `ShardId` | `u64` | Multi-shard is live — splits create non-zero shard ids. All storage keys are prefixed with the shard id. |
 
 ## `KvEntry`
 
@@ -67,7 +67,7 @@ it is derived from the state transition at apply time.
 | `VersionConflict` | `expect_version` mismatch. Carries expected and actual values for client diagnostics. |
 | `Timeout` | Operation exceeded the configured deadline. |
 | `Storage(String)` | Unrecoverable I/O or serialization failure. Always fatal to the operation; upper layers should not retry without investigation. |
-| `Consensus(String)` | openraft-level error (Phase 4+). |
+| `Consensus(String)` | openraft-level error surfaced from the consensus layer. |
 | `InvalidArgument(String)` | Bad input caught before touching storage. |
 
 Error types use `thiserror` (never `anyhow`) because `ggap-types` is a library.

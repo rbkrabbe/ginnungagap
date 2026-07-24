@@ -3,15 +3,14 @@
 The persistence layer. Provides two storage traits (`LogStorage`,
 `StateMachineStore`) with in-memory implementations for tests and fjall-backed
 implementations for production. Has no dependency on `openraft`; the adapter
-shim lives in `ggap-consensus` (Phase 4).
+shim lives in `ggap-consensus`.
 
 ## Key encoding (`keys.rs`)
 
 Every storage key starts with `be_u64(shard_id)`. This prefix is **never
-omitted**, even in the single-shard (Phase 1–6) deployment. The prefix makes
-Phase 7 multi-shard additive: a range scan bounded to
-`[shard_prefix, shard_prefix+1)` naturally isolates one shard with no schema
-migration.
+omitted**. Multi-shard is live (splits create shards), and the prefix is what
+isolates them: a range scan bounded to `[shard_prefix, shard_prefix+1)` naturally
+covers exactly one shard.
 
 ### Partition layouts
 
@@ -89,8 +88,8 @@ Each write to a key stores the new `KvEntry` in two places:
    (default 10).
 
 `get(key, at_version=0)` reads from `data`. `get(key, at_version=N)` is a
-point-lookup in `history`. There is no cross-version garbage collection in
-Phase 3; history is compacted only on write and only by count.
+point-lookup in `history`. There is no cross-version garbage collection; history
+is compacted only on write and only by count.
 
 ### History compaction
 
@@ -112,18 +111,19 @@ context switch can interleave with a partial batch.
 
 ## TTL GC (`ttl.rs`)
 
-`TtlGcTask` is a skeleton. The design is:
+`TtlGcTask` runs the expiry loop:
 
 1. Scan `ttl_index` from the shard prefix; take the first entry (earliest
    expiry).
 2. If `expires_at_ns <= now`, send `KvCommand::Delete` via an mpsc channel.
-3. If `expires_at_ns > now`, sleep until then before sending.
+3. If `expires_at_ns > now`, sleep (via `tokio::time`) until then before sending.
 
-The GC task does **not** apply the delete directly — it sends it through the
-Raft proposal channel (wired in Phase 4). This ensures that TTL expiry is a
+The GC task does **not** apply the delete directly — it sends it through the Raft
+proposal channel (`raft.client_write`). This ensures that TTL expiry is a
 replicated operation, not a local side effect that would diverge across nodes.
 The eager removal of the `ttl_index` entry after sending is an optimisation to
 prevent the next poll from re-triggering; the Raft-committed delete will also
 clean up the entry via the normal `Delete` path.
 
-The task is not spawned in `ggap-node` until Phase 4.
+Because it sleeps on `tokio::time`, the task is driveable by the simulation
+harness — never use `std::time` here.

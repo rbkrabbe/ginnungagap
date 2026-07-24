@@ -1,6 +1,6 @@
 # CLAUDE.md — Ginnungagap
 
-Decisions anchored here to avoid re-discussion. Full rationale in PLAN.md.
+Decisions anchored here to avoid re-discussion.
 
 ## Hard Constraints
 
@@ -28,7 +28,7 @@ Decisions anchored here to avoid re-discussion. Full rationale in PLAN.md.
 ggap-proto / ggap-types / ggap-storage / ggap-consensus / ggap-server / ggap-node
 ```
 
-See PLAN.md § Crate Responsibilities for each crate's scope.
+Each crate has a `docs/<crate>.md` describing its scope.
 
 ## Pre-Push Checklist
 
@@ -38,30 +38,25 @@ Before every `git push` or PR creation, run all of the following and fix any err
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets
-cargo test --all
+cargo test --all --quiet
 ```
 
 CI enforces all four checks — a push that skips them will fail.
 
-## Phase Status
+## Current State
 
-Phases 1–6 are **complete**, and Phase 7 (multi-raft) is **mostly done**: storage is
-shard-prefixed, `RaftNode` carries `ShardId`, `ShardRouter` routes per shard, `ShardMap`
-persists shard metadata, `SplitCoordinator` + `run_split_handler` create new shards via
-`KvCommand::Split`, and the admin APIs are shard-aware. Treat multi-shard as a present-day
-reality, not a future feature — design new code to work for any shard, not just `ShardId(0)`.
+The system is a working multi-shard, multi-raft KV store. **Multi-shard is a
+present-day reality, not a future feature** — design new code to work for any shard, not
+just `ShardId(0)`. What exists today:
 
-Phases (all delivered):
-1. Skeleton — workspace, protos, `ggap-types`, CLI + config
-2. gRPC layer — service stubs wired to a `StubRaftNode`; enabled `grpcurl` testing
-3. Storage — `Mem*` impls first, then `Fjall*`; fjall replaced mem impls in `ggap-node`
-4. Consensus — real `RaftNode` impl; replaced `StubRaftNode`
-5. Advanced features — Watch, MVCC reads, snapshots, TTL GC
-6. Hardening — chaos tests, metrics, tracing
-7. Multi-raft — shard splits, shard-aware routing and admin APIs (mostly done)
+- Storage is shard-prefixed (`fjall`-backed), with MVCC reads and TTL GC.
+- `RaftNode` carries `ShardId`; `ShardRouter` routes per shard; `ShardMap` persists shard metadata.
+- `SplitCoordinator` + `run_split_handler` create new shards via `KvCommand::Split`.
+- gRPC (Kv + Admin) is shard-aware; Watch, snapshots, metrics, and tracing are wired.
+- Consensus is exercised by deterministic simulation tests in `ggap-consensus/tests/`.
 
-**Known remaining Phase 7 gap:** there is no cluster-wide membership/placement view, so a
-node can only report Raft status for the shards it hosts locally; `AdminService` "zeroes
-out" (rather than fabricates) consensus fields for non-hosted shards. Closing this needs a
-gossip / shard-registry layer — see the open issue tracking it. A placement driver
-(`ggap-pd`) for automatic rebalancing is also still future work.
+**Known gap:** there is no cluster-wide membership/placement view, so a node can only
+report Raft status for the shards it hosts locally; `AdminService` "zeroes out" (rather
+than fabricates) consensus fields for non-hosted shards. Closing this needs a gossip /
+shard-registry layer — see the open issue tracking it. A placement driver (`ggap-pd`) for
+automatic rebalancing is also still future work.

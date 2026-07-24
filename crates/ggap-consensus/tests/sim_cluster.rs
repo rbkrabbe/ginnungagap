@@ -1,4 +1,4 @@
-//! Phase 6 — Deterministic Simulation Tests
+//! Deterministic Simulation Tests
 //!
 //! Uses in-process openraft with `SimNetwork` (no TCP/gRPC), a seeded
 //! `FaultController` for reproducible message drops/partitions, and

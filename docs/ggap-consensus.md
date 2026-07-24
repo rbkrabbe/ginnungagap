@@ -1,7 +1,8 @@
 # ggap-consensus
 
-Defines the `RaftNode` trait and provides `StubRaftNode` as a test double.
-The real openraft-backed implementation is Phase 4.
+Defines the `RaftNode` trait, the real openraft-backed implementation
+(`OpenRaftNode`), the multi-shard router, and the split machinery. Also provides
+`StubRaftNode` as a lightweight test double.
 
 ## `RaftNode` trait
 
@@ -39,23 +40,30 @@ pub trait RaftNode: Send + Sync + 'static {
 
 ## `StubRaftNode`
 
-A minimal in-memory implementation used in Phases 1–3 to allow the gRPC layer
-to be tested before real Raft exists. Backed by a `BTreeMap` under an
-`Arc<RwLock<...>>`.
+A minimal in-memory implementation used in unit tests to exercise the gRPC layer
+without spinning up real Raft. Backed by a `BTreeMap` under an `Arc<RwLock<...>>`.
+It has no durability, no replication, and no read-consistency enforcement, so it
+is for testing only — production paths use `OpenRaftNode`.
 
-It is correct enough for basic API testing but has no durability, no
-replication, and no read consistency enforcement. It will be replaced by the
-real `RaftNode` in Phase 4.
+## `OpenRaftNode`
 
-## Phase 4 plan
+The production `RaftNode` implementation. It:
 
-Phase 4 will introduce a struct (working name `RaftNode` or `OpenRaftNode`)
-that:
+- Wraps `openraft::Raft` (`GgapRaft`) typed with `GgapTypeConfig`.
+- Adapts `ggap-storage`'s fjall log store and state machine into openraft's
+  `RaftLogStorage` / `RaftStateMachine` traits (`GgapLogStorage`,
+  `GgapStateMachine`), and reaches the cluster over `GgapNetwork`.
+- Carries a `ShardId`; a node hosting multiple shards holds one `OpenRaftNode`
+  per shard, dispatched by `ShardRouter`.
+- Returns `GgapError::NotLeader` from `propose` when openraft signals the node is
+  not the current leader.
 
-- Wraps `openraft::Raft` typed with the application's `TypeConfig`.
-- Adapts `FjallLogStorage` and `FjallStateMachine` from `ggap-storage` into
-  openraft's `RaftLogStorage` and `RaftStateMachine` traits.
-- Carries a `ShardId` so the multi-shard dispatch in Phase 7 is
-  `HashMap<ShardId, RaftNode>` with no structural changes.
-- Returns `GgapError::NotLeader` from `propose` when openraft signals the node
-  is not the current leader.
+## Multi-shard and splits
+
+- **`ShardRouter`** maps `key -> ShardId -> OpenRaftNode` for reads and writes,
+  blocks writes to shards mid-split, and rejects scans that span shards.
+- **`SplitCoordinator` / `run_split_handler`** create new shards from a range
+  split via `KvCommand::Split`.
+- **`ShardRegistry` + `GossipTask`** maintain a cluster-wide view of which node
+  hosts which shard. `LeaseManager` backs lease-based leader reads; `ClusterNode`
+  keeps openraft types out of the `ggap-server` dependency tree.

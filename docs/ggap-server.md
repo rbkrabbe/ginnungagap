@@ -56,15 +56,20 @@ character set restrictions (if any) are enforced at the storage layer.
 | `Consensus` | `INTERNAL` |
 | `InvalidArgument` | `INVALID_ARGUMENT` |
 
-### What is stubbed
+### `Watch`
 
-- **`Watch`** — returns `UNIMPLEMENTED`. Phase 5.
-- **`ResponseHeader`** — `cluster_id`, `raft_index`, and `raft_term` are
-  hardcoded to `0` (the "stub header"). Phase 4 will fill these from the real
-  Raft state.
+`Watch` is a server stream fed by a `broadcast` channel from the state machine's
+change fan-out. A node without a configured `watch_tx` returns `UNIMPLEMENTED`.
 
-## `RaftServiceImpl` / `AdminServiceImpl`
+## `RaftServiceImpl` / `AdminServiceImpl` / `GossipServiceImpl`
 
-Both return `UNIMPLEMENTED` for every RPC. Phase 4 will implement
-`RaftService` (AppendEntries, Vote, InstallSnapshot) and Phase 5/6 will flesh
-out `AdminService` (cluster membership, leader transfer).
+All implemented and served on the cluster-facing port:
+
+- **`RaftService`** — `AppendEntries`, `Vote`, `InstallSnapshot`. Payloads are
+  opaque bytes decoded inside `ggap-consensus`; the server never sees openraft
+  types.
+- **`AdminService`** — `ClusterStatus`, `AddLearner`, `ChangeMembership`,
+  `SplitShard`, `ListShards`. Shard-aware, enriched with per-shard Raft state.
+  For shards a node does not host locally it zeroes out (never fabricates)
+  consensus fields — closing that gap needs the cluster-wide placement view.
+- **`GossipService`** — carries the shard-registry gossip between nodes.

@@ -6,7 +6,7 @@ pub type ShardId = u64;
 
 /// Injectable clock for wall-clock timestamps (nanoseconds since Unix epoch).
 /// Use the default `system_now_fn()` in production. In deterministic simulation
-/// tests (Phase 6), inject a mock that returns controlled time.
+/// tests, inject a mock that returns controlled time.
 pub type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// Returns a `NowFn` backed by `SystemTime::now()`.

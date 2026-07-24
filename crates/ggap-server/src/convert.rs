@@ -29,7 +29,8 @@ pub fn proto_write_quorum(raw: i32) -> WriteMode {
     }
 }
 
-/// Stub header for Phase 2 — no real Raft state yet.
+/// Response header with `cluster_id`/`raft_index`/`raft_term` left at `0`; these
+/// are not yet populated from real Raft state.
 pub fn stub_header(node_id: u64) -> ResponseHeader {
     ResponseHeader {
         cluster_id: 0,

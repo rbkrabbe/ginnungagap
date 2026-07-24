@@ -21,21 +21,27 @@ configuration. They do not flow through `figment`.
 
 ## Startup sequence
 
-1. Parse CLI.
-2. Load and merge configuration.
-3. Initialise the tracing subscriber (format determined by
+1. Parse CLI and load/merge configuration.
+2. Initialise the tracing subscriber (format determined by
    `observability.log_format`: `"json"` or pretty).
-4. Parse socket addresses.
-5. Construct the `RaftNode` (currently `StubRaftNode`).
-6. `tokio::try_join!` the two gRPC servers. Either server failing causes the
-   process to exit.
+3. Start the Prometheus metrics recorder/exporter on `observability.metrics_addr`
+   (when set).
+4. Parse socket addresses and ensure the data directory exists.
+5. Open `FjallStore`; load the `ShardMap` (initialising the default shard on
+   first boot).
+6. Create the shared state machine + Watch broadcast channel and the split-event
+   channel, then build the `ShardRouter`.
+7. For every shard in the `ShardMap`, start an `OpenRaftNode` (`GgapRaft`) over
+   the fjall log store and state machine. On first boot each shard initialises
+   its membership from persisted `bootstrap_members` (split-created shards), as a
+   single-voter seed (`--seed`), or stays uninitialised to be joined later.
+8. `tokio::try_join!` the gRPC servers (client + cluster). Either server failing
+   causes the process to exit; `shutdown` is broadcast to background tasks.
 
-## What is not yet wired (Phase 4+)
+## Known limitations
 
-- `StorageConfig` fields (`data_dir`, `max_key_bytes`, etc.) are parsed but not
-  used — `FjallStore` is not opened yet.
-- `RaftConfig`, `ConsistencyConfig`, `ServerConfig` are parsed but not passed
-  anywhere.
-- Peers (`--peer`) are parsed but not registered with openraft.
-- Metrics (`observability.metrics_addr`) are not exported.
+- No cluster-wide placement/rebalancing driver (`ggap-pd`) — shard placement is
+  driven by explicit `AdminService` calls and splits.
 - TLS is not configured on either server.
+- The retained `PrometheusHandle` is not yet consumed by an in-process
+  metrics-read transport.
