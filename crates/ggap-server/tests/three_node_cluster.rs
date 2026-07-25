@@ -645,6 +645,50 @@ async fn add_learner_on_follower_returns_not_leader() {
     cluster.shutdown().await;
 }
 
+/// Verifies that a linearizable read served by a follower returns `NotLeader`
+/// with a leader hint, not an opaque `Consensus` error.
+///
+/// Regression test: `ensure_linearizable_or_lease` used to map every openraft
+/// error — including `ForwardToLeader` — to `GgapError::Consensus`, so the
+/// forwarding hint never reached `ggap_to_status` and clients saw gRPC
+/// `INTERNAL` instead of `UNAVAILABLE` plus `ggap-leader-addr`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_read_on_follower_returns_not_leader() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+
+    let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let err = cluster.nodes[follower_idx]
+        .raft_node
+        .read("any_key", 0, ReadMode::Linearizable)
+        .await
+        .expect_err("linearizable read on follower should fail");
+
+    assert!(
+        matches!(err, GgapError::NotLeader { .. }),
+        "expected NotLeader, got {err:?}"
+    );
+
+    // The error should carry a leader hint, which is the whole point: it is what
+    // `ggap_to_status` turns into the `ggap-leader-addr` metadata.
+    if let GgapError::NotLeader { leader } = &err {
+        assert!(
+            leader.is_some(),
+            "NotLeader error should include a leader address hint"
+        );
+    }
+
+    // A linearizable read on the leader still succeeds — the forwarding check
+    // must not have broken the happy path.
+    cluster.nodes[leader_idx]
+        .raft_node
+        .read("any_key", 0, ReadMode::Linearizable)
+        .await
+        .expect("linearizable read on leader should succeed");
+
+    cluster.shutdown().await;
+}
+
 /// Verifies that `change_membership` correctly shrinks the voter set and that
 /// `retain=true` demotes the removed voter to a learner instead of ejecting it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
