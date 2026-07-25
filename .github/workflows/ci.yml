@@ -3,6 +3,12 @@
 # To block merges on failure, configure branch protection in:
 #   GitHub → Settings → Branches → Add rule for `main`
 #   → "Require status checks to pass" → add `ci` as required check.
+#
+# Changes that touch no code (task files, markdown) skip the Rust steps but
+# still report `ci` as successful, so the required check above stays
+# satisfiable. Do not convert this to `paths-ignore` on the trigger: a
+# workflow that never runs never reports a status, and docs-only PRs would
+# hang forever on a pending required check.
 
 name: CI
 
@@ -22,21 +28,77 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect code changes
+        id: changes
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+
+          # An unresolvable range (first push to a branch, force push, shallow
+          # clone) means we do not know what changed — run everything rather
+          # than guess.
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null \
+            || ! git rev-parse --verify --quiet "$head^{commit}" >/dev/null; then
+            echo "cannot resolve $base..$head — running the full pipeline"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          files="$(git diff --name-only "$base" "$head")"
+          echo "changed files:"
+          echo "$files"
+
+          if [ -z "$files" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Skip only when EVERY changed path is a task file or markdown, so a
+          # path we have not classified yet runs CI instead of silently
+          # skipping it.
+          code=false
+          while IFS= read -r f; do
+            case "$f" in
+              .tasks/*|*.md) ;;
+              *) code=true; break ;;
+            esac
+          done <<< "$files"
+
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: No code changed
+        if: steps.changes.outputs.code != 'true'
+        run: echo "Task files and markdown only — skipping fmt, clippy, build and test."
 
       - name: Install Rust (stable)
+        if: steps.changes.outputs.code == 'true'
         run: |
           rustup update stable
           rustup default stable
           rustup component add rustfmt clippy
 
       - name: Format check
+        if: steps.changes.outputs.code == 'true'
         run: cargo fmt --all -- --check
 
       - name: Clippy
+        if: steps.changes.outputs.code == 'true'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
+        if: steps.changes.outputs.code == 'true'
         run: cargo build --all-targets
 
       - name: Test
+        if: steps.changes.outputs.code == 'true'
         run: cargo test --all

@@ -32,7 +32,8 @@ Each crate has a `docs/<crate>.md` describing its scope.
 
 ## Pre-Push Checklist
 
-Before every `git push` or PR creation, run all of the following and fix any errors:
+Before every `git push` or PR creation **that touches code**, run all of the
+following and fix any errors:
 
 ```
 cargo fmt --all
@@ -42,6 +43,11 @@ cargo test --all --quiet
 ```
 
 CI enforces all four checks — a push that skips them will fail.
+
+A change that touches no code — only `.tasks/*.md` or other markdown — skips
+the checklist. CI applies the same rule and reports success without running
+them, so `ci` stays usable as a required status check. If a change mixes code
+and task files, it touches code: run all four.
 
 ## Current State
 
