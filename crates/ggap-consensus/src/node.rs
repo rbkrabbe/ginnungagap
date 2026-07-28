@@ -5,6 +5,7 @@ use ggap_storage::fjall::FjallStateMachine;
 use ggap_storage::traits::StateMachineStore;
 use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, WriteMode};
 use openraft::{
+    error::ForwardToLeader,
     raft::{AppendEntriesRequest, VoteRequest},
     BasicNode, ChangeMembers, Raft,
 };
@@ -17,6 +18,18 @@ use crate::convert::{decode, encode};
 use crate::RaftNode;
 
 pub type GgapRaft = Raft<GgapTypeConfig>;
+
+/// Build a `NotLeader` from openraft's `ForwardToLeader` hint.
+///
+/// Carries both the leader's node id and the address openraft knew for it: the
+/// id is stable and resolvable through the gossip directory, the address is
+/// only a fallback and may already be stale.
+pub(crate) fn not_leader(fwd: &ForwardToLeader<u64, BasicNode>) -> GgapError {
+    GgapError::NotLeader {
+        leader_id: fwd.leader_id,
+        leader: fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ClusterNode trait (bytes in / bytes out)
@@ -103,10 +116,7 @@ impl OpenRaftNode {
         }
         self.raft.ensure_linearizable().await.map_err(|e| {
             if let Some(fwd) = e.forward_to_leader() {
-                let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
-                return GgapError::NotLeader {
-                    leader: leader_addr,
-                };
+                return not_leader(fwd);
             }
             GgapError::Consensus(e.to_string())
         })?;
@@ -153,10 +163,7 @@ impl OpenRaftNode {
             .await
             .map_err(|e| {
                 if let Some(fwd) = e.forward_to_leader() {
-                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
-                    return GgapError::NotLeader {
-                        leader: leader_addr,
-                    };
+                    return not_leader(fwd);
                 }
                 GgapError::Consensus(e.to_string())
             })?;
@@ -181,10 +188,7 @@ impl OpenRaftNode {
             .await
             .map_err(|e| {
                 if let Some(fwd) = e.forward_to_leader() {
-                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
-                    return GgapError::NotLeader {
-                        leader: leader_addr,
-                    };
+                    return not_leader(fwd);
                 }
                 GgapError::Consensus(e.to_string())
             })?;
@@ -217,10 +221,7 @@ impl RaftNode for OpenRaftNode {
             .map(|r| r.data)
             .map_err(|e| {
                 if let Some(fwd) = e.forward_to_leader() {
-                    let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
-                    return GgapError::NotLeader {
-                        leader: leader_addr,
-                    };
+                    return not_leader(fwd);
                 }
                 GgapError::Consensus(e.to_string())
             })

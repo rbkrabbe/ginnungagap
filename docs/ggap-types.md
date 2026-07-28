@@ -63,7 +63,7 @@ it is derived from the state transition at apply time.
 | Variant | When |
 |---------|------|
 | `NotFound` | Read for a key that does not exist (internal use; gRPC layer converts to `NOT_FOUND` status). |
-| `NotLeader { leader }` | Write rejected because the node is not the current leader. `leader` is a hint only and may be stale. |
+| `NotLeader { leader_id, leader }` | Write or linearizable read rejected because the node is not the current leader. `leader_id` is the leader's stable node id — the half a forwarder resolves through the gossip directory. `leader` is the address that was current when the error was built and may be stale; treat it as a fallback. Either may be absent. |
 | `VersionConflict` | `expect_version` mismatch. Carries expected and actual values for client diagnostics. |
 | `Timeout` | Operation exceeded the configured deadline. |
 | `Storage(String)` | Unrecoverable I/O or serialization failure. Always fatal to the operation; upper layers should not retry without investigation. |

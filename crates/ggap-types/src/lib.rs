@@ -184,8 +184,17 @@ pub struct DomainWatchEvent {
 pub enum GgapError {
     #[error("key not found")]
     NotFound,
-    #[error("not the leader; hint: {leader:?}")]
-    NotLeader { leader: Option<String> },
+    /// The receiving node is not the leader for this shard.
+    ///
+    /// `leader_id` is the leader's stable node id and `leader` the address that
+    /// was current when the error was constructed. A forwarder should resolve
+    /// `leader_id` through the gossip directory and treat `leader` only as a
+    /// fallback, since the address can be stale by the time it is read.
+    #[error("not the leader; hint: {leader_id:?} at {leader:?}")]
+    NotLeader {
+        leader_id: Option<u64>,
+        leader: Option<String>,
+    },
     #[error("version conflict: expected {expected}, got {actual}")]
     VersionConflict { expected: u64, actual: u64 },
     #[error("operation timed out")]

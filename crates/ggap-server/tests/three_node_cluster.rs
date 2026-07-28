@@ -616,6 +616,36 @@ async fn add_learner_updates_membership() {
     cluster.shutdown().await;
 }
 
+/// Assert a `NotLeader` carries both halves of the hint, and that they agree.
+///
+/// The id is what a forwarder actually resolves through the gossip directory,
+/// so it must be present; the address is the fallback. Rather than pinning the
+/// hint to whichever node was leader when the test started — the leader can
+/// move at any time — this checks the pair is internally consistent: the node
+/// named by `leader_id` is the one listening on `leader`.
+fn assert_leader_hint_consistent(err: &GgapError, cluster: &TestCluster) {
+    let GgapError::NotLeader { leader_id, leader } = err else {
+        panic!("expected NotLeader, got {err:?}");
+    };
+
+    let id = leader_id.expect("NotLeader should include the leader's node id");
+    let addr = leader
+        .as_ref()
+        .expect("NotLeader should include a leader address hint");
+
+    let node = cluster
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .unwrap_or_else(|| panic!("leader_id {id} does not name any node in the cluster"));
+
+    assert_eq!(
+        node.cluster_addr.to_string(),
+        *addr,
+        "leader_id {id} and leader address disagree about which node is leader"
+    );
+}
+
 /// Verifies that `add_learner` called on a follower returns `NotLeader`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_learner_on_follower_returns_not_leader() {
@@ -629,18 +659,8 @@ async fn add_learner_on_follower_returns_not_leader() {
         .await
         .expect_err("add_learner on follower should fail");
 
-    assert!(
-        matches!(err, GgapError::NotLeader { .. }),
-        "expected NotLeader, got {err:?}"
-    );
-
-    // The error should carry a leader hint.
-    if let GgapError::NotLeader { leader } = &err {
-        assert!(
-            leader.is_some(),
-            "NotLeader error should include a leader address hint"
-        );
-    }
+    // The error should carry a complete leader hint: id and address.
+    assert_leader_hint_consistent(&err, &cluster);
 
     cluster.shutdown().await;
 }
@@ -664,19 +684,10 @@ async fn linearizable_read_on_follower_returns_not_leader() {
         .await
         .expect_err("linearizable read on follower should fail");
 
-    assert!(
-        matches!(err, GgapError::NotLeader { .. }),
-        "expected NotLeader, got {err:?}"
-    );
-
     // The error should carry a leader hint, which is the whole point: it is what
-    // `ggap_to_status` turns into the `ggap-leader-addr` metadata.
-    if let GgapError::NotLeader { leader } = &err {
-        assert!(
-            leader.is_some(),
-            "NotLeader error should include a leader address hint"
-        );
-    }
+    // `ggap_to_status` turns into the `ggap-leader-id` / `ggap-leader-addr`
+    // metadata.
+    assert_leader_hint_consistent(&err, &cluster);
 
     // A linearizable read on the leader still succeeds — the forwarding check
     // must not have broken the happy path.
@@ -791,10 +802,7 @@ async fn change_membership_on_follower_returns_not_leader() {
         .await
         .expect_err("change_membership on follower should fail");
 
-    assert!(
-        matches!(err, GgapError::NotLeader { .. }),
-        "expected NotLeader, got {err:?}"
-    );
+    assert_leader_hint_consistent(&err, &cluster);
 
     cluster.shutdown().await;
 }

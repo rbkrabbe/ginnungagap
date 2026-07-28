@@ -43,8 +43,13 @@ pub fn stub_header(node_id: u64) -> ResponseHeader {
 pub fn ggap_to_status(err: GgapError) -> Status {
     match &err {
         GgapError::NotFound => Status::not_found(err.to_string()),
-        GgapError::NotLeader { leader } => {
+        GgapError::NotLeader { leader_id, leader } => {
             let mut status = Status::unavailable(err.to_string());
+            if let Some(id) = leader_id {
+                if let Ok(val) = MetadataValue::try_from(id.to_string().as_str()) {
+                    status.metadata_mut().insert("ggap-leader-id", val);
+                }
+            }
             if let Some(addr) = leader {
                 if let Ok(val) = MetadataValue::try_from(addr.as_str()) {
                     status.metadata_mut().insert("ggap-leader-addr", val);
@@ -65,5 +70,58 @@ pub fn ggap_to_status(err: GgapError) -> Status {
         }
         GgapError::ShardSplitting => Status::unavailable(err.to_string()),
         GgapError::ShardNotFound(_) => Status::not_found(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(status: &Status, key: &str) -> Option<String> {
+        status
+            .metadata()
+            .get(key)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn not_leader_emits_both_id_and_addr() {
+        let status = ggap_to_status(GgapError::NotLeader {
+            leader_id: Some(7),
+            leader: Some("10.0.0.4:17001".to_string()),
+        });
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(meta(&status, "ggap-leader-id").as_deref(), Some("7"));
+        assert_eq!(
+            meta(&status, "ggap-leader-addr").as_deref(),
+            Some("10.0.0.4:17001")
+        );
+    }
+
+    /// Each half of the hint is emitted independently: openraft can know who the
+    /// leader is without knowing an address for it, and a forwarder that
+    /// resolves ids through gossip can still act on the id alone.
+    #[test]
+    fn not_leader_emits_id_without_addr() {
+        let status = ggap_to_status(GgapError::NotLeader {
+            leader_id: Some(7),
+            leader: None,
+        });
+
+        assert_eq!(meta(&status, "ggap-leader-id").as_deref(), Some("7"));
+        assert!(meta(&status, "ggap-leader-addr").is_none());
+    }
+
+    #[test]
+    fn not_leader_with_no_hint_emits_no_metadata() {
+        let status = ggap_to_status(GgapError::NotLeader {
+            leader_id: None,
+            leader: None,
+        });
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(meta(&status, "ggap-leader-id").is_none());
+        assert!(meta(&status, "ggap-leader-addr").is_none());
     }
 }
