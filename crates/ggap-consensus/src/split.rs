@@ -148,10 +148,7 @@ impl SplitCoordinator {
         };
         let write_result = source_node.raft().client_write(cmd).await.map_err(|e| {
             if let Some(fwd) = e.forward_to_leader() {
-                let leader_addr = fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone());
-                return GgapError::NotLeader {
-                    leader: leader_addr,
-                };
+                return crate::node::not_leader(fwd);
             }
             GgapError::Consensus(format!("Split propose failed: {e}"))
         })?;

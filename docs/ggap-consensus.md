@@ -28,8 +28,13 @@ pub trait RaftNode: Send + Sync + 'static {
   it is still the leader (read-index or lease) before returning. `Sequential`
   and `Eventual` may serve stale reads. The stub ignores the mode.
 - **`NotLeader` error.** If the node is not the leader, `propose` must return
-  `Err(GgapError::NotLeader { leader: Option<String> })`. The `leader` hint
-  lets the client retry against the right node without a full rediscovery round.
+  `Err(GgapError::NotLeader { leader_id: Option<u64>, leader: Option<String> })`.
+  Both halves come from openraft's `ForwardToLeader`; construct the error via
+  `node::not_leader()` rather than building the struct, so they cannot drift
+  apart. `leader_id` is the stable identity a forwarder resolves through the
+  gossip directory; `leader` is the address that was current when the error was
+  built and may already be stale. Either half may be absent. The hint lets the
+  caller retry against the right node without a full rediscovery round.
 - **`at_version = 0`** in `read` means current value. Non-zero requests an
   exact historical version; return `None` if that version does not exist or has
   been compacted.
