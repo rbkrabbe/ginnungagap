@@ -2,7 +2,7 @@
 id = "tk-3cd2"
 title = "NotLeader carries the leader's node id, not just an address"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "l"
 priority = 2
 blocked_by = []
@@ -15,7 +15,7 @@ parent = "tk-3846"
 resized_from = "m"
 reviewed_at = "2026-07-28T15:30:55+00:00"
 spec_approved_at = "2026-07-28T15:22:26+00:00"
-closed = "2026-07-28T15:35:23+00:00"
+closed = "2026-07-28T15:37:33+00:00"
 base = "39d8fee97c407147d349571d8439678d3b6fee0a"
 +++
 ## Context
