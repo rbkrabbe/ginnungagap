@@ -112,12 +112,23 @@ message ListShardsResponse {
   repeated ShardInfoProto shards = 1;
 }
 
-// One node's identity plus reachable cluster gRPC address, for transitive peer
+// One node's identity plus its reachable gRPC addresses, for transitive peer
 // discovery: a node learns about peers it doesn't directly co-host a shard with
 // by receiving their directory entries through gossip.
+//
+// The two addresses reach this node by different routes. `cluster_addr` also
+// travels in the Raft membership (openraft `BasicNode.addr`), so it is
+// re-derivable from consensus state; `client_addr` rides gossip alone and is
+// only ever originated by the node it describes. Either may be empty — an old
+// peer sends no `client_addr`, and a directory entry learned from Raft
+// membership has no client address to report — so receivers merge the two
+// fields independently and treat empty as "unknown", never as "cleared".
 message GossipNode {
   uint64 node_id = 1;
   string cluster_addr = 2;
+  // Client-facing gRPC address (the KV API listener). Used to forward
+  // leader-required requests to a shard's leader.
+  string client_addr = 3;
 }
 
 // One shard's placement + lightweight Raft status as known by some origin node.

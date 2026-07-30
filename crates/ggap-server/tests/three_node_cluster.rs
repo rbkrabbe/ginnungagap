@@ -19,9 +19,9 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ggap_consensus::{
-    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRegistry,
-    ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, derive_client_addr, run_split_handler, GgapLogStorage, GgapNetworkFactory,
+    GgapRaft, GgapStateMachine, GossipTask, NodeAddrs, OpenRaftCluster, OpenRaftNode, RaftNode,
+    ShardRegistry, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{
     serve_client_with_listener, serve_cluster_with_listener, AdminServiceForTesting,
@@ -44,6 +44,10 @@ struct TestNode {
     raft: Arc<GgapRaft>,
     fsm: Arc<FjallStateMachine>,
     cluster_addr: SocketAddr,
+    /// The address the client listener is actually bound to. The directory
+    /// entry other nodes gossip about this node must resolve to this.
+    client_addr: SocketAddr,
+    registry: Arc<ShardRegistry>,
     raft_node: Arc<OpenRaftNode>,
     // Kept alive so the servers stay running; aborted on drop via TestCluster::shutdown.
     _handles: Vec<tokio::task::JoinHandle<()>>,
@@ -87,6 +91,7 @@ async fn start_node(id: u64) -> TestNode {
     let cluster_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let cluster_addr = cluster_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client_listener.local_addr().unwrap();
 
     let raft_node = Arc::new(OpenRaftNode::new(
         raft.clone(),
@@ -117,7 +122,18 @@ async fn start_node(id: u64) -> TestNode {
     }));
 
     // Cluster registry + fast gossip task (short interval for snappy tests).
-    let registry = Arc::new(ShardRegistry::new(id, [(id, cluster_addr.to_string())]));
+    // Both listeners are on 127.0.0.1, so the derivation this exercises — host
+    // of the cluster addr, port of the client bind — yields a genuinely
+    // reachable address, exactly as it does for a pod's two ports.
+    let self_client_addr = derive_client_addr(&cluster_addr.to_string(), &client_addr.to_string())
+        .expect("both test listeners are host:port");
+    let registry = Arc::new(ShardRegistry::new(
+        id,
+        [(
+            id,
+            NodeAddrs::new(cluster_addr.to_string(), self_client_addr.clone()),
+        )],
+    ));
 
     let mut handles = Vec::new();
 
@@ -127,6 +143,7 @@ async fn start_node(id: u64) -> TestNode {
             registry.clone(),
             id,
             cluster_addr.to_string(),
+            self_client_addr,
             CancellationToken::new(),
         )
         .with_interval(Duration::from_millis(50))
@@ -160,6 +177,8 @@ async fn start_node(id: u64) -> TestNode {
         raft,
         fsm,
         cluster_addr,
+        client_addr,
+        registry,
         raft_node,
         _handles: handles,
         _tempdir: tempdir,
@@ -834,9 +853,15 @@ async fn start_observer(id: u64, seed_id: u64, seed_addr: SocketAddr) -> Observe
     // Self addr is a dummy (the observer serves nothing and never dials itself);
     // the seed gives it an entry point into the cluster's gossip directory.
     let self_addr = format!("127.0.0.1:1{id}");
+    // The observer serves no client API, so it has no client address to
+    // advertise — the legitimate "unknown" case. Its own entry stays
+    // cluster-only while it still learns everyone else's client address.
     let registry = Arc::new(ShardRegistry::new(
         id,
-        [(id, self_addr.clone()), (seed_id, seed_addr.to_string())],
+        [
+            (id, NodeAddrs::cluster_only(self_addr.clone())),
+            (seed_id, NodeAddrs::cluster_only(seed_addr.to_string())),
+        ],
     ));
     let handle = tokio::spawn(
         GossipTask::new(
@@ -844,6 +869,7 @@ async fn start_observer(id: u64, seed_id: u64, seed_addr: SocketAddr) -> Observe
             registry.clone(),
             id,
             self_addr,
+            String::new(),
             CancellationToken::new(),
         )
         .with_interval(Duration::from_millis(50))
@@ -1017,4 +1043,126 @@ async fn gossip_degrades_to_stale_when_hosts_unreachable() {
     }
 
     observer.handle.abort();
+}
+
+/// Every node learns every other node's *client* address.
+///
+/// This can only travel by gossip: openraft's `BasicNode` has a single address
+/// field, which carries `cluster_addr`, so Raft membership has nowhere to put a
+/// second address. A node's client address is originated by that node alone.
+///
+/// The assertion is repeated after several more gossip ticks, and that repeat is
+/// the point of the test. `refresh_local` re-merges the directory from Raft
+/// membership on every tick with cluster-only entries; if `merge_directory`
+/// replaced values wholesale instead of merging field by field, those ticks
+/// would blank every client address in the cluster. Checking once immediately
+/// after convergence would not catch it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossip_converges_on_every_node_client_addr() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+
+    let expected: Vec<(u64, String)> = cluster
+        .nodes
+        .iter()
+        .map(|n| (n.id, n.client_addr.to_string()))
+        .collect();
+
+    // Converge: every node knows every node's client address.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut all_known = true;
+        for node in &cluster.nodes {
+            for (peer_id, _) in &expected {
+                if node.registry.client_addr(*peer_id).await.is_none() {
+                    all_known = false;
+                }
+            }
+        }
+        if all_known {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gossip never converged on all client addresses"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ~10 further gossip ticks at the 50ms test interval, so the
+    // membership-derived refresh has run many times over.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for node in &cluster.nodes {
+        for (peer_id, peer_client_addr) in &expected {
+            assert_eq!(
+                node.registry.client_addr(*peer_id).await.as_ref(),
+                Some(peer_client_addr),
+                "node {} lost or mismatched node {peer_id}'s client address",
+                node.id,
+            );
+        }
+        // The cluster address must survive the same traffic — a merge bug in
+        // either direction is a failure.
+        for peer in &cluster.nodes {
+            assert_eq!(
+                node.registry.directory_addr(peer.id).await,
+                Some(peer.cluster_addr.to_string()),
+                "node {} lost node {}'s cluster address",
+                node.id,
+                peer.id,
+            );
+        }
+    }
+
+    cluster.shutdown().await;
+}
+
+/// A node's two addresses are distinct and independently reported: the client
+/// address must not be the cluster address wearing a different accessor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_and_cluster_addrs_are_distinct_per_node() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+
+    for node in &cluster.nodes {
+        assert_ne!(
+            node.client_addr, node.cluster_addr,
+            "test harness should bind two different ports"
+        );
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let probe = cluster.nodes[0].id;
+    let target = &cluster.nodes[1];
+    loop {
+        if cluster.nodes[0]
+            .registry
+            .client_addr(target.id)
+            .await
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {probe} never learned node {}'s client address",
+            target.id
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let learned_client = cluster.nodes[0].registry.client_addr(target.id).await;
+    let learned_cluster = cluster.nodes[0].registry.directory_addr(target.id).await;
+    assert_eq!(
+        learned_client.as_deref(),
+        Some(target.client_addr.to_string()).as_deref()
+    );
+    assert_eq!(
+        learned_cluster.as_deref(),
+        Some(target.cluster_addr.to_string()).as_deref()
+    );
+    assert_ne!(learned_client, learned_cluster);
+
+    cluster.shutdown().await;
 }
