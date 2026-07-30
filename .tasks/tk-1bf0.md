@@ -27,6 +27,23 @@ Not a regression: the pre-tk-c507 directory was equally version-free. It matters
 
 Worth doing before or alongside tk-2cb2, since a forwarder dialling a stale address is the visible symptom.
 
+## Superseded, pending approval of tk-d08a (2026-07-30)
+
+**tk-c4fc** fixes this, by a better route than the origin-stamped counter
+suggested above: once Raft membership carries both addresses (epic tk-d08a),
+gossiped directory entries can be stamped with the membership `(term, index)`
+they came from. That reuses Raft's clock instead of inventing a second one that
+must be persisted and must never regress.
+
+Left open deliberately rather than dropped: tk-d08a is not approved yet, and this
+is a real defect in code that ships today. If the epic is approved, close this
+with a pointer to tk-c4fc. If it is not, implement this as originally written.
+
+**Do not work both.** Whichever starts first, close the other.
+
 ## Acceptance
 
-- [ ] TODO
+Superseded — see tk-c4fc. If implemented standalone instead:
+
+- [ ] A stale directory entry cannot overwrite a fresher one.
+- [ ] The stamp survives a node restart without regressing.
