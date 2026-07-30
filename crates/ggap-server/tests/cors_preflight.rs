@@ -19,8 +19,8 @@ use tokio::net::TcpListener;
 
 use ggap_consensus::{
     build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
-    SplitCoordinatorConfig,
+    GgapStateMachine, NodeAddrs, OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter,
+    SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::serve_cluster_with_listener;
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
@@ -74,7 +74,10 @@ async fn cors_preflight_returns_allow_origin() {
         shard_map: shard_map.clone(),
     }));
 
-    let registry = Arc::new(ShardRegistry::new(1, [(1u64, addr.to_string())]));
+    let registry = Arc::new(ShardRegistry::new(
+        1,
+        [(1u64, NodeAddrs::cluster_only(addr.to_string()))],
+    ));
 
     tokio::spawn(run_split_handler(
         split_rx,

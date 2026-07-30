@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use ggap_consensus::gossip::entry_to_proto;
+use ggap_consensus::gossip::{entry_to_proto, node_to_proto};
 use ggap_consensus::{merge_gossip_state, ShardRegistry};
-use ggap_proto::v1::{gossip_service_server::GossipService, GossipNode, GossipState};
+use ggap_proto::v1::{gossip_service_server::GossipService, GossipState};
 use tonic::{Request, Response, Status};
 
 use crate::metrics::record;
@@ -25,13 +25,7 @@ impl GossipServiceImpl {
         let (dir, shards) = self.registry.snapshot_for_gossip().await;
         Ok(Response::new(GossipState {
             sender_node_id: self.registry.self_node_id(),
-            directory: dir
-                .into_iter()
-                .map(|(node_id, cluster_addr)| GossipNode {
-                    node_id,
-                    cluster_addr,
-                })
-                .collect(),
+            directory: dir.into_iter().map(node_to_proto).collect(),
             shards: shards.into_iter().map(entry_to_proto).collect(),
         }))
     }

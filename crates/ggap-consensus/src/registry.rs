@@ -45,22 +45,54 @@ impl ShardEntry {
     }
 }
 
+/// The gRPC addresses at which a node can be reached.
+///
+/// The two fields arrive by different routes and are therefore merged
+/// independently — see [`ShardRegistry::merge_directory`]. An empty string means
+/// "not known here", never "known to be absent".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeAddrs {
+    /// Cluster gRPC endpoint, shared by RaftService, AdminService and
+    /// GossipService.
+    pub cluster_addr: String,
+    /// Client-facing gRPC endpoint (the KV API listener).
+    pub client_addr: String,
+}
+
+impl NodeAddrs {
+    /// Both addresses known.
+    pub fn new(cluster_addr: impl Into<String>, client_addr: impl Into<String>) -> Self {
+        NodeAddrs {
+            cluster_addr: cluster_addr.into(),
+            client_addr: client_addr.into(),
+        }
+    }
+
+    /// Only the cluster address is known — the shape of every entry derived from
+    /// Raft membership, which carries no client address.
+    pub fn cluster_only(cluster_addr: impl Into<String>) -> Self {
+        NodeAddrs {
+            cluster_addr: cluster_addr.into(),
+            client_addr: String::new(),
+        }
+    }
+}
+
 /// The eventually-consistent global view shared between the gossip task, the
 /// gossip service, and the admin service.
 pub struct ShardRegistry {
     self_node_id: u64,
-    /// `node_id -> cluster_addr`, learned transitively via gossip + bootstrap
-    /// seeds. The address is the cluster gRPC endpoint (shared by RaftService,
-    /// AdminService, and GossipService).
-    directory: RwLock<HashMap<u64, String>>,
+    /// `node_id -> addresses`, learned transitively via gossip + bootstrap
+    /// seeds.
+    directory: RwLock<HashMap<u64, NodeAddrs>>,
     /// Best-known entry per shard.
     shards: RwLock<HashMap<ShardId, ShardEntry>>,
 }
 
 impl ShardRegistry {
-    /// Create a registry seeded with an initial `node_id -> cluster_addr`
-    /// directory (typically just `self`).
-    pub fn new(self_node_id: u64, seeds: impl IntoIterator<Item = (u64, String)>) -> Self {
+    /// Create a registry seeded with an initial `node_id -> addresses` directory
+    /// (typically just `self`).
+    pub fn new(self_node_id: u64, seeds: impl IntoIterator<Item = (u64, NodeAddrs)>) -> Self {
         ShardRegistry {
             self_node_id,
             directory: RwLock::new(seeds.into_iter().collect()),
@@ -113,23 +145,58 @@ impl ShardRegistry {
         )
     }
 
-    /// Merge a batch of `node_id -> cluster_addr` directory entries.
-    pub async fn merge_directory(&self, entries: impl IntoIterator<Item = (u64, String)>) {
+    /// Merge a batch of directory entries, **field by field**.
+    ///
+    /// An empty field in `entries` is ignored rather than written, so a source
+    /// that knows only one of the two addresses cannot erase the other. This is
+    /// load-bearing, not defensive: the gossip task refreshes the directory from
+    /// Raft membership once per tick (see [`crate::gossip`]), and membership
+    /// carries `cluster_addr` alone. A whole-value merge would blank every
+    /// `client_addr` in the cluster roughly once a second.
+    pub async fn merge_directory(&self, entries: impl IntoIterator<Item = (u64, NodeAddrs)>) {
         let mut dir = self.directory.write().await;
-        for (node_id, addr) in entries {
-            if addr.is_empty() {
+        for (node_id, addrs) in entries {
+            if addrs.cluster_addr.is_empty() && addrs.client_addr.is_empty() {
                 continue;
             }
-            dir.insert(node_id, addr);
+            let slot = dir.entry(node_id).or_default();
+            if !addrs.cluster_addr.is_empty() {
+                slot.cluster_addr = addrs.cluster_addr;
+            }
+            if !addrs.client_addr.is_empty() {
+                slot.client_addr = addrs.client_addr;
+            }
         }
     }
 
     /// Cluster address for a node id, if known.
     pub async fn directory_addr(&self, node_id: u64) -> Option<String> {
-        self.directory.read().await.get(&node_id).cloned()
+        self.directory
+            .read()
+            .await
+            .get(&node_id)
+            .map(|a| a.cluster_addr.clone())
+            .filter(|a| !a.is_empty())
     }
 
-    /// Gossip peers: every known node except self, as `(node_id, addr)`.
+    /// Client-facing address for a node id, if known.
+    ///
+    /// `None` covers both an unknown node and a known node whose client address
+    /// has never been gossiped — a peer running a version that predates the
+    /// field, or an entry so far only learned from Raft membership. Callers must
+    /// treat it as "cannot reach this node's client API yet", never dialling the
+    /// empty string.
+    pub async fn client_addr(&self, node_id: u64) -> Option<String> {
+        self.directory
+            .read()
+            .await
+            .get(&node_id)
+            .map(|a| a.client_addr.clone())
+            .filter(|a| !a.is_empty())
+    }
+
+    /// Gossip peers: every known node except self, as `(node_id, cluster_addr)`.
+    /// Gossip dials the cluster port, so the client address is irrelevant here.
     pub async fn peers_excluding_self(&self) -> Vec<(u64, String)> {
         let mut peers: Vec<(u64, String)> = self
             .directory
@@ -137,7 +204,8 @@ impl ShardRegistry {
             .await
             .iter()
             .filter(|(id, _)| **id != self.self_node_id)
-            .map(|(id, addr)| (*id, addr.clone()))
+            .filter(|(_, addrs)| !addrs.cluster_addr.is_empty())
+            .map(|(id, addrs)| (*id, addrs.cluster_addr.clone()))
             .collect();
         // Deterministic order (the gossip task rotates over this).
         peers.sort_by_key(|(id, _)| *id);
@@ -146,13 +214,13 @@ impl ShardRegistry {
 
     /// The full view to push to a peer (or return from `Exchange`). Sorted for
     /// deterministic output.
-    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, String)>, Vec<ShardEntry>) {
-        let mut dir: Vec<(u64, String)> = self
+    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, NodeAddrs)>, Vec<ShardEntry>) {
+        let mut dir: Vec<(u64, NodeAddrs)> = self
             .directory
             .read()
             .await
             .iter()
-            .map(|(id, addr)| (*id, addr.clone()))
+            .map(|(id, addrs)| (*id, addrs.clone()))
             .collect();
         dir.sort_by_key(|(id, _)| *id);
 
@@ -222,7 +290,14 @@ mod tests {
 
     #[tokio::test]
     async fn peers_exclude_self() {
-        let reg = ShardRegistry::new(1, [(1, "a".into()), (2, "b".into()), (3, "c".into())]);
+        let reg = ShardRegistry::new(
+            1,
+            [
+                (1, NodeAddrs::cluster_only("a")),
+                (2, NodeAddrs::cluster_only("b")),
+                (3, NodeAddrs::cluster_only("c")),
+            ],
+        );
         let peers = reg.peers_excluding_self().await;
         assert_eq!(peers, vec![(2, "b".into()), (3, "c".into())]);
     }
@@ -230,9 +305,73 @@ mod tests {
     #[tokio::test]
     async fn merge_directory_ignores_empty_addr() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, String::new()), (3, "c".into())])
+        reg.merge_directory([(2, NodeAddrs::default()), (3, NodeAddrs::cluster_only("c"))])
             .await;
         assert_eq!(reg.directory_addr(2).await, None);
         assert_eq!(reg.directory_addr(3).await, Some("c".into()));
+    }
+
+    /// The rule the Raft-membership refresh depends on: a merge carrying only a
+    /// cluster addr must not blank a client addr learned from gossip. Without
+    /// this, `refresh_local` would erase every client addr once per tick.
+    #[tokio::test]
+    async fn merge_directory_preserves_client_addr_across_cluster_only_merge() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, NodeAddrs::new("host:17001", "host:17000"))])
+            .await;
+
+        // Simulate many rounds of the membership-derived refresh.
+        for _ in 0..5 {
+            reg.merge_directory([(2, NodeAddrs::cluster_only("host:17001"))])
+                .await;
+        }
+
+        assert_eq!(reg.client_addr(2).await, Some("host:17000".into()));
+        assert_eq!(reg.directory_addr(2).await, Some("host:17001".into()));
+    }
+
+    /// The mirror case: a client-only merge must not blank a known cluster addr.
+    #[tokio::test]
+    async fn merge_directory_preserves_cluster_addr_across_client_only_merge() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, NodeAddrs::new("host:17001", "host:17000"))])
+            .await;
+        reg.merge_directory([(2, NodeAddrs::new("", "other:17000"))])
+            .await;
+
+        assert_eq!(reg.directory_addr(2).await, Some("host:17001".into()));
+        assert_eq!(reg.client_addr(2).await, Some("other:17000".into()));
+    }
+
+    /// A peer predating the field gossips entries with an empty client_addr.
+    /// Merging one must neither panic nor clear anything.
+    #[tokio::test]
+    async fn client_addr_absent_for_unknown_and_for_cluster_only_node() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, NodeAddrs::cluster_only("host:17001"))])
+            .await;
+
+        assert_eq!(reg.client_addr(99).await, None, "unknown node");
+        assert_eq!(reg.client_addr(2).await, None, "known, no client addr");
+        assert_eq!(reg.directory_addr(2).await, Some("host:17001".into()));
+    }
+
+    /// A directory entry with no usable cluster addr must not become a gossip
+    /// target — dialling "" would fail every round.
+    #[tokio::test]
+    async fn peers_exclude_nodes_with_no_cluster_addr() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, NodeAddrs::new("", "host:17000"))])
+            .await;
+
+        assert!(reg.peers_excluding_self().await.is_empty());
+        assert_eq!(reg.client_addr(2).await, Some("host:17000".into()));
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_both_addrs() {
+        let reg = ShardRegistry::new(1, [(1, NodeAddrs::new("c1:17001", "c1:17000"))]);
+        let (dir, _) = reg.snapshot_for_gossip().await;
+        assert_eq!(dir, vec![(1, NodeAddrs::new("c1:17001", "c1:17000"))]);
     }
 }

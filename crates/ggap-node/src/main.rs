@@ -11,9 +11,9 @@ use openraft::BasicNode;
 use serde::Deserialize;
 
 use ggap_consensus::{
-    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, ShardRegistry,
-    ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, derive_client_addr, run_split_handler, GgapLogStorage, GgapNetworkFactory,
+    GgapRaft, GgapStateMachine, GossipTask, NodeAddrs, OpenRaftCluster, OpenRaftNode,
+    RaftMetricsTask, ShardRegistry, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -349,9 +349,29 @@ async fn main() -> anyhow::Result<()> {
     // 7b. Cluster-wide shard registry + gossip task. Seeded with self; the node
     //     directory grows transitively from each shard's Raft membership, so any
     //     node can report consensus state for shards it does not host locally.
+    //
+    //     `--client-addr` is a bind address, so it names a port but no reachable
+    //     host; the advertised client address takes its host from the (already
+    //     advertised, Raft-dialable) cluster address. Only this node originates
+    //     it — peers learn it by gossip alone, since Raft membership has nowhere
+    //     to carry a second address.
+    let self_client_addr = derive_client_addr(&cli.cluster_addr, &cli.client_addr);
+    if self_client_addr.is_none() {
+        tracing::warn!(
+            cluster_addr = %cli.cluster_addr,
+            client_addr = %cli.client_addr,
+            "cannot derive an advertised client address; peers will not be able to \
+             forward leader-required requests to this node"
+        );
+    }
+    let self_client_addr = self_client_addr.unwrap_or_default();
+
     let registry = Arc::new(ShardRegistry::new(
         cli.node_id,
-        [(cli.node_id, cli.cluster_addr.clone())],
+        [(
+            cli.node_id,
+            NodeAddrs::new(cli.cluster_addr.clone(), self_client_addr.clone()),
+        )],
     ));
     tokio::spawn(
         GossipTask::new(
@@ -359,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
             registry.clone(),
             cli.node_id,
             cli.cluster_addr.clone(),
+            self_client_addr,
             shutdown.child_token(),
         )
         .run(),

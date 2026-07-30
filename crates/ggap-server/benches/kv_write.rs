@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
+    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine, NodeAddrs,
     OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
     SplitCoordinatorConfig,
 };
@@ -93,7 +93,10 @@ async fn start_node(id: u64) -> BenchNode {
 
     let mut handles = Vec::new();
 
-    let registry = Arc::new(ShardRegistry::new(id, [(id, cluster_addr.to_string())]));
+    let registry = Arc::new(ShardRegistry::new(
+        id,
+        [(id, NodeAddrs::cluster_only(cluster_addr.to_string()))],
+    ));
     let r = router.clone();
     let sc = split_coordinator.clone();
     let sm2 = shard_map.clone();
