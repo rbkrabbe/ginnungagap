@@ -2,7 +2,7 @@
 id = "tk-f2fc"
 title = "Move NodeAddrs into ggap-types"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "s"
 priority = 2
 blocked_by = []
@@ -13,6 +13,7 @@ review = "none"
 touched = ["crates/ggap-types/src/lib.rs", "crates/ggap-consensus/src/registry.rs", "crates/ggap-consensus/src/lib.rs", "crates/ggap-consensus/src/gossip.rs"]
 parent = "tk-d08a"
 base = "80cd06ba9ecf1b2ca05793354c361c6ef5c1a74a"
+closed = "2026-07-31T16:50:36+00:00"
 +++
 ## Context
 
