@@ -20,7 +20,8 @@ data:
     echo "ggap-node starting: node_id=${NODE_ID} seed=${SEED_FLAG:-no}"
     exec /usr/local/bin/ggap-node \
       --node-id "${NODE_ID}" \
-      --client-addr 0.0.0.0:17000 \
+      --client-addr ggap-${ORDINAL}.ggap-headless.ginnungagap.svc.cluster.local:17000 \
+      --client-listen-addr 0.0.0.0:17000 \
       --cluster-addr ggap-${ORDINAL}.ggap-headless.ginnungagap.svc.cluster.local:17001 \
       --data-dir /var/lib/ginnungagap \
       --metrics-addr 0.0.0.0:9090 \

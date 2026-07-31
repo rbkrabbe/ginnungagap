@@ -19,9 +19,9 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ggap_consensus::{
-    build_raft_config, derive_client_addr, run_split_handler, GgapLogStorage, GgapNetworkFactory,
-    GgapNode, GgapRaft, GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftNode,
-    ShardRegistry, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft,
+    GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRegistry,
+    ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{
     serve_client_with_listener, serve_cluster_with_listener, AdminServiceForTesting,
@@ -133,11 +133,9 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
     }));
 
     // Cluster registry + fast gossip task (short interval for snappy tests).
-    // Both listeners are on 127.0.0.1, so the derivation this exercises — host
-    // of the cluster addr, port of the client bind — yields a genuinely
-    // reachable address, exactly as it does for a pod's two ports.
-    let self_client_addr = derive_client_addr(&cluster_addr.to_string(), &client_addr.to_string())
-        .expect("both test listeners are host:port");
+    // Both listeners bind 127.0.0.1 on an ephemeral port, so the bind address is
+    // also the advertised one.
+    let self_client_addr = client_addr.to_string();
     let registry = Arc::new(ShardRegistry::new(
         id,
         [(
