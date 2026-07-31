@@ -61,4 +61,6 @@ leaves two valid import paths. Kept it because the alternative — updating all
 seven `ggap_consensus::NodeAddrs` importers — would have made this a 10-file
 change and forced a resize off `s`, for a task whose entire point is to be
 invisible. The re-export carries a comment pointing new code at `ggap_types`.
-Worth deleting once tk-441f and tk-11b6 have churned those files anyway.
+Worth deleting once tk-441f and tk-11b6 have churned those files anyway — filed
+as **tk-3080**, blocked on tk-11b6, with instructions to fold it into whichever
+task edits those imports first rather than spend a PR on `use` statements.

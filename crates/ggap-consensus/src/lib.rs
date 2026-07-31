@@ -31,7 +31,8 @@ pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, ClusterStatus, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
 // `NodeAddrs` is a `ggap-types` domain type, re-exported here so the seven
 // existing `ggap_consensus::NodeAddrs` imports keep working. Both paths are
-// valid; prefer `ggap_types::NodeAddrs` in new code.
+// valid; prefer `ggap_types::NodeAddrs` in new code. Removal is tracked by
+// tk-3080 — fold it into any task that edits these imports anyway.
 pub use ggap_types::NodeAddrs;
 pub use registry::{ShardEntry, ShardRegistry};
 pub use router::ShardRouter;
