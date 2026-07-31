@@ -3,14 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
+    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
 };
 use ggap_storage::{
     fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
     traits::StateMachineStore,
 };
 use ggap_types::{KvCommand, KvResponse};
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_node_leader_write_read() {
@@ -26,7 +26,7 @@ async fn single_node_leader_write_read() {
 
     // Initialize as a single-node cluster.
     let mut members = BTreeMap::new();
-    members.insert(1u64, BasicNode::default());
+    members.insert(1u64, GgapNode::default());
     raft.initialize(members).await.unwrap();
 
     // Wait for this node to become leader.

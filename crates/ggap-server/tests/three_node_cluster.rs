@@ -13,14 +13,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ggap_consensus::{
     build_raft_config, derive_client_addr, run_split_handler, GgapLogStorage, GgapNetworkFactory,
-    GgapRaft, GgapStateMachine, GossipTask, NodeAddrs, OpenRaftCluster, OpenRaftNode, RaftNode,
+    GgapNode, GgapRaft, GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftNode,
     ShardRegistry, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{
@@ -30,7 +30,7 @@ use ggap_server::{
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
-use ggap_types::{GgapError, KvCommand, KvResponse, ReadMode, WriteMode};
+use ggap_types::{GgapError, KvCommand, KvResponse, NodeAddrs, ReadMode, WriteMode};
 
 use ggap_proto::v1::admin_service_server::AdminService;
 use ggap_proto::v1::{ClusterStatusRequest, ListShardsRequest, ShardInfoProto};
@@ -87,7 +87,7 @@ async fn start_node(id: u64) -> TestNode {
         .unwrap_or_else(|e| panic!("node {id}: raft init failed: {e}")),
     );
 
-    // Pre-bind on port 0 → OS picks a free port we can pass to BasicNode.
+    // Pre-bind on port 0 → OS picks a free port we can pass to GgapNode.
     let cluster_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let cluster_addr = cluster_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -202,16 +202,9 @@ impl TestCluster {
         }
 
         // Build the full member map with each node's cluster address.
-        let members: BTreeMap<u64, BasicNode> = nodes
+        let members: BTreeMap<u64, GgapNode> = nodes
             .iter()
-            .map(|n| {
-                (
-                    n.id,
-                    BasicNode {
-                        addr: n.cluster_addr.to_string(),
-                    },
-                )
-            })
+            .map(|n| (n.id, GgapNode::cluster_only(n.cluster_addr.to_string())))
             .collect();
 
         // Only one node calls initialize(); the others learn about the cluster
@@ -1047,9 +1040,9 @@ async fn gossip_degrades_to_stale_when_hosts_unreachable() {
 
 /// Every node learns every other node's *client* address.
 ///
-/// This can only travel by gossip: openraft's `BasicNode` has a single address
-/// field, which carries `cluster_addr`, so Raft membership has nowhere to put a
-/// second address. A node's client address is originated by that node alone.
+/// This can only travel by gossip: `GgapNode` has room for a client address,
+/// but nothing populates it (tk-fd58), so every membership entry is
+/// cluster-only. A node's client address is originated by that node alone.
 ///
 /// The assertion is repeated after several more gossip ticks, and that repeat is
 /// the point of the test. `refresh_local` re-merges the directory from Raft

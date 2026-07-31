@@ -12,19 +12,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use ggap_consensus::{
-    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
-    GgapStateMachine, NodeAddrs, OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter,
-    SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft,
+    GgapStateMachine, OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
+    SplitCoordinatorConfig,
 };
 use ggap_server::serve_cluster_with_listener;
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
+use ggap_types::NodeAddrs;
 
 #[tokio::test]
 async fn cors_preflight_returns_allow_origin() {
@@ -89,7 +89,7 @@ async fn cors_preflight_returns_allow_origin() {
     ));
 
     // Bootstrap single-node Raft.
-    let members = BTreeMap::from([(1u64, BasicNode::default())]);
+    let members = BTreeMap::from([(1u64, GgapNode::default())]);
     raft.initialize(members).await.unwrap();
     raft.wait(Some(Duration::from_secs(5)))
         .metrics(|m| m.current_leader.is_some(), "leader elected")

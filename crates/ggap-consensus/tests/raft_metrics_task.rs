@@ -7,11 +7,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
-use openraft::BasicNode;
 use tempfile::TempDir;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
+    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
     RaftMetricsTask,
 };
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
@@ -53,12 +52,8 @@ async fn start_single_node_raft() -> (Arc<GgapRaft>, TempDir) {
             .expect("raft init"),
     );
 
-    let members: BTreeMap<u64, BasicNode> = BTreeMap::from([(
-        1,
-        BasicNode {
-            addr: "127.0.0.1:0".into(),
-        },
-    )]);
+    let members: BTreeMap<u64, GgapNode> =
+        BTreeMap::from([(1, GgapNode::cluster_only("127.0.0.1:0"))]);
     raft.initialize(members).await.expect("cluster init");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

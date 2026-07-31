@@ -9,11 +9,11 @@ use openraft::{
     error::{NetworkError, RPCError, RaftError, Unreachable},
     network::RPCOption,
     raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse},
-    AnyError, BasicNode, RaftNetwork, RaftNetworkFactory,
+    AnyError, RaftNetwork, RaftNetworkFactory,
 };
 use tonic::transport::Channel;
 
-use crate::config::GgapTypeConfig;
+use crate::config::{GgapNode, GgapTypeConfig};
 use crate::convert::{decode, encode};
 
 // ---------------------------------------------------------------------------
@@ -49,9 +49,9 @@ impl GgapNetworkFactory {
 impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
     type Network = GgapNetwork;
 
-    async fn new_client(&mut self, _target_id: u64, node: &BasicNode) -> GgapNetwork {
+    async fn new_client(&mut self, _target_id: u64, node: &GgapNode) -> GgapNetwork {
         GgapNetwork {
-            addr: node.addr.clone(),
+            addr: node.cluster_addr().to_string(),
             channel: None,
             shard_id: self.shard_id,
         }
@@ -82,23 +82,23 @@ impl GgapNetwork {
         Ok(())
     }
 
-    fn to_net_err(e: impl std::fmt::Display) -> RPCError<u64, BasicNode, RaftError<u64>> {
+    fn to_net_err(e: impl std::fmt::Display) -> RPCError<u64, GgapNode, RaftError<u64>> {
         RPCError::Network(NetworkError::new(&AnyError::error(e.to_string())))
     }
 
-    fn to_unreachable(e: impl std::fmt::Display) -> RPCError<u64, BasicNode, RaftError<u64>> {
+    fn to_unreachable(e: impl std::fmt::Display) -> RPCError<u64, GgapNode, RaftError<u64>> {
         RPCError::Unreachable(Unreachable::new(&AnyError::error(e.to_string())))
     }
 
     fn to_iss_unreachable(
         e: impl std::fmt::Display,
-    ) -> RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>> {
+    ) -> RPCError<u64, GgapNode, RaftError<u64, openraft::error::InstallSnapshotError>> {
         RPCError::Unreachable(Unreachable::new(&AnyError::error(e.to_string())))
     }
 
     fn to_iss_net_err(
         e: impl std::fmt::Display,
-    ) -> RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>> {
+    ) -> RPCError<u64, GgapNode, RaftError<u64, openraft::error::InstallSnapshotError>> {
         RPCError::Network(NetworkError::new(&AnyError::error(e.to_string())))
     }
 }
@@ -109,7 +109,7 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         &mut self,
         rpc: AppendEntriesRequest<GgapTypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, GgapNode, RaftError<u64>>> {
         let span = tracing::info_span!(
             "rpc.client.append_entries",
             otel.kind = "client",
@@ -152,7 +152,7 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         &mut self,
         rpc: VoteRequest<u64>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+    ) -> Result<VoteResponse<u64>, RPCError<u64, GgapNode, RaftError<u64>>> {
         let span = tracing::info_span!(
             "rpc.client.vote",
             otel.kind = "client",
@@ -197,7 +197,7 @@ impl RaftNetwork<GgapTypeConfig> for GgapNetwork {
         _option: RPCOption,
     ) -> Result<
         openraft::raft::InstallSnapshotResponse<u64>,
-        RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
+        RPCError<u64, GgapNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
     > {
         let span = tracing::info_span!(
             "rpc.client.install_snapshot",

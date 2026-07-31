@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::config::GgapTypeConfig;
+use crate::config::{GgapNode, GgapTypeConfig};
 use crate::convert::{self, decode, encode, log_id_to_or_log_id};
 use ggap_storage::fjall::FjallStateMachine;
 use ggap_storage::traits::StateMachineStore;
@@ -9,8 +9,8 @@ use ggap_types::{GgapError, KvResponse, ShardId};
 use openraft::storage::RaftStateMachine;
 use openraft::AnyError;
 use openraft::{
-    BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftSnapshotBuilder, RaftTypeConfig,
-    Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
+    EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftSnapshotBuilder, RaftTypeConfig, Snapshot,
+    SnapshotMeta, StorageError, StorageIOError, StoredMembership,
 };
 
 fn sto_err(msg: impl Into<String>) -> StorageError<u64> {
@@ -43,7 +43,7 @@ impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, GgapNode>), StorageError<u64>> {
         let shard_id = self.shard_id;
 
         let last_applied = self
@@ -53,7 +53,7 @@ impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
             .map_err(|e| sto_err(e.to_string()))?;
         let log_id = last_applied.0.map(log_id_to_or_log_id);
         let membership = match last_applied.1 {
-            Some(bytes) => decode::<StoredMembership<u64, BasicNode>>(&bytes)
+            Some(bytes) => decode::<StoredMembership<u64, GgapNode>>(&bytes)
                 .map_err(|e| sto_err(e.to_string()))?,
             None => StoredMembership::default(),
         };
@@ -138,7 +138,7 @@ impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<u64, BasicNode>,
+        meta: &SnapshotMeta<u64, GgapNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
         let shard_id = self.shard_id;
@@ -182,7 +182,7 @@ impl RaftStateMachine<GgapTypeConfig> for GgapStateMachine {
         let cursor = Cursor::new(data);
 
         let membership = match our_snap.meta.membership_bytes.is_empty() {
-            false => decode::<StoredMembership<u64, BasicNode>>(&our_snap.meta.membership_bytes)
+            false => decode::<StoredMembership<u64, GgapNode>>(&our_snap.meta.membership_bytes)
                 .map_err(|e| sto_err(e.to_string()))?,
             true => StoredMembership::default(),
         };
@@ -227,7 +227,7 @@ impl RaftSnapshotBuilder<GgapTypeConfig> for GgapSnapshotBuilder {
         Ok(Snapshot {
             meta: SnapshotMeta {
                 last_log_id: our_snap.meta.last_log_id.map(convert::log_id_to_or_log_id),
-                last_membership: decode::<StoredMembership<u64, BasicNode>>(
+                last_membership: decode::<StoredMembership<u64, GgapNode>>(
                     &our_snap.meta.membership_bytes,
                 )
                 .map_err(|e| sto_err(e.to_string()))?,

@@ -15,12 +15,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
-use openraft::BasicNode;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine, NodeAddrs,
+    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
     SplitCoordinatorConfig,
 };
@@ -32,6 +31,7 @@ use ggap_proto::v1::{
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
+use ggap_types::NodeAddrs;
 
 const METRIC: &str = "rpc_server_call_duration_seconds";
 
@@ -125,12 +125,8 @@ async fn start_single_node() -> TestNode {
     }));
 
     // Single-node bootstrap.
-    let members: BTreeMap<u64, BasicNode> = BTreeMap::from([(
-        1,
-        BasicNode {
-            addr: cluster_addr.to_string(),
-        },
-    )]);
+    let members: BTreeMap<u64, GgapNode> =
+        BTreeMap::from([(1, GgapNode::cluster_only(cluster_addr.to_string()))]);
     raft.initialize(members).await.expect("cluster init");
 
     // Wait until this node is leader so writes are accepted.

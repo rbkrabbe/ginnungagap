@@ -15,14 +15,14 @@ use openraft::{
     error::{NetworkError, RPCError, RaftError, Unreachable},
     network::RPCOption,
     raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse},
-    AnyError, BasicNode, ChangeMembers, RaftNetwork, RaftNetworkFactory, ServerState,
+    AnyError, ChangeMembers, RaftNetwork, RaftNetworkFactory, ServerState,
 };
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use tempfile::TempDir;
 use tokio::sync::{Mutex, RwLock};
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapRaft, GgapStateMachine, GgapTypeConfig,
+    build_raft_config, GgapLogStorage, GgapNode, GgapRaft, GgapStateMachine, GgapTypeConfig,
 };
 use ggap_storage::{
     fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
@@ -103,7 +103,7 @@ struct SimNetworkFactory {
 impl RaftNetworkFactory<GgapTypeConfig> for SimNetworkFactory {
     type Network = SimNetwork;
 
-    async fn new_client(&mut self, target_id: u64, _node: &BasicNode) -> SimNetwork {
+    async fn new_client(&mut self, target_id: u64, _node: &GgapNode) -> SimNetwork {
         SimNetwork {
             from_id: self.from_id,
             target_id,
@@ -125,13 +125,13 @@ struct SimNetwork {
 }
 
 impl SimNetwork {
-    fn rpc_unreachable(msg: impl std::fmt::Display) -> RPCError<u64, BasicNode, RaftError<u64>> {
+    fn rpc_unreachable(msg: impl std::fmt::Display) -> RPCError<u64, GgapNode, RaftError<u64>> {
         RPCError::Unreachable(Unreachable::new(&AnyError::error(msg.to_string())))
     }
 
     fn iss_unreachable(
         msg: impl std::fmt::Display,
-    ) -> RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>> {
+    ) -> RPCError<u64, GgapNode, RaftError<u64, openraft::error::InstallSnapshotError>> {
         RPCError::Unreachable(Unreachable::new(&AnyError::error(msg.to_string())))
     }
 }
@@ -141,7 +141,7 @@ impl RaftNetwork<GgapTypeConfig> for SimNetwork {
         &mut self,
         rpc: AppendEntriesRequest<GgapTypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, GgapNode, RaftError<u64>>> {
         if self.fault.should_drop(self.from_id, self.target_id).await {
             return Err(Self::rpc_unreachable("simulated drop"));
         }
@@ -162,7 +162,7 @@ impl RaftNetwork<GgapTypeConfig> for SimNetwork {
         &mut self,
         rpc: VoteRequest<u64>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+    ) -> Result<VoteResponse<u64>, RPCError<u64, GgapNode, RaftError<u64>>> {
         if self.fault.should_drop(self.from_id, self.target_id).await {
             return Err(Self::rpc_unreachable("simulated drop"));
         }
@@ -185,7 +185,7 @@ impl RaftNetwork<GgapTypeConfig> for SimNetwork {
         _option: RPCOption,
     ) -> Result<
         openraft::raft::InstallSnapshotResponse<u64>,
-        RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
+        RPCError<u64, GgapNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
     > {
         if self.fault.should_drop(self.from_id, self.target_id).await {
             return Err(Self::iss_unreachable("simulated drop"));
@@ -229,7 +229,7 @@ impl SimCluster {
         let cfg = build_raft_config(50, 150, 300, snapshot_threshold);
 
         let mut nodes = Vec::new();
-        let mut initial_members: BTreeMap<u64, BasicNode> = BTreeMap::new();
+        let mut initial_members: BTreeMap<u64, GgapNode> = BTreeMap::new();
 
         for id in 1..=count {
             let dir = tempfile::tempdir().unwrap();
@@ -248,7 +248,7 @@ impl SimCluster {
                     .unwrap(),
             );
             registry.write().await.insert(id, raft.clone());
-            initial_members.insert(id, BasicNode::default());
+            initial_members.insert(id, GgapNode::default());
             nodes.push(SimNode {
                 id,
                 raft,
@@ -797,7 +797,7 @@ async fn test_snapshot_catchup() {
     cluster
         .node(leader)
         .raft
-        .add_learner(new_id, BasicNode::default(), false)
+        .add_learner(new_id, GgapNode::default(), false)
         .await
         .expect("add_learner failed");
 
@@ -898,7 +898,7 @@ async fn test_membership_change_under_partition() {
     cluster
         .node(leader)
         .raft
-        .add_learner(new_id, BasicNode::default(), false)
+        .add_learner(new_id, GgapNode::default(), false)
         .await
         .expect("add_learner failed");
 

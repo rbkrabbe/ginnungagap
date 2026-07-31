@@ -7,13 +7,13 @@ use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, W
 use openraft::{
     error::ForwardToLeader,
     raft::{AppendEntriesRequest, VoteRequest},
-    BasicNode, ChangeMembers, Raft,
+    ChangeMembers, Raft,
 };
 
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::config::GgapTypeConfig;
+use crate::config::{GgapNode, GgapTypeConfig};
 use crate::convert::{decode, encode};
 use crate::RaftNode;
 
@@ -24,10 +24,13 @@ pub type GgapRaft = Raft<GgapTypeConfig>;
 /// Carries both the leader's node id and the address openraft knew for it: the
 /// id is stable and resolvable through the gossip directory, the address is
 /// only a fallback and may already be stale.
-pub(crate) fn not_leader(fwd: &ForwardToLeader<u64, BasicNode>) -> GgapError {
+pub(crate) fn not_leader(fwd: &ForwardToLeader<u64, GgapNode>) -> GgapError {
     GgapError::NotLeader {
         leader_id: fwd.leader_id,
-        leader: fwd.leader_node.as_ref().map(|n: &BasicNode| n.addr.clone()),
+        leader: fwd
+            .leader_node
+            .as_ref()
+            .map(|n: &GgapNode| n.cluster_addr().to_string()),
     }
 }
 
@@ -139,7 +142,7 @@ impl OpenRaftNode {
         let mut voters = Vec::new();
         let mut learners = Vec::new();
         for (nid, node) in membership.nodes() {
-            let pair = (*nid, node.addr.clone());
+            let pair = (*nid, node.cluster_addr().to_string());
             if voter_ids.contains(nid) {
                 voters.push(pair);
             } else {
@@ -159,7 +162,7 @@ impl OpenRaftNode {
     /// Add a node as a non-voting learner to the Raft group.
     pub async fn add_learner(&self, node_id: u64, addr: String) -> Result<(), GgapError> {
         self.raft
-            .add_learner(node_id, BasicNode { addr }, false)
+            .add_learner(node_id, GgapNode::cluster_only(addr), false)
             .await
             .map_err(|e| {
                 if let Some(fwd) = e.forward_to_leader() {
@@ -182,7 +185,7 @@ impl OpenRaftNode {
     pub async fn change_membership(&self, node_ids: BTreeSet<u64>) -> Result<(), GgapError> {
         self.raft
             .change_membership(
-                ChangeMembers::<u64, BasicNode>::ReplaceAllVoters(node_ids),
+                ChangeMembers::<u64, GgapNode>::ReplaceAllVoters(node_ids),
                 true,
             )
             .await
