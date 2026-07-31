@@ -81,10 +81,9 @@ The production `RaftNode` implementation. It:
   both from membership every tick. That is also what bootstraps gossip at all,
   since a fresh node's directory holds only itself and gossip needs a peer
   address before it can learn peer addresses. A node still originates its own
-  entry (its advertised client address is derived by `derive_client_addr` from
-  the host of its cluster address and the port of its client bind, until
-  tk-d049), and gossip is still how addresses cross between nodes that share no
-  shard.
+  entry from its configured advertised addresses (`--cluster-addr` /
+  `--client-addr`), and gossip is still how addresses cross between nodes that
+  share no shard.
 
   One feed can still supply just one field — a split-created shard's persisted
   `bootstrap_members` carries cluster addresses alone (tk-10b7) — so

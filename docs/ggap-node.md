@@ -15,7 +15,8 @@ sources win):
 3. Environment variables with the prefix `GINNUNGAGAP_`, using `__` as the
    section separator (`GINNUNGAGAP_STORAGE__DATA_DIR`, etc.).
 
-CLI flags (`--node-id`, `--client-addr`, `--cluster-addr`, `--peer`, `--data-dir`)
+CLI flags (`--node-id`, `--client-addr`, `--client-listen-addr`, `--cluster-addr`,
+`--cluster-listen-addr`, `--peer`, `--data-dir`)
 are parsed separately with `clap` and take effect regardless of the file
 configuration. They do not flow through `figment`.
 

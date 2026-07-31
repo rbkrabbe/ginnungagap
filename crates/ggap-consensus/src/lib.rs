@@ -24,7 +24,7 @@ use ggap_types::{
 // ---------------------------------------------------------------------------
 
 pub use config::{build_raft_config, GgapNode, GgapTypeConfig};
-pub use gossip::{derive_client_addr, merge_gossip_state, GossipTask};
+pub use gossip::{merge_gossip_state, GossipTask};
 pub use log_store::GgapLogStorage;
 pub use metrics_task::RaftMetricsTask;
 pub use network::{GgapNetwork, GgapNetworkFactory};

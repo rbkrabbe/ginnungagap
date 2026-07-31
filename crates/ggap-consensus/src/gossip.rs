@@ -26,68 +26,13 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_FANOUT: usize = 3;
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Derive the address at which this node's *client* gRPC API is reachable from
-/// elsewhere in the cluster, as the host of `cluster_addr` joined to the port of
-/// `client_bind_addr`.
-///
-/// The client listener is bound to a wildcard in every real deployment
-/// (`--client-addr 0.0.0.0:17000`), so its bind address names a port but no
-/// reachable host. The cluster address is the opposite: it is already an
-/// advertised, resolvable name because Raft membership dials it. Combining them
-/// gives a reachable client address with no new configuration, on the assumption
-/// that both listeners of a node share a hostname — true wherever a node is one
-/// container with one address, which covers the StatefulSet deployment.
-///
-/// A deployment that ever exposes the two ports on different hostnames needs an
-/// explicit advertised address instead; this returns `None` rather than a
-/// malformed address when either input has no port to work with, so an
-/// unsupported topology surfaces as a missing directory entry rather than as a
-/// silently wrong dial target.
-pub fn derive_client_addr(cluster_addr: &str, client_bind_addr: &str) -> Option<String> {
-    let host = host_of(cluster_addr)?;
-    let port = port_of(client_bind_addr)?;
-    if host.starts_with('[') || host.contains(':') {
-        // IPv6 literal — re-bracket so the result reparses as host:port.
-        let bare = host.trim_start_matches('[').trim_end_matches(']');
-        Some(format!("[{bare}]:{port}"))
-    } else {
-        Some(format!("{host}:{port}"))
-    }
-}
-
-/// The host portion of an `addr`, keeping any IPv6 brackets. `None` if there is
-/// no port separator to split on.
-fn host_of(addr: &str) -> Option<&str> {
-    let (host, _) = split_host_port(addr)?;
-    (!host.is_empty()).then_some(host)
-}
-
-/// The port portion of an `addr`. `None` if absent or not a number.
-fn port_of(addr: &str) -> Option<u16> {
-    let (_, port) = split_host_port(addr)?;
-    port.parse().ok()
-}
-
-/// Split on the port separator, honouring IPv6 bracket syntax
-/// (`[::1]:17001` splits after the bracket, not at the first colon).
-fn split_host_port(addr: &str) -> Option<(&str, &str)> {
-    match addr.rfind(']') {
-        Some(close) => {
-            let rest = &addr[close + 1..];
-            let port = rest.strip_prefix(':')?;
-            Some((&addr[..=close], port))
-        }
-        None => addr.rsplit_once(':'),
-    }
-}
-
 pub struct GossipTask {
     router: Arc<ShardRouter>,
     registry: Arc<ShardRegistry>,
     self_node_id: u64,
     self_cluster_addr: String,
-    /// This node's advertised client address, or empty when it could not be
-    /// derived. Empty is gossiped as "unknown" and merged away, never dialled.
+    /// This node's advertised client address (`--client-addr`). An empty string
+    /// is gossiped as "unknown" and merged away, never dialled.
     self_client_addr: String,
     cancel: CancellationToken,
     interval: Duration,
@@ -352,64 +297,6 @@ pub fn entry_from_proto(e: GossipShardEntry) -> ShardEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The shape every real deployment uses: an advertised DNS cluster address
-    /// plus a wildcard client bind.
-    #[test]
-    fn derives_from_dns_cluster_addr_and_wildcard_client_bind() {
-        assert_eq!(
-            derive_client_addr(
-                "ggap-2.ggap-headless.ginnungagap.svc.cluster.local:17001",
-                "0.0.0.0:17000"
-            )
-            .as_deref(),
-            Some("ggap-2.ggap-headless.ginnungagap.svc.cluster.local:17000")
-        );
-    }
-
-    #[test]
-    fn derives_from_ipv4_cluster_addr() {
-        assert_eq!(
-            derive_client_addr("10.42.0.16:17001", "0.0.0.0:17000").as_deref(),
-            Some("10.42.0.16:17000")
-        );
-    }
-
-    /// The host keeps its brackets so the result reparses as `host:port`.
-    #[test]
-    fn derives_from_bracketed_ipv6_cluster_addr() {
-        assert_eq!(
-            derive_client_addr("[fd00::1]:17001", "[::]:17000").as_deref(),
-            Some("[fd00::1]:17000")
-        );
-        assert_eq!(
-            derive_client_addr("[::1]:17001", "0.0.0.0:17000").as_deref(),
-            Some("[::1]:17000")
-        );
-    }
-
-    /// Unparseable input yields no address rather than a malformed one, so an
-    /// unsupported topology shows up as a missing directory entry.
-    #[test]
-    fn returns_none_rather_than_a_malformed_addr() {
-        assert_eq!(derive_client_addr("no-port-here", "0.0.0.0:17000"), None);
-        assert_eq!(derive_client_addr("host:17001", "no-port-here"), None);
-        assert_eq!(derive_client_addr("host:17001", "0.0.0.0:not-a-port"), None);
-        assert_eq!(derive_client_addr(":17001", "0.0.0.0:17000"), None);
-        assert_eq!(derive_client_addr("", ""), None);
-    }
-
-    /// A wildcard *client* bind is what the derivation exists to repair. A
-    /// wildcard *cluster* addr cannot be repaired — nothing here knows a better
-    /// host — so it passes through rather than being guessed at. Raft would be
-    /// equally unable to dial such a node, so this is not a new failure.
-    #[test]
-    fn wildcard_cluster_addr_derives_a_wildcard_host() {
-        assert_eq!(
-            derive_client_addr("0.0.0.0:17001", "0.0.0.0:17000").as_deref(),
-            Some("0.0.0.0:17000")
-        );
-    }
 
     #[test]
     fn proto_round_trip_preserves_both_addrs() {

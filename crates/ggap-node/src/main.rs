@@ -10,9 +10,9 @@ use figment::{
 use serde::Deserialize;
 
 use ggap_consensus::{
-    build_raft_config, derive_client_addr, run_split_handler, GgapLogStorage, GgapNetworkFactory,
-    GgapNode, GgapRaft, GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode,
-    RaftMetricsTask, ShardRegistry, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
+    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft,
+    GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, ShardRegistry,
+    ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,11 @@ struct Cli {
     node_id: u64,
     #[arg(long, default_value = "0.0.0.0:17000")]
     client_addr: String,
+    /// Address to bind the client gRPC listener to. Defaults to `--client-addr`
+    /// when omitted. Set this to `0.0.0.0:<port>` when `--client-addr` is a DNS
+    /// hostname that should only be used for advertisement to other nodes.
+    #[arg(long)]
+    client_listen_addr: Option<String>,
     #[arg(long, default_value = "0.0.0.0:17001")]
     cluster_addr: String,
     /// Address to bind the cluster gRPC listener to. Defaults to `--cluster-addr`
@@ -163,10 +168,16 @@ async fn main() -> anyhow::Result<()> {
     let (_metrics_handle, _metrics_task) =
         observability::init_metrics_recorder(metrics_addr, shutdown.clone())?;
 
-    let client_addr: SocketAddr = cli
-        .client_addr
-        .parse()
-        .with_context(|| format!("invalid client_addr: {}", cli.client_addr))?;
+    let client_addr: SocketAddr = match &cli.client_listen_addr {
+        Some(listen) => listen
+            .parse()
+            .with_context(|| format!("invalid client_listen_addr: {listen}"))?,
+        None => tokio::net::lookup_host(&cli.client_addr)
+            .await
+            .with_context(|| format!("cannot resolve client_addr: {}", cli.client_addr))?
+            .next()
+            .with_context(|| format!("no addresses for client_addr: {}", cli.client_addr))?,
+    };
     let cluster_addr: SocketAddr = match &cli.cluster_listen_addr {
         Some(listen) => listen
             .parse()
@@ -178,23 +189,11 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("no addresses for cluster_addr: {}", cli.cluster_addr))?,
     };
 
-    // The advertised client address: the host of the (advertised, Raft-dialable)
-    // cluster address with the port of the `--client-addr` bind. tk-d049 replaces
-    // this derivation with an explicit advertise/bind pair.
-    //
-    // Needed before any Raft group starts, because seed bootstrap puts it into
-    // the initial membership. Fatal on failure for the same reason `AddLearner`
-    // rejects an empty `client_addr`: a member without one is unreachable for
-    // client forwarding, and only another membership change could fix it. It
-    // takes a malformed `--cluster-addr` / `--client-addr` to get here.
-    let self_client_addr =
-        derive_client_addr(&cli.cluster_addr, &cli.client_addr).with_context(|| {
-            format!(
-                "cannot derive an advertised client address from cluster_addr {} and \
-                 client_addr {}; both must be host:port",
-                cli.cluster_addr, cli.client_addr
-            )
-        })?;
+    // `--client-addr` is what other nodes dial to forward client requests here;
+    // `--client-listen-addr` is where the listener binds. Needed before any Raft
+    // group starts, because seed bootstrap puts the advertised address into the
+    // initial membership.
+    let self_client_addr = cli.client_addr.clone();
     let self_addrs = NodeAddrs::new(cli.cluster_addr.clone(), self_client_addr.clone());
 
     // Use data_dir from CLI if provided (non-default), else fall back to config.

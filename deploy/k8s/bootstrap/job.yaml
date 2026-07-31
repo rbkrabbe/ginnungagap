@@ -43,9 +43,9 @@ data:
       exit 0
     fi
 
-    # AddLearner requires both addresses; an empty client_addr is rejected. Port
-    # 17000 is the advertised form of the `--client-addr 0.0.0.0:17000` bind in
-    # the ggap ConfigMap.
+    # AddLearner requires both addresses; an empty client_addr is rejected.
+    # These must match the `--client-addr` / `--cluster-addr` each pod
+    # advertises in the ggap ConfigMap.
     for id in 1 2; do
       ord=$((id - 1))
       host="ggap-${ord}.ggap-headless.ginnungagap.svc.cluster.local"
