@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-use ggap_types::ShardId;
+use ggap_types::{NodeAddrs, ShardId};
 
 /// One shard's placement + lightweight Raft status as last known to this node.
 ///
@@ -42,39 +42,6 @@ impl ShardEntry {
     /// Age of the snapshot from this node's perspective, in milliseconds.
     pub fn age_ms(&self) -> u64 {
         self.last_updated.elapsed().as_millis() as u64
-    }
-}
-
-/// The gRPC addresses at which a node can be reached.
-///
-/// The two fields arrive by different routes and are therefore merged
-/// independently — see [`ShardRegistry::merge_directory`]. An empty string means
-/// "not known here", never "known to be absent".
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NodeAddrs {
-    /// Cluster gRPC endpoint, shared by RaftService, AdminService and
-    /// GossipService.
-    pub cluster_addr: String,
-    /// Client-facing gRPC endpoint (the KV API listener).
-    pub client_addr: String,
-}
-
-impl NodeAddrs {
-    /// Both addresses known.
-    pub fn new(cluster_addr: impl Into<String>, client_addr: impl Into<String>) -> Self {
-        NodeAddrs {
-            cluster_addr: cluster_addr.into(),
-            client_addr: client_addr.into(),
-        }
-    }
-
-    /// Only the cluster address is known — the shape of every entry derived from
-    /// Raft membership, which carries no client address.
-    pub fn cluster_only(cluster_addr: impl Into<String>) -> Self {
-        NodeAddrs {
-            cluster_addr: cluster_addr.into(),
-            client_addr: String::new(),
-        }
     }
 }
 

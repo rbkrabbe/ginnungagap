@@ -17,7 +17,9 @@ use ggap_proto::v1::{
     gossip_service_client::GossipServiceClient, GossipNode, GossipShardEntry, GossipState,
 };
 
-use crate::registry::{NodeAddrs, ShardEntry, ShardRegistry};
+use ggap_types::NodeAddrs;
+
+use crate::registry::{ShardEntry, ShardRegistry};
 use crate::router::ShardRouter;
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
