@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use openraft::BasicNode;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::{
@@ -30,7 +29,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine, NodeAddrs,
+    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
     SplitCoordinatorConfig,
 };
@@ -38,6 +37,7 @@ use ggap_proto::v1::{kv_service_client::KvServiceClient, GetRequest, PutRequest}
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
+use ggap_types::NodeAddrs;
 
 // ---------------------------------------------------------------------------
 // Process-global test pipeline (installed once)
@@ -152,12 +152,8 @@ async fn start_single_node() -> TestNode {
                 .await;
     }));
 
-    let members: BTreeMap<u64, BasicNode> = BTreeMap::from([(
-        1,
-        BasicNode {
-            addr: cluster_addr.to_string(),
-        },
-    )]);
+    let members: BTreeMap<u64, GgapNode> =
+        BTreeMap::from([(1, GgapNode::cluster_only(cluster_addr.to_string()))]);
     raft.initialize(members).await.expect("cluster init");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

@@ -11,12 +11,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine,
+    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode, ShardRouter,
 };
 use ggap_server::{serve_client_with_listener, KvServiceConfig};
@@ -63,7 +63,7 @@ async fn start_watch_node(broadcast_capacity: usize) -> TestNode {
     );
 
     let mut members = BTreeMap::new();
-    members.insert(1u64, BasicNode::default());
+    members.insert(1u64, GgapNode::default());
     raft.initialize(members).await.unwrap();
 
     raft.wait(Some(Duration::from_secs(5)))

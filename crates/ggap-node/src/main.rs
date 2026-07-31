@@ -7,12 +7,11 @@ use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
-use openraft::BasicNode;
 use serde::Deserialize;
 
 use ggap_consensus::{
     build_raft_config, derive_client_addr, run_split_handler, GgapLogStorage, GgapNetworkFactory,
-    GgapRaft, GgapStateMachine, GossipTask, NodeAddrs, OpenRaftCluster, OpenRaftNode,
+    GgapNode, GgapRaft, GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode,
     RaftMetricsTask, ShardRegistry, ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
@@ -24,7 +23,7 @@ use ggap_storage::{
     ttl::TtlGcTask,
     ShardMap,
 };
-use ggap_types::DomainWatchEvent;
+use ggap_types::{DomainWatchEvent, NodeAddrs};
 
 mod observability;
 
@@ -253,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("raft.is_initialized failed for shard {shard_id}"))?
         {
             let bootstrap_key = meta_key(shard_id, "bootstrap_members");
-            let members: Option<BTreeMap<u64, BasicNode>> = match store.meta.get(&bootstrap_key) {
+            let members: Option<BTreeMap<u64, GgapNode>> = match store.meta.get(&bootstrap_key) {
                 Ok(Some(bytes)) => {
                     let (addr_map, _): (BTreeMap<u64, String>, _) =
                         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
@@ -263,15 +262,13 @@ async fn main() -> anyhow::Result<()> {
                     Some(
                         addr_map
                             .into_iter()
-                            .map(|(id, addr)| (id, BasicNode { addr }))
+                            .map(|(id, addr)| (id, GgapNode::cluster_only(addr)))
                             .collect(),
                     )
                 }
                 Ok(None) if cli.seed => Some(BTreeMap::from([(
                     cli.node_id,
-                    BasicNode {
-                        addr: cli.cluster_addr.clone(),
-                    },
+                    GgapNode::cluster_only(cli.cluster_addr.clone()),
                 )])),
                 Ok(None) => None,
                 Err(e) => {

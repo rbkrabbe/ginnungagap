@@ -2,13 +2,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
 use ggap_storage::SplitApplied;
 use ggap_types::{GgapError, KvCommand, KvResponse, ShardId, ShardInfo, ShardState};
 
+use crate::config::GgapNode;
 use crate::log_store::GgapLogStorage;
 use crate::network::GgapNetworkFactory;
 use crate::node::{GgapRaft, OpenRaftCluster, OpenRaftNode};
@@ -117,7 +118,7 @@ impl SplitCoordinator {
             .ok_or(GgapError::ShardNotFound(shard_id))?;
 
         // 2. Read source shard membership from Raft metrics.
-        let source_members: BTreeMap<u64, BasicNode> = {
+        let source_members: BTreeMap<u64, GgapNode> = {
             let metrics = source_node.raft().metrics().borrow().clone();
             metrics
                 .membership_config
@@ -143,7 +144,7 @@ impl SplitCoordinator {
             source_range: source_info.range.clone(),
             source_members: source_members
                 .iter()
-                .map(|(id, node)| (*id, node.addr.clone()))
+                .map(|(id, node)| (*id, node.cluster_addr().to_string()))
                 .collect(),
         };
         let write_result = source_node.raft().client_write(cmd).await.map_err(|e| {

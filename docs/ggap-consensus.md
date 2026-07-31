@@ -77,11 +77,12 @@ The production `RaftNode` implementation. It:
 
   The two addresses reach the directory by different routes, and that asymmetry
   drives the merge rule. `cluster_addr` also travels inside the Raft membership
-  (openraft `BasicNode.addr`), so `GossipTask::refresh_local` re-derives it from
-  consensus state every tick — which is what bootstraps gossip at all, since a
-  fresh node's directory holds only itself and gossip needs a peer address before
-  it can learn peer addresses. `client_addr` has no such carrier: `BasicNode` has
-  one address field, so a node's client address is originated by that node alone
+  (`GgapNode`, the openraft `Node` for this cluster), so
+  `GossipTask::refresh_local` re-derives it from consensus state every tick —
+  which is what bootstraps gossip at all, since a fresh node's directory holds
+  only itself and gossip needs a peer address before it can learn peer addresses.
+  `client_addr` has no such carrier yet: `GgapNode` has room for it but nothing
+  populates it (tk-fd58), so a node's client address is originated by that node alone
   (derived by `derive_client_addr` from the host of its cluster address and the
   port of its client bind) and spreads by gossip only.
 

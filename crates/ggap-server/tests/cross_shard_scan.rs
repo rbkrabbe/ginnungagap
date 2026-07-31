@@ -10,12 +10,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 use tempfile::TempDir;
 use tonic::Request;
 
 use ggap_consensus::{
-    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapRaft,
+    build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft,
     GgapStateMachine, OpenRaftCluster, OpenRaftNode, ShardRouter, SplitCoordinator,
     SplitCoordinatorConfig,
 };
@@ -63,7 +63,7 @@ async fn setup() -> TestSetup {
     );
 
     let mut members = BTreeMap::new();
-    members.insert(1u64, BasicNode::default());
+    members.insert(1u64, GgapNode::default());
     raft.initialize(members).await.unwrap();
     raft.wait(Some(Duration::from_secs(5)))
         .state(ServerState::Leader, "become leader")

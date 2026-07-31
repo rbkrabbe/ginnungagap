@@ -13,14 +13,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use ggap_consensus::{
-    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapRaft, GgapStateMachine, NodeAddrs,
+    build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
     OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
     SplitCoordinatorConfig,
 };
@@ -28,6 +28,7 @@ use ggap_proto::v1::{kv_service_client::KvServiceClient, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
+use ggap_types::NodeAddrs;
 
 // ---------------------------------------------------------------------------
 // Tuning knobs
@@ -138,16 +139,9 @@ impl BenchCluster {
         for id in 1..=(count as u64) {
             nodes.push(start_node(id).await);
         }
-        let members: BTreeMap<u64, BasicNode> = nodes
+        let members: BTreeMap<u64, GgapNode> = nodes
             .iter()
-            .map(|n| {
-                (
-                    n.id,
-                    BasicNode {
-                        addr: n.cluster_addr.to_string(),
-                    },
-                )
-            })
+            .map(|n| (n.id, GgapNode::cluster_only(n.cluster_addr.to_string())))
             .collect();
         nodes[0]
             .raft

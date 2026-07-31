@@ -197,10 +197,11 @@ impl GossipTask {
             let status = node.cluster_status();
 
             // Each membership pair carries the peer's cluster gRPC address, and
-            // only that — openraft's `BasicNode` has one address field. These
-            // entries are therefore cluster-only, and rely on `merge_directory`
-            // merging field-wise so this once-per-tick refresh does not blank
-            // client addresses learned from gossip.
+            // only that — `GgapNode` has room for a client address but nothing
+            // populates it yet (tk-fd58). These entries are therefore
+            // cluster-only, and rely on `merge_directory` merging field-wise so
+            // this once-per-tick refresh does not blank client addresses learned
+            // from gossip.
             self.registry
                 .merge_directory(
                     status

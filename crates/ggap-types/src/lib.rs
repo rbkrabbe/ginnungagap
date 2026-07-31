@@ -137,8 +137,9 @@ pub enum KvCommand {
         /// Raft membership for the new shard: node_id → gRPC address.
         /// Stored atomically alongside the data movement so that on restart
         /// main.rs can initialise the new shard with the correct peers.
-        /// Uses `String` addresses (not `BasicNode`) to keep ggap-types free
-        /// of any openraft dependency.
+        /// Uses `String` addresses rather than the `GgapNode` that Raft
+        /// membership carries, so this crate stays free of any openraft
+        /// dependency. Widening this to both addresses is tk-10b7.
         source_members: std::collections::BTreeMap<u64, String>,
     },
 }
