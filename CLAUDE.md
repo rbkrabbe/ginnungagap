@@ -30,6 +30,17 @@ ggap-proto / ggap-types / ggap-storage / ggap-consensus / ggap-server / ggap-nod
 
 Each crate has a `docs/<crate>.md` describing its scope.
 
+## Comments
+
+State what a reader needs to understand the code as it stands. No historical
+context — no "used to", no "before tk-xxxx", no narration of what changed. The
+rationale behind a decision belongs in the task file, which `tk show` surfaces.
+A task id is welcome where a fix is still owed (e.g. "`bootstrap_members` is
+cluster-only (tk-10b7)") — that points at work, not at history.
+
+Design docs under `docs/` may carry more context than source comments, but not
+a diff's worth of justification.
+
 ## Pre-Push Checklist
 
 Before every `git push` or PR creation **that touches code**, run all of the
