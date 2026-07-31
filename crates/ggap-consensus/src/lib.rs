@@ -29,7 +29,11 @@ pub use log_store::GgapLogStorage;
 pub use metrics_task::RaftMetricsTask;
 pub use network::{GgapNetwork, GgapNetworkFactory};
 pub use node::{ClusterNode, ClusterStatus, GgapRaft, LeaseManager, OpenRaftCluster, OpenRaftNode};
-pub use registry::{NodeAddrs, ShardEntry, ShardRegistry};
+// `NodeAddrs` is a `ggap-types` domain type, re-exported here so the seven
+// existing `ggap_consensus::NodeAddrs` imports keep working. Both paths are
+// valid; prefer `ggap_types::NodeAddrs` in new code.
+pub use ggap_types::NodeAddrs;
+pub use registry::{ShardEntry, ShardRegistry};
 pub use router::ShardRouter;
 pub use split::{run_split_handler, SplitCoordinator, SplitCoordinatorConfig};
 pub use state_machine::{GgapSnapshotBuilder, GgapStateMachine};

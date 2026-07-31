@@ -52,6 +52,42 @@ pub struct ShardInfo {
     pub state: ShardState,
 }
 
+/// The gRPC addresses at which a node can be reached.
+///
+/// Lives here rather than in `ggap-consensus` because both the gossip directory
+/// and `KvCommand::Split` need the same shape, and this crate depends on neither
+/// openraft nor gRPC. Whoever holds these decides how they are reconciled; the
+/// type itself carries no merge policy.
+///
+/// An empty field means "not known here", never "known to be absent".
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct NodeAddrs {
+    /// Cluster gRPC endpoint, shared by RaftService, AdminService and
+    /// GossipService.
+    pub cluster_addr: String,
+    /// Client-facing gRPC endpoint (the KV API listener).
+    pub client_addr: String,
+}
+
+impl NodeAddrs {
+    /// Both addresses known.
+    pub fn new(cluster_addr: impl Into<String>, client_addr: impl Into<String>) -> Self {
+        NodeAddrs {
+            cluster_addr: cluster_addr.into(),
+            client_addr: client_addr.into(),
+        }
+    }
+
+    /// Only the cluster address is known — the shape of every entry derived from
+    /// Raft membership, which carries no client address.
+    pub fn cluster_only(cluster_addr: impl Into<String>) -> Self {
+        NodeAddrs {
+            cluster_addr: cluster_addr.into(),
+            client_addr: String::new(),
+        }
+    }
+}
+
 /// Stored in last_applied metadata
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogId {
