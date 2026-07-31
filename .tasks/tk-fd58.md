@@ -2,7 +2,7 @@
 id = "tk-fd58"
 title = "add_learner stops discarding NodeInfo.client_addr"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "m"
 priority = 2
 blocked_by = ["tk-441f"]
@@ -14,7 +14,7 @@ touched = ["crates/ggap-consensus/src/node.rs", "crates/ggap-consensus/src/confi
 parent = "tk-d08a"
 base = "eaaed87db6e9016c0dd6e23275f8af7aad417ccb"
 reviewed_at = "2026-07-31T18:38:13+00:00"
-closed = "2026-07-31T19:11:45+00:00"
+closed = "2026-07-31T19:13:46+00:00"
 +++
 ## Context
 
