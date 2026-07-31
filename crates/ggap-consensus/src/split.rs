@@ -7,7 +7,7 @@ use openraft::ServerState;
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
 use ggap_storage::SplitApplied;
-use ggap_types::{GgapError, KvCommand, KvResponse, ShardId, ShardInfo, ShardState};
+use ggap_types::{GgapError, KvCommand, KvResponse, NodeAddrs, ShardId, ShardInfo, ShardState};
 
 use crate::config::GgapNode;
 use crate::log_store::GgapLogStorage;
@@ -144,7 +144,7 @@ impl SplitCoordinator {
             source_range: source_info.range.clone(),
             source_members: source_members
                 .iter()
-                .map(|(id, node)| (*id, node.cluster_addr().to_string()))
+                .map(|(id, node)| (*id, NodeAddrs::from(node.clone())))
                 .collect(),
         };
         let write_result = source_node.raft().client_write(cmd).await.map_err(|e| {

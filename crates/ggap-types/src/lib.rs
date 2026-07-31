@@ -78,8 +78,8 @@ impl NodeAddrs {
         }
     }
 
-    /// Only the cluster address is known — the shape of every entry derived from
-    /// Raft membership, which carries no client address.
+    /// Only the cluster address is known — the shape of an entry for a peer
+    /// whose client address has not reached this node yet.
     pub fn cluster_only(cluster_addr: impl Into<String>) -> Self {
         NodeAddrs {
             cluster_addr: cluster_addr.into(),
@@ -134,13 +134,12 @@ pub enum KvCommand {
         split_key: String,
         new_shard_id: ShardId,
         source_range: KeyRange,
-        /// Raft membership for the new shard: node_id → gRPC address.
+        /// Raft membership for the new shard: node_id → both addresses.
         /// Stored atomically alongside the data movement so that on restart
         /// main.rs can initialise the new shard with the correct peers.
-        /// Uses `String` addresses rather than the `GgapNode` that Raft
-        /// membership carries, so this crate stays free of any openraft
-        /// dependency. Widening this to both addresses is tk-10b7.
-        source_members: std::collections::BTreeMap<u64, String>,
+        /// Carries `NodeAddrs` rather than the `GgapNode` that Raft membership
+        /// carries, so this crate stays free of any openraft dependency.
+        source_members: std::collections::BTreeMap<u64, NodeAddrs>,
     },
 }
 

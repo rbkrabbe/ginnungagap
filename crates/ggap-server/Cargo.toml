@@ -27,6 +27,7 @@ metrics        = { workspace = true }
 
 [dev-dependencies]
 ggap-storage = { path = "../ggap-storage" }
+bincode       = { workspace = true }
 openraft      = { workspace = true }
 tempfile      = { workspace = true }
 tokio-util    = { workspace = true }

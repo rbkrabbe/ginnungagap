@@ -19,13 +19,21 @@ use ggap_consensus::{
     SplitCoordinatorConfig,
 };
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
+use ggap_storage::keys::meta_key;
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
-use ggap_types::{KvCommand, KvResponse, ReadMode, WriteMode};
+use ggap_types::{KvCommand, KvResponse, NodeAddrs, ReadMode, WriteMode};
+
+/// The membership entry for the single node. Both addresses are set: a split
+/// must hand the whole entry to the shard it creates.
+fn self_addrs() -> NodeAddrs {
+    NodeAddrs::new("127.0.0.1:7001", "127.0.0.1:8001")
+}
 
 /// Helper to set up a single-node cluster with one shard.
 struct TestSetup {
     router: Arc<ShardRouter>,
+    store: Arc<FjallStore>,
     shard_map: Arc<ShardMap>,
     split_coordinator: Arc<SplitCoordinator>,
     fsm: Arc<FjallStateMachine>,
@@ -64,9 +72,10 @@ async fn setup() -> TestSetup {
         .unwrap(),
     );
 
-    // Initialize as single-node cluster.
+    // Initialize as single-node cluster. Both addresses are populated so the
+    // split path can be checked for carrying them through to the new shard.
     let mut members = BTreeMap::new();
-    members.insert(1u64, GgapNode::default());
+    members.insert(1u64, GgapNode::from(self_addrs()));
     raft.initialize(members).await.unwrap();
 
     // Wait for leader.
@@ -103,6 +112,7 @@ async fn setup() -> TestSetup {
 
     TestSetup {
         router,
+        store,
         shard_map,
         split_coordinator,
         fsm,
@@ -200,6 +210,39 @@ async fn split_partitions_data_correctly() {
             "key '{key}' should NOT exist in shard 1 storage"
         );
     }
+
+    s.raft.shutdown().await.unwrap();
+}
+
+/// A shard created by a split bootstraps its Raft group from `source_members`,
+/// so whatever those omit the new shard never has. Both addresses must reach it
+/// twice over: in the membership initialised at split time, and in the
+/// `bootstrap_members` a restart re-initialises it from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_carries_both_addresses_to_new_shard() {
+    let s = setup().await;
+
+    let new_shard_id = s.split_coordinator.split(0, "m").await.unwrap();
+
+    // Live membership of the shard the split created.
+    let new_node = s.router.get_node(new_shard_id).await.unwrap();
+    let status = new_node.cluster_status();
+    assert_eq!(
+        status.voters,
+        vec![(1u64, self_addrs())],
+        "split-created shard must start with both addresses for every member"
+    );
+
+    // The same membership persisted, which is what a restart initialises from.
+    let raw = s
+        .store
+        .meta
+        .get(meta_key(new_shard_id, "bootstrap_members"))
+        .unwrap()
+        .expect("bootstrap_members written with the split");
+    let (members, _): (BTreeMap<u64, NodeAddrs>, _) =
+        bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    assert_eq!(members, BTreeMap::from([(1u64, self_addrs())]));
 
     s.raft.shutdown().await.unwrap();
 }

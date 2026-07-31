@@ -12,17 +12,15 @@ use openraft::{Config, SnapshotPolicy};
 /// `Debug + Clone + Default + Eq + serde`, so no `impl Node` is needed here and
 /// `ggap-types` keeps its openraft-free dependency list.
 ///
-/// Membership is the source of truth for both addresses. A split-created
-/// shard's `bootstrap_members` is the one construction site that still leaves
-/// `client_addr` empty (tk-10b7).
+/// Membership is the source of truth for both addresses.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GgapNode {
     pub addrs: NodeAddrs,
 }
 
 impl GgapNode {
-    /// Only the cluster address is known — the shape of every membership entry
-    /// until a client address reaches consensus state.
+    /// Only the cluster address is known — for a caller that has no client
+    /// address to offer, such as a test fixture or a hand-written peer list.
     pub fn cluster_only(cluster_addr: impl Into<String>) -> Self {
         GgapNode {
             addrs: NodeAddrs::cluster_only(cluster_addr),
@@ -43,6 +41,14 @@ impl GgapNode {
 impl From<NodeAddrs> for GgapNode {
     fn from(addrs: NodeAddrs) -> Self {
         GgapNode { addrs }
+    }
+}
+
+/// The seam at the `ggap-types` boundary: `KvCommand::Split` carries membership
+/// as `NodeAddrs`, since `ggap-types` has no openraft dependency.
+impl From<GgapNode> for NodeAddrs {
+    fn from(node: GgapNode) -> Self {
+        node.addrs
     }
 }
 
