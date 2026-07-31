@@ -178,6 +178,25 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("no addresses for cluster_addr: {}", cli.cluster_addr))?,
     };
 
+    // The advertised client address: the host of the (advertised, Raft-dialable)
+    // cluster address with the port of the `--client-addr` bind. tk-d049 replaces
+    // this derivation with an explicit advertise/bind pair.
+    //
+    // Needed before any Raft group starts, because seed bootstrap puts it into
+    // the initial membership. Fatal on failure for the same reason `AddLearner`
+    // rejects an empty `client_addr`: a member without one is unreachable for
+    // client forwarding, and only another membership change could fix it. It
+    // takes a malformed `--cluster-addr` / `--client-addr` to get here.
+    let self_client_addr =
+        derive_client_addr(&cli.cluster_addr, &cli.client_addr).with_context(|| {
+            format!(
+                "cannot derive an advertised client address from cluster_addr {} and \
+                 client_addr {}; both must be host:port",
+                cli.cluster_addr, cli.client_addr
+            )
+        })?;
+    let self_addrs = NodeAddrs::new(cli.cluster_addr.clone(), self_client_addr.clone());
+
     // Use data_dir from CLI if provided (non-default), else fall back to config.
     let data_dir = if cli.data_dir == std::path::Path::new("/var/lib/ginnungagap") {
         std::path::PathBuf::from(&config.storage.data_dir)
@@ -268,7 +287,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(None) if cli.seed => Some(BTreeMap::from([(
                     cli.node_id,
-                    GgapNode::cluster_only(cli.cluster_addr.clone()),
+                    GgapNode::from(self_addrs.clone()),
                 )])),
                 Ok(None) => None,
                 Err(e) => {
@@ -347,28 +366,12 @@ async fn main() -> anyhow::Result<()> {
     //     directory grows transitively from each shard's Raft membership, so any
     //     node can report consensus state for shards it does not host locally.
     //
-    //     `--client-addr` is a bind address, so it names a port but no reachable
-    //     host; the advertised client address takes its host from the (already
-    //     advertised, Raft-dialable) cluster address. Only this node originates
-    //     it — peers learn it by gossip alone, since Raft membership has nowhere
-    //     to carry a second address.
-    let self_client_addr = derive_client_addr(&cli.cluster_addr, &cli.client_addr);
-    if self_client_addr.is_none() {
-        tracing::warn!(
-            cluster_addr = %cli.cluster_addr,
-            client_addr = %cli.client_addr,
-            "cannot derive an advertised client address; peers will not be able to \
-             forward leader-required requests to this node"
-        );
-    }
-    let self_client_addr = self_client_addr.unwrap_or_default();
-
+    //     Self-seeding stays for now: gossip still carries the directory between
+    //     nodes that share no shard. tk-11b6 makes the entries for locally hosted
+    //     shards derived from membership instead.
     let registry = Arc::new(ShardRegistry::new(
         cli.node_id,
-        [(
-            cli.node_id,
-            NodeAddrs::new(cli.cluster_addr.clone(), self_client_addr.clone()),
-        )],
+        [(cli.node_id, self_addrs.clone())],
     ));
     tokio::spawn(
         GossipTask::new(

@@ -196,19 +196,16 @@ impl GossipTask {
             };
             let status = node.cluster_status();
 
-            // Each membership pair carries the peer's cluster gRPC address, and
-            // only that — `GgapNode` has room for a client address but nothing
-            // populates it yet (tk-fd58). These entries are therefore
-            // cluster-only, and rely on `merge_directory` merging field-wise so
-            // this once-per-tick refresh does not blank client addresses learned
-            // from gossip.
+            // Membership carries both addresses. `merge_directory` merges
+            // field-wise, so a split-created shard's cluster-only
+            // `bootstrap_members` (tk-10b7) cannot blank a client address.
             self.registry
                 .merge_directory(
                     status
                         .voters
                         .iter()
                         .chain(status.learners.iter())
-                        .map(|(id, addr)| (*id, NodeAddrs::cluster_only(addr.clone()))),
+                        .map(|(id, addrs)| (*id, addrs.clone())),
                 )
                 .await;
 

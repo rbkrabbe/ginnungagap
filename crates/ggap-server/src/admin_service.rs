@@ -9,6 +9,7 @@ use ggap_proto::v1::{
     SplitShardResponse,
 };
 use ggap_storage::ShardMap;
+use ggap_types::NodeAddrs;
 use tonic::{Request, Response, Status};
 
 use crate::convert::ggap_to_status;
@@ -51,10 +52,12 @@ impl AdminServiceImpl {
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         let shard_id = req.shard_id.unwrap_or(0);
 
-        let to_node_info = |(node_id, cluster_addr): (u64, String)| NodeInfo {
+        // Membership carries both addresses, so a locally hosted shard answers
+        // in full without gossip having run.
+        let to_node_info = |(node_id, addrs): (u64, NodeAddrs)| NodeInfo {
             node_id,
-            client_addr: String::new(),
-            cluster_addr,
+            client_addr: addrs.client_addr,
+            cluster_addr: addrs.cluster_addr,
         };
 
         // Prefer fresh local openraft metrics when we host the shard.
@@ -97,14 +100,17 @@ impl AdminServiceImpl {
         }
     }
 
-    /// Resolve node ids to `NodeInfo`, filling `cluster_addr` from the gossiped
+    /// Resolve node ids to `NodeInfo`, filling both addresses from the gossiped
     /// directory where known (empty otherwise).
+    ///
+    /// Only used for shards this node does not host; a hosted shard reads
+    /// membership directly and needs no directory lookup.
     async fn ids_to_node_infos(&self, ids: &[u64]) -> Vec<NodeInfo> {
         let mut out = Vec::with_capacity(ids.len());
         for &node_id in ids {
             out.push(NodeInfo {
                 node_id,
-                client_addr: String::new(),
+                client_addr: self.registry.client_addr(node_id).await.unwrap_or_default(),
                 cluster_addr: self
                     .registry
                     .directory_addr(node_id)
@@ -128,10 +134,18 @@ impl AdminServiceImpl {
         if node_info.cluster_addr.is_empty() {
             return Err(Status::invalid_argument("cluster_addr must not be empty"));
         }
+        // A learner without a client address is one nothing can forward a client
+        // request to, and only another membership change could fix it.
+        if node_info.client_addr.is_empty() {
+            return Err(Status::invalid_argument("client_addr must not be empty"));
+        }
 
         let raft_node = self.node_for_shard(req.shard_id.unwrap_or(0)).await?;
         match raft_node
-            .add_learner(node_info.node_id, node_info.cluster_addr)
+            .add_learner(
+                node_info.node_id,
+                NodeAddrs::new(node_info.cluster_addr, node_info.client_addr),
+            )
             .await
         {
             Ok(()) => Ok(Response::new(AddLearnerResponse {

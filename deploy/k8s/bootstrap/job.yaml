@@ -43,12 +43,17 @@ data:
       exit 0
     fi
 
+    # AddLearner requires both addresses; an empty client_addr is rejected. Port
+    # 17000 is the advertised form of the `--client-addr 0.0.0.0:17000` bind in
+    # the ggap ConfigMap.
     for id in 1 2; do
       ord=$((id - 1))
-      addr="ggap-${ord}.ggap-headless.ginnungagap.svc.cluster.local:17001"
-      echo "AddLearner node_id=${id} cluster_addr=${addr}"
+      host="ggap-${ord}.ggap-headless.ginnungagap.svc.cluster.local"
+      addr="${host}:17001"
+      client="${host}:17000"
+      echo "AddLearner node_id=${id} cluster_addr=${addr} client_addr=${client}"
       grpcurl -plaintext -max-time 10 \
-        -d "{\"node\":{\"nodeId\":${id},\"clusterAddr\":\"${addr}\"}}" \
+        -d "{\"node\":{\"nodeId\":${id},\"clusterAddr\":\"${addr}\",\"clientAddr\":\"${client}\"}}" \
         "${SEED}" ginnungagap.v1.AdminService/AddLearner
     done
 

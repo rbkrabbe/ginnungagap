@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use ggap_storage::fjall::FjallStateMachine;
 use ggap_storage::traits::StateMachineStore;
-use ggap_types::{GgapError, KvCommand, KvEntry, KvResponse, ReadMode, ShardId, WriteMode};
+use ggap_types::{
+    GgapError, KvCommand, KvEntry, KvResponse, NodeAddrs, ReadMode, ShardId, WriteMode,
+};
 use openraft::{
     error::ForwardToLeader,
     raft::{AppendEntriesRequest, VoteRequest},
@@ -66,8 +68,11 @@ pub struct ClusterStatus {
     pub term: u64,
     pub leader_id: Option<u64>,
     pub last_applied: u64,
-    pub voters: Vec<(u64, String)>,
-    pub learners: Vec<(u64, String)>,
+    /// Both addresses, out of committed Raft membership — no gossip involved.
+    /// `client_addr` is empty only for a split-created shard's
+    /// `bootstrap_members` (tk-10b7).
+    pub voters: Vec<(u64, NodeAddrs)>,
+    pub learners: Vec<(u64, NodeAddrs)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +147,7 @@ impl OpenRaftNode {
         let mut voters = Vec::new();
         let mut learners = Vec::new();
         for (nid, node) in membership.nodes() {
-            let pair = (*nid, node.cluster_addr().to_string());
+            let pair = (*nid, node.addrs.clone());
             if voter_ids.contains(nid) {
                 voters.push(pair);
             } else {
@@ -160,9 +165,13 @@ impl OpenRaftNode {
     }
 
     /// Add a node as a non-voting learner to the Raft group.
-    pub async fn add_learner(&self, node_id: u64, addr: String) -> Result<(), GgapError> {
+    ///
+    /// Both addresses go into membership, so peers learn them by replication
+    /// rather than by gossip. `addrs` is validated by the caller —
+    /// `AdminService::add_learner` rejects an empty address of either kind.
+    pub async fn add_learner(&self, node_id: u64, addrs: NodeAddrs) -> Result<(), GgapError> {
         self.raft
-            .add_learner(node_id, GgapNode::cluster_only(addr), false)
+            .add_learner(node_id, GgapNode::from(addrs), false)
             .await
             .map_err(|e| {
                 if let Some(fwd) = e.forward_to_leader() {
