@@ -2,7 +2,7 @@
 id = "tk-fd58"
 title = "add_learner stops discarding NodeInfo.client_addr"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "m"
 priority = 2
 blocked_by = ["tk-441f"]
@@ -10,11 +10,11 @@ tags = []
 created = "2026-07-30T19:07:52+00:00"
 spec_approved = false
 review = "pass"
-touched = ["crates/ggap-consensus/src/node.rs", "crates/ggap-consensus/src/config.rs", "crates/ggap-server/src/admin_service.rs", "crates/ggap-node/src/main.rs", "crates/ggap-consensus/src/gossip.rs", "crates/ggap-server/tests/three_node_cluster.rs", "docs/ggap-consensus.md", "deploy/k8s/bootstrap/job.yaml", "deploy/README.md"]
+touched = ["crates/ggap-consensus/src/node.rs", "crates/ggap-consensus/src/config.rs", "crates/ggap-server/src/admin_service.rs", "crates/ggap-node/src/main.rs", "crates/ggap-consensus/src/gossip.rs", "crates/ggap-server/tests/three_node_cluster.rs", "docs/ggap-consensus.md", "deploy/k8s/bootstrap/job.yaml", "deploy/README.md", "../../.claude/projects/-Users-rasmusbachkrabbe-projects-ginnungagap/memory/comments-state-present-not-history.md", "../../.claude/projects/-Users-rasmusbachkrabbe-projects-ginnungagap/memory/MEMORY.md"]
 parent = "tk-d08a"
 base = "eaaed87db6e9016c0dd6e23275f8af7aad417ccb"
 reviewed_at = "2026-07-31T18:38:13+00:00"
-closed = "2026-07-31T19:13:46+00:00"
+closed = "2026-07-31T19:23:16+00:00"
 +++
 ## Context
 
