@@ -75,18 +75,19 @@ The production `RaftNode` implementation. It:
   reads; `ClusterNode` keeps openraft types out of the `ggap-server` dependency
   tree.
 
-  The two addresses reach the directory by different routes, and that asymmetry
-  drives the merge rule. `cluster_addr` also travels inside the Raft membership
-  (`GgapNode`, the openraft `Node` for this cluster), so
-  `GossipTask::refresh_local` re-derives it from consensus state every tick —
-  which is what bootstraps gossip at all, since a fresh node's directory holds
-  only itself and gossip needs a peer address before it can learn peer addresses.
-  `client_addr` has no such carrier yet: `GgapNode` has room for it but nothing
-  populates it (tk-fd58), so a node's client address is originated by that node alone
-  (derived by `derive_client_addr` from the host of its cluster address and the
-  port of its client bind) and spreads by gossip only.
+  Both addresses travel inside the Raft membership (`GgapNode`, the openraft
+  `Node` for this cluster): cluster bootstrap and `AddLearner` each put a full
+  `NodeAddrs` into consensus state, so `GossipTask::refresh_local` re-derives
+  both from membership every tick. That is also what bootstraps gossip at all,
+  since a fresh node's directory holds only itself and gossip needs a peer
+  address before it can learn peer addresses. A node still originates its own
+  entry (its advertised client address is derived by `derive_client_addr` from
+  the host of its cluster address and the port of its client bind, until
+  tk-d049), and gossip is still how addresses cross between nodes that share no
+  shard.
 
-  Because one feed supplies both fields and the other supplies just one,
+  One feed can still supply just one field — a split-created shard's persisted
+  `bootstrap_members` carries cluster addresses alone (tk-10b7) — so
   `merge_directory` merges **field by field** and treats an empty field as
   "unknown", never as "cleared". A whole-value merge would let the once-per-tick
-  membership refresh blank every client address in the cluster.
+  membership refresh blank client addresses learned elsewhere.

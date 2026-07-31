@@ -33,7 +33,9 @@ use ggap_storage::ShardMap;
 use ggap_types::{GgapError, KvCommand, KvResponse, NodeAddrs, ReadMode, WriteMode};
 
 use ggap_proto::v1::admin_service_server::AdminService;
-use ggap_proto::v1::{ClusterStatusRequest, ListShardsRequest, ShardInfoProto};
+use ggap_proto::v1::{
+    AddLearnerRequest, ClusterStatusRequest, ListShardsRequest, NodeInfo, ShardInfoProto,
+};
 
 // ---------------------------------------------------------------------------
 // TestNode — a single in-process Raft node with gRPC servers running
@@ -47,15 +49,25 @@ struct TestNode {
     /// The address the client listener is actually bound to. The directory
     /// entry other nodes gossip about this node must resolve to this.
     client_addr: SocketAddr,
+    /// The advertised form of `client_addr` — what goes into Raft membership
+    /// and the gossip directory.
+    advertised_client_addr: String,
     registry: Arc<ShardRegistry>,
     raft_node: Arc<OpenRaftNode>,
+    /// In-process AdminService over the same router and registry the node's
+    /// cluster server exposes, so tests can call admin RPCs without a client.
+    admin: AdminServiceForTesting,
     // Kept alive so the servers stay running; aborted on drop via TestCluster::shutdown.
     _handles: Vec<tokio::task::JoinHandle<()>>,
     // Kept alive so the tempdir is not deleted while the node is running.
     _tempdir: TempDir,
 }
 
-async fn start_node(id: u64) -> TestNode {
+/// `gossip = false` starts every server but the gossip task, so nothing can
+/// reach the directory except Raft. Tests that assert membership is the source
+/// of truth for an address need that: with gossip running, an assertion passes
+/// whether the address arrived through consensus or through a gossip tick.
+async fn start_node(id: u64, gossip: bool) -> TestNode {
     let tempdir = TempDir::new().unwrap();
     let store = FjallStore::open(tempdir.path()).unwrap();
 
@@ -137,19 +149,21 @@ async fn start_node(id: u64) -> TestNode {
 
     let mut handles = Vec::new();
 
-    handles.push(tokio::spawn(
-        GossipTask::new(
-            router.clone(),
-            registry.clone(),
-            id,
-            cluster_addr.to_string(),
-            self_client_addr,
-            CancellationToken::new(),
-        )
-        .with_interval(Duration::from_millis(50))
-        .with_rpc_timeout(Duration::from_secs(1))
-        .run(),
-    ));
+    if gossip {
+        handles.push(tokio::spawn(
+            GossipTask::new(
+                router.clone(),
+                registry.clone(),
+                id,
+                cluster_addr.to_string(),
+                self_client_addr.clone(),
+                CancellationToken::new(),
+            )
+            .with_interval(Duration::from_millis(50))
+            .with_rpc_timeout(Duration::from_secs(1))
+            .run(),
+        ));
+    }
 
     let r = router.clone();
     let sc = split_coordinator.clone();
@@ -178,6 +192,13 @@ async fn start_node(id: u64) -> TestNode {
         fsm,
         cluster_addr,
         client_addr,
+        advertised_client_addr: self_client_addr,
+        admin: AdminServiceForTesting::new(
+            router.clone(),
+            split_coordinator.clone(),
+            shard_map.clone(),
+            registry.clone(),
+        ),
         registry,
         raft_node,
         _handles: handles,
@@ -196,15 +217,30 @@ struct TestCluster {
 impl TestCluster {
     /// Start `count` nodes and initialise them as a single Raft cluster.
     async fn start(count: usize) -> Self {
+        Self::start_with_gossip(count, true).await
+    }
+
+    /// As [`TestCluster::start`], but optionally without any gossip task
+    /// running. See [`start_node`].
+    async fn start_with_gossip(count: usize, gossip: bool) -> Self {
         let mut nodes = Vec::with_capacity(count);
         for id in 1..=(count as u64) {
-            nodes.push(start_node(id).await);
+            nodes.push(start_node(id, gossip).await);
         }
 
-        // Build the full member map with each node's cluster address.
+        // Build the full member map with both of each node's addresses, exactly
+        // as `ggap-node`'s seed bootstrap does.
         let members: BTreeMap<u64, GgapNode> = nodes
             .iter()
-            .map(|n| (n.id, GgapNode::cluster_only(n.cluster_addr.to_string())))
+            .map(|n| {
+                (
+                    n.id,
+                    GgapNode::from(NodeAddrs::new(
+                        n.cluster_addr.to_string(),
+                        n.advertised_client_addr.clone(),
+                    )),
+                )
+            })
             .collect();
 
         // Only one node calls initialize(); the others learn about the cluster
@@ -527,11 +563,15 @@ async fn cluster_status_reflects_elected_leader_and_membership() {
         "expected voters {{1,2,3}}, got {voter_ids:?}"
     );
 
-    // Each member should have a non-empty cluster address.
-    for (nid, addr) in &status.voters {
+    // Each member should have both addresses in membership.
+    for (nid, addrs) in &status.voters {
         assert!(
-            !addr.is_empty(),
+            !addrs.cluster_addr.is_empty(),
             "node {nid} has empty cluster addr in membership"
+        );
+        assert!(
+            !addrs.client_addr.is_empty(),
+            "node {nid} has empty client addr in membership"
         );
     }
 
@@ -581,7 +621,7 @@ async fn add_learner_updates_membership() {
     // the membership change still commits through Raft).
     leader
         .raft_node
-        .add_learner(99, "127.0.0.1:19999".to_string())
+        .add_learner(99, NodeAddrs::new("127.0.0.1:19999", "127.0.0.1:19998"))
         .await
         .expect("add_learner should succeed on leader");
 
@@ -658,6 +698,172 @@ fn assert_leader_hint_consistent(err: &GgapError, cluster: &TestCluster) {
     );
 }
 
+/// Look up a node's entry in a `ClusterStatus` response, voter or learner.
+fn node_info_for(resp: &ggap_proto::v1::ClusterStatusResponse, node_id: u64) -> Option<&NodeInfo> {
+    resp.nodes
+        .iter()
+        .chain(resp.learners.iter())
+        .find(|n| n.node_id == node_id)
+}
+
+/// The payoff assertion for this epic: with no gossip task running anywhere,
+/// every node still reports every peer's *client* address. Membership is the
+/// only path that address can have taken — a follower never called
+/// `initialize()`, so it holds what Raft replicated to it and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_addr_comes_from_membership_without_gossip() {
+    let cluster = TestCluster::start_with_gossip(3, false).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let follower = &cluster.nodes[(0..3).find(|&i| i != leader_idx).unwrap()];
+
+    // The directory was seeded with this node alone and nothing refreshes it,
+    // so any peer address in the response cannot have come from there.
+    for peer in cluster.nodes.iter().filter(|n| n.id != follower.id) {
+        assert_eq!(
+            follower.registry.client_addr(peer.id).await,
+            None,
+            "node {} should have no gossiped client address for peer {}",
+            follower.id,
+            peer.id
+        );
+    }
+
+    let resp = follower
+        .admin
+        .cluster_status(tonic::Request::new(ClusterStatusRequest {
+            shard_id: Some(0),
+        }))
+        .await
+        .expect("cluster_status should succeed")
+        .into_inner();
+
+    for peer in &cluster.nodes {
+        let info = node_info_for(&resp, peer.id)
+            .unwrap_or_else(|| panic!("node {} missing from cluster status", peer.id));
+        assert_eq!(
+            info.client_addr, peer.advertised_client_addr,
+            "node {} reported the wrong client address for peer {}",
+            follower.id, peer.id
+        );
+        assert_eq!(
+            info.cluster_addr,
+            peer.cluster_addr.to_string(),
+            "node {} reported the wrong cluster address for peer {}",
+            follower.id,
+            peer.id
+        );
+    }
+
+    cluster.shutdown().await;
+}
+
+/// A learner joined through the `AddLearner` RPC reaches committed membership
+/// with both addresses, and every node sees both — again with gossip stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_learner_rpc_puts_both_addresses_in_membership() {
+    let cluster = TestCluster::start_with_gossip(3, false).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let leader = &cluster.nodes[leader_idx];
+
+    // Node 99 need not be running for the membership change to commit.
+    let resp = leader
+        .admin
+        .add_learner(tonic::Request::new(AddLearnerRequest {
+            shard_id: Some(0),
+            node: Some(NodeInfo {
+                node_id: 99,
+                cluster_addr: "127.0.0.1:19999".to_string(),
+                client_addr: "127.0.0.1:19998".to_string(),
+            }),
+        }))
+        .await
+        .expect("add_learner should succeed on leader")
+        .into_inner();
+    assert!(resp.ok, "add_learner failed: {}", resp.error);
+
+    // Assert on a follower: it holds only what Raft replicated to it.
+    let follower = &cluster.nodes[(0..3).find(|&i| i != leader_idx).unwrap()];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = follower
+            .admin
+            .cluster_status(tonic::Request::new(ClusterStatusRequest {
+                shard_id: Some(0),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        if let Some(info) = node_info_for(&status, 99) {
+            assert_eq!(info.cluster_addr, "127.0.0.1:19999");
+            assert_eq!(
+                info.client_addr, "127.0.0.1:19998",
+                "learner's client address was dropped on the way through Raft"
+            );
+            assert!(
+                status.learners.iter().any(|n| n.node_id == 99),
+                "node 99 should be a learner, not a voter"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 99 never reached the follower's membership"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    cluster.shutdown().await;
+}
+
+/// An `AddLearner` with no client address is rejected outright.
+///
+/// Membership is now the source of truth for the client address, so admitting a
+/// learner without one produces a member nothing can forward a client request
+/// to, and nothing later fills the gap in. Failing the join is the only loud
+/// moment available.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_learner_rpc_rejects_empty_client_addr() {
+    let cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+    let leader = &cluster.nodes[leader_idx];
+
+    let status = leader
+        .admin
+        .add_learner(tonic::Request::new(AddLearnerRequest {
+            shard_id: Some(0),
+            node: Some(NodeInfo {
+                node_id: 99,
+                cluster_addr: "127.0.0.1:19999".to_string(),
+                client_addr: String::new(),
+            }),
+        }))
+        .await
+        .expect_err("empty client_addr must be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("client_addr"),
+        "message should name the offending field, got {:?}",
+        status.message()
+    );
+
+    // Rejected before Raft: no membership change was proposed.
+    let membership_ids: BTreeSet<u64> = leader
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(nid, _)| *nid)
+        .collect();
+    assert!(
+        !membership_ids.contains(&99),
+        "rejected learner reached membership: {membership_ids:?}"
+    );
+
+    cluster.shutdown().await;
+}
+
 /// Verifies that `add_learner` called on a follower returns `NotLeader`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_learner_on_follower_returns_not_leader() {
@@ -667,7 +873,7 @@ async fn add_learner_on_follower_returns_not_leader() {
     let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
     let err = cluster.nodes[follower_idx]
         .raft_node
-        .add_learner(99, "127.0.0.1:19999".to_string())
+        .add_learner(99, NodeAddrs::new("127.0.0.1:19999", "127.0.0.1:19998"))
         .await
         .expect_err("add_learner on follower should fail");
 

@@ -43,12 +43,19 @@ data:
       exit 0
     fi
 
+    # Both addresses are required: they go into Raft membership together, and
+    # AddLearner rejects an empty client_addr rather than admitting a member
+    # nothing can forward a client request to. The client address is the pod's
+    # advertised form of the `--client-addr 0.0.0.0:17000` bind in the ggap
+    # ConfigMap — same host as the cluster address, client port.
     for id in 1 2; do
       ord=$((id - 1))
-      addr="ggap-${ord}.ggap-headless.ginnungagap.svc.cluster.local:17001"
-      echo "AddLearner node_id=${id} cluster_addr=${addr}"
+      host="ggap-${ord}.ggap-headless.ginnungagap.svc.cluster.local"
+      addr="${host}:17001"
+      client="${host}:17000"
+      echo "AddLearner node_id=${id} cluster_addr=${addr} client_addr=${client}"
       grpcurl -plaintext -max-time 10 \
-        -d "{\"node\":{\"nodeId\":${id},\"clusterAddr\":\"${addr}\"}}" \
+        -d "{\"node\":{\"nodeId\":${id},\"clusterAddr\":\"${addr}\",\"clientAddr\":\"${client}\"}}" \
         "${SEED}" ginnungagap.v1.AdminService/AddLearner
     done
 

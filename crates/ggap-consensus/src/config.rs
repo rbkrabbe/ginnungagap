@@ -12,8 +12,10 @@ use openraft::{Config, SnapshotPolicy};
 /// `Debug + Clone + Default + Eq + serde`, so no `impl Node` is needed here and
 /// `ggap-types` keeps its openraft-free dependency list.
 ///
-/// Membership does not yet populate `client_addr`; every construction site
-/// leaves it empty until tk-fd58 and tk-10b7.
+/// `AddLearner` and cluster bootstrap both populate `client_addr`, so membership
+/// is the source of truth for both addresses. The one construction site that
+/// still leaves it empty is a split-created shard's `bootstrap_members`
+/// (tk-10b7).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GgapNode {
     pub addrs: NodeAddrs,

@@ -92,7 +92,9 @@ own.
 The `ggap-bootstrap` Job (run by `make bootstrap`) then calls AdminService
 on `ggap-0.ggap-headless.ginnungagap.svc:17001`:
 
-1. `AddLearner` for node_id 2 (ggap-1) and node_id 3 (ggap-2)
+1. `AddLearner` for node_id 2 (ggap-1) and node_id 3 (ggap-2), each carrying
+   both the pod's cluster address (`:17001`) and its client address (`:17000`).
+   Both go into Raft membership; an empty `client_addr` is rejected.
 2. `ChangeMembership([1, 2, 3])` to promote the learners to voters
 
 The Job is idempotent: if `ClusterStatus` already reports 3 voters it exits 0.
