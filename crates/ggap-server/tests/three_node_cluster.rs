@@ -63,10 +63,9 @@ struct TestNode {
     _tempdir: TempDir,
 }
 
-/// `gossip = false` starts every server but the gossip task, so nothing can
-/// reach the directory except Raft. Tests that assert membership is the source
-/// of truth for an address need that: with gossip running, an assertion passes
-/// whether the address arrived through consensus or through a gossip tick.
+/// `gossip = false` starts every server but the gossip task, so only Raft can
+/// reach the directory. Tests asserting membership is the source of truth for
+/// an address need that: with gossip running, the assertion passes either way.
 async fn start_node(id: u64, gossip: bool) -> TestNode {
     let tempdir = TempDir::new().unwrap();
     let store = FjallStore::open(tempdir.path()).unwrap();

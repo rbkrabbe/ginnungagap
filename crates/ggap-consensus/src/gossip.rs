@@ -196,12 +196,9 @@ impl GossipTask {
             };
             let status = node.cluster_status();
 
-            // Each membership pair carries both of the peer's addresses, so this
-            // refresh is a directory source in its own right, not just a
-            // cluster-address top-up. Entries written before tk-fd58 — a
-            // split-created shard's `bootstrap_members` (tk-10b7) — still carry an
-            // empty client address; `merge_directory` merges field-wise, so those
-            // cannot blank a client address learned from gossip.
+            // Membership carries both addresses. `merge_directory` merges
+            // field-wise, so a split-created shard's cluster-only
+            // `bootstrap_members` (tk-10b7) cannot blank a client address.
             self.registry
                 .merge_directory(
                     status

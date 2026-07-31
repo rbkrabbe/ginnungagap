@@ -2,7 +2,7 @@
 id = "tk-fd58"
 title = "add_learner stops discarding NodeInfo.client_addr"
 kind = "task"
-status = "done"
+status = "in_progress"
 size = "m"
 priority = 2
 blocked_by = ["tk-441f"]

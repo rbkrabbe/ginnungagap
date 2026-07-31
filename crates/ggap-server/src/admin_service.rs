@@ -53,7 +53,7 @@ impl AdminServiceImpl {
         let shard_id = req.shard_id.unwrap_or(0);
 
         // Membership carries both addresses, so a locally hosted shard answers
-        // in full without gossip having run at all.
+        // in full without gossip having run.
         let to_node_info = |(node_id, addrs): (u64, NodeAddrs)| NodeInfo {
             node_id,
             client_addr: addrs.client_addr,
@@ -134,12 +134,8 @@ impl AdminServiceImpl {
         if node_info.cluster_addr.is_empty() {
             return Err(Status::invalid_argument("cluster_addr must not be empty"));
         }
-        // Rejected rather than accepted-as-empty: membership is now the source of
-        // truth for the client address, so a learner joining without one is a node
-        // nothing in the cluster can ever forward a client request to, and nothing
-        // later fills the gap in. Failing the join is the only loud moment
-        // available — silently admitting it defers the surprise to whoever tries
-        // to forward months later.
+        // A learner without a client address is one nothing can forward a client
+        // request to, and only another membership change could fix it.
         if node_info.client_addr.is_empty() {
             return Err(Status::invalid_argument("client_addr must not be empty"));
         }

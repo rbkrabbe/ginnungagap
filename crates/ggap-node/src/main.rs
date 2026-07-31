@@ -178,22 +178,15 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("no addresses for cluster_addr: {}", cli.cluster_addr))?,
     };
 
-    // The advertised client address. `--client-addr` is a bind address, so it
-    // names a port but no reachable host; the advertised form takes its host from
-    // the (already advertised, Raft-dialable) cluster address. tk-d049 replaces
+    // The advertised client address: the host of the (advertised, Raft-dialable)
+    // cluster address with the port of the `--client-addr` bind. tk-d049 replaces
     // this derivation with an explicit advertise/bind pair.
     //
-    // Derived here, before any Raft group starts, because cluster bootstrap puts
-    // it into the initial membership — the client address reaches committed
-    // consensus state, not just the gossip directory.
-    //
-    // A failed derivation is fatal rather than a warning, for the same reason
-    // `AddLearner` rejects an empty `client_addr`: a member without one is a node
-    // nothing can forward a client request to, and once it is in membership
-    // nothing fills the gap in short of another membership change. A seed cannot
-    // hold itself to a weaker rule than the learners it admits. The only way to
-    // reach this is a malformed `--cluster-addr` / `--client-addr`, so failing at
-    // startup costs a working deployment nothing.
+    // Needed before any Raft group starts, because seed bootstrap puts it into
+    // the initial membership. Fatal on failure for the same reason `AddLearner`
+    // rejects an empty `client_addr`: a member without one is unreachable for
+    // client forwarding, and only another membership change could fix it. It
+    // takes a malformed `--cluster-addr` / `--client-addr` to get here.
     let self_client_addr =
         derive_client_addr(&cli.cluster_addr, &cli.client_addr).with_context(|| {
             format!(

@@ -68,9 +68,9 @@ pub struct ClusterStatus {
     pub term: u64,
     pub leader_id: Option<u64>,
     pub last_applied: u64,
-    /// Both addresses, straight out of committed Raft membership — no gossip
-    /// involved. A `client_addr` is empty only for a node whose membership entry
-    /// predates it (a split-created shard's `bootstrap_members`, until tk-10b7).
+    /// Both addresses, out of committed Raft membership — no gossip involved.
+    /// `client_addr` is empty only for a split-created shard's
+    /// `bootstrap_members` (tk-10b7).
     pub voters: Vec<(u64, NodeAddrs)>,
     pub learners: Vec<(u64, NodeAddrs)>,
 }
@@ -166,11 +166,9 @@ impl OpenRaftNode {
 
     /// Add a node as a non-voting learner to the Raft group.
     ///
-    /// Both addresses go into membership, so they reach committed consensus
-    /// state together and every peer learns them by replication rather than by
-    /// gossip. Callers are expected to have validated `addrs`; the caller that
-    /// matters is `AdminService::add_learner`, which rejects an empty address of
-    /// either kind.
+    /// Both addresses go into membership, so peers learn them by replication
+    /// rather than by gossip. `addrs` is validated by the caller —
+    /// `AdminService::add_learner` rejects an empty address of either kind.
     pub async fn add_learner(&self, node_id: u64, addrs: NodeAddrs) -> Result<(), GgapError> {
         self.raft
             .add_learner(node_id, GgapNode::from(addrs), false)
