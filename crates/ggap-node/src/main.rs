@@ -272,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
             let bootstrap_key = meta_key(shard_id, "bootstrap_members");
             let members: Option<BTreeMap<u64, GgapNode>> = match store.meta.get(&bootstrap_key) {
                 Ok(Some(bytes)) => {
-                    let (addr_map, _): (BTreeMap<u64, String>, _) =
+                    let (addr_map, _): (BTreeMap<u64, NodeAddrs>, _) =
                         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
                             .with_context(|| {
                                 format!("failed to decode bootstrap_members for shard {shard_id}")
@@ -280,7 +280,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(
                         addr_map
                             .into_iter()
-                            .map(|(id, addr)| (id, GgapNode::cluster_only(addr)))
+                            .map(|(id, addrs)| (id, GgapNode::from(addrs)))
                             .collect(),
                     )
                 }

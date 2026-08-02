@@ -76,17 +76,19 @@ The production `RaftNode` implementation. It:
   tree.
 
   Both addresses travel inside the Raft membership (`GgapNode`, the openraft
-  `Node` for this cluster): cluster bootstrap and `AddLearner` each put a full
-  `NodeAddrs` into consensus state, so `GossipTask::refresh_local` re-derives
-  both from membership every tick. That is also what bootstraps gossip at all,
-  since a fresh node's directory holds only itself and gossip needs a peer
-  address before it can learn peer addresses. A node still originates its own
-  entry from its configured advertised addresses (`--cluster-addr` /
-  `--client-addr`), and gossip is still how addresses cross between nodes that
-  share no shard.
+  `Node` for this cluster): cluster bootstrap, `AddLearner` and a split's
+  `source_members` each put a full `NodeAddrs` into consensus state — a
+  split-created shard inherits both addresses for every member, on the split
+  itself and again from `bootstrap_members` after a restart — so
+  `GossipTask::refresh_local` re-derives both from membership every tick. That
+  is also what bootstraps gossip at all, since a fresh node's directory holds
+  only itself and gossip needs a peer address before it can learn peer
+  addresses. A node still originates its own entry from its configured
+  advertised addresses (`--cluster-addr` / `--client-addr`), and gossip is still
+  how addresses cross between nodes that share no shard.
 
-  One feed can still supply just one field — a split-created shard's persisted
-  `bootstrap_members` carries cluster addresses alone (tk-10b7) — so
+  A feed can still supply just one field — an uninitialised shard's membership
+  is empty, and a peer may be known by its cluster address alone — so
   `merge_directory` merges **field by field** and treats an empty field as
   "unknown", never as "cleared". A whole-value merge would let the once-per-tick
   membership refresh blank client addresses learned elsewhere.

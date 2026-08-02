@@ -141,9 +141,9 @@ impl GossipTask {
             };
             let status = node.cluster_status();
 
-            // Membership carries both addresses. `merge_directory` merges
-            // field-wise, so a split-created shard's cluster-only
-            // `bootstrap_members` (tk-10b7) cannot blank a client address.
+            // Membership carries both addresses, on split-created shards too.
+            // `merge_directory` merges field-wise, so a feed that knows only one
+            // of them cannot blank the other (tk-11b6).
             self.registry
                 .merge_directory(
                     status

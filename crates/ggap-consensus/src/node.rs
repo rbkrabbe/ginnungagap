@@ -69,8 +69,6 @@ pub struct ClusterStatus {
     pub leader_id: Option<u64>,
     pub last_applied: u64,
     /// Both addresses, out of committed Raft membership — no gossip involved.
-    /// `client_addr` is empty only for a split-created shard's
-    /// `bootstrap_members` (tk-10b7).
     pub voters: Vec<(u64, NodeAddrs)>,
     pub learners: Vec<(u64, NodeAddrs)>,
 }
