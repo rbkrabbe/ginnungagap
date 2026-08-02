@@ -136,13 +136,7 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
     // Both listeners bind 127.0.0.1 on an ephemeral port, so the bind address is
     // also the advertised one.
     let self_client_addr = client_addr.to_string();
-    let registry = Arc::new(ShardRegistry::new(
-        id,
-        [(
-            id,
-            NodeAddrs::new(cluster_addr.to_string(), self_client_addr.clone()),
-        )],
-    ));
+    let registry = Arc::new(ShardRegistry::new(id, []));
 
     let mut handles = Vec::new();
 
@@ -153,7 +147,6 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
                 registry.clone(),
                 id,
                 cluster_addr.to_string(),
-                self_client_addr.clone(),
                 CancellationToken::new(),
             )
             .with_interval(Duration::from_millis(50))
@@ -713,17 +706,15 @@ async fn client_addr_comes_from_membership_without_gossip() {
     let leader_idx = cluster.wait_for_leader().await;
     let follower = &cluster.nodes[(0..3).find(|&i| i != leader_idx).unwrap()];
 
-    // The directory was seeded with this node alone and nothing refreshes it,
-    // so any peer address in the response cannot have come from there.
-    for peer in cluster.nodes.iter().filter(|n| n.id != follower.id) {
-        assert_eq!(
-            follower.registry.client_addr(peer.id).await,
-            None,
-            "node {} should have no gossiped client address for peer {}",
-            follower.id,
-            peer.id
-        );
-    }
+    // Nothing seeds the directory and nothing refreshes it, so it is empty —
+    // this node's own entry included. Every address in the response below has
+    // to have come from membership.
+    let (directory, _) = follower.registry.snapshot_for_gossip().await;
+    assert!(
+        directory.is_empty(),
+        "node {} has directory entries with gossip stopped: {directory:?}",
+        follower.id,
+    );
 
     let resp = follower
         .admin
@@ -1049,23 +1040,15 @@ async fn start_observer(id: u64, seed_id: u64, seed_addr: SocketAddr) -> Observe
     // Self addr is a dummy (the observer serves nothing and never dials itself);
     // the seed gives it an entry point into the cluster's gossip directory.
     let self_addr = format!("127.0.0.1:1{id}");
-    // The observer serves no client API, so it has no client address to
-    // advertise — the legitimate "unknown" case. Its own entry stays
-    // cluster-only while it still learns everyone else's client address.
-    let registry = Arc::new(ShardRegistry::new(
-        id,
-        [
-            (id, NodeAddrs::cluster_only(self_addr.clone())),
-            (seed_id, NodeAddrs::cluster_only(seed_addr.to_string())),
-        ],
-    ));
+    // The observer is in no shard's membership, so nothing puts it in any
+    // directory — including its own. It reaches the cluster through the seed.
+    let registry = Arc::new(ShardRegistry::new(id, [(seed_id, seed_addr.to_string())]));
     let handle = tokio::spawn(
         GossipTask::new(
             router.clone(),
             registry.clone(),
             id,
             self_addr,
-            String::new(),
             CancellationToken::new(),
         )
         .with_interval(Duration::from_millis(50))
@@ -1243,16 +1226,12 @@ async fn gossip_degrades_to_stale_when_hosts_unreachable() {
 
 /// Every node learns every other node's *client* address.
 ///
-/// This can only travel by gossip: `GgapNode` has room for a client address,
-/// but nothing populates it (tk-fd58), so every membership entry is
-/// cluster-only. A node's client address is originated by that node alone.
-///
-/// The assertion is repeated after several more gossip ticks, and that repeat is
-/// the point of the test. `refresh_local` re-merges the directory from Raft
-/// membership on every tick with cluster-only entries; if `merge_directory`
-/// replaced values wholesale instead of merging field by field, those ticks
-/// would blank every client address in the cluster. Checking once immediately
-/// after convergence would not catch it.
+/// Both addresses come from Raft membership, so within a shard no gossip is
+/// needed at all — see `client_addr_comes_from_membership_without_gossip`.
+/// Here the gossip task is running, and the assertion is repeated after several
+/// more ticks: a refresh that re-derived the directory badly, or a gossiped copy
+/// that overwrote a good entry with a worse one, would show up as a flap that a
+/// single check immediately after convergence would miss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gossip_converges_on_every_node_client_addr() {
     let cluster = TestCluster::start(3).await;

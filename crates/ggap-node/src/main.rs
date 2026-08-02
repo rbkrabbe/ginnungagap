@@ -361,24 +361,19 @@ async fn main() -> anyhow::Result<()> {
         shard_map: shard_map.clone(),
     }));
 
-    // 7b. Cluster-wide shard registry + gossip task. Seeded with self; the node
-    //     directory grows transitively from each shard's Raft membership, so any
+    // 7b. Cluster-wide shard registry + gossip task. The directory is derived
+    //     from each hosted shard's Raft membership — including this node's own
+    //     entry — and gossip carries copies to nodes that share no shard, so any
     //     node can report consensus state for shards it does not host locally.
-    //
-    //     Self-seeding stays for now: gossip still carries the directory between
-    //     nodes that share no shard. tk-11b6 makes the entries for locally hosted
-    //     shards derived from membership instead.
-    let registry = Arc::new(ShardRegistry::new(
-        cli.node_id,
-        [(cli.node_id, self_addrs.clone())],
-    ));
+    //     No bootstrap seeds: a node joins by being added to a shard's
+    //     membership, which is exactly what tells it about the cluster.
+    let registry = Arc::new(ShardRegistry::new(cli.node_id, []));
     tokio::spawn(
         GossipTask::new(
             router.clone(),
             registry.clone(),
             cli.node_id,
             cli.cluster_addr.clone(),
-            self_client_addr,
             shutdown.child_token(),
         )
         .run(),

@@ -31,7 +31,6 @@ use ggap_proto::v1::{
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
-use ggap_types::NodeAddrs;
 
 const METRIC: &str = "rpc_server_call_duration_seconds";
 
@@ -106,10 +105,7 @@ async fn start_single_node() -> TestNode {
         shard_map: shard_map.clone(),
     }));
 
-    let registry = Arc::new(ShardRegistry::new(
-        1,
-        [(1, NodeAddrs::cluster_only(cluster_addr.to_string()))],
-    ));
+    let registry = Arc::new(ShardRegistry::new(1, []));
     let mut handles = Vec::new();
     let r = router.clone();
     let sc = split_coordinator;
