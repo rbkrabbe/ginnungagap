@@ -54,12 +54,14 @@ pub struct ShardInfo {
 
 /// The gRPC addresses at which a node can be reached.
 ///
-/// Lives here rather than in `ggap-consensus` because both the gossip directory
-/// and `KvCommand::Split` need the same shape, and this crate depends on neither
+/// Lives here rather than in `ggap-consensus` because both the directory and
+/// `KvCommand::Split` need the same shape, and this crate depends on neither
 /// openraft nor gRPC. Whoever holds these decides how they are reconciled; the
 /// type itself carries no merge policy.
 ///
-/// An empty field means "not known here", never "known to be absent".
+/// An empty field means the node advertises no such address — nothing can reach
+/// it there. `ShardRegistry` treats that as a fact to propagate, not a gap to
+/// fill from another source.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct NodeAddrs {
     /// Cluster gRPC endpoint, shared by RaftService, AdminService and
@@ -225,7 +227,8 @@ pub enum GgapError {
     ///
     /// `leader_id` is the leader's stable node id and `leader` the address that
     /// was current when the error was constructed. A forwarder should resolve
-    /// `leader_id` through the gossip directory and treat `leader` only as a
+    /// `leader_id` through the membership-derived directory and treat `leader`
+    /// only as a
     /// fallback, since the address can be stale by the time it is read.
     #[error("not the leader; hint: {leader_id:?} at {leader:?}")]
     NotLeader {

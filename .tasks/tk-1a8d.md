@@ -13,7 +13,7 @@ review = "none"
 touched = ["docs/ggap-consensus.md", "docs/ggap-types.md", "crates/ggap-types/src/lib.rs", "CLAUDE.md"]
 parent = "tk-d08a"
 base = "4061c944cab000799f8137e4a84a173cb0be8684"
-closed = "2026-08-13T19:47:30+00:00"
+closed = "2026-08-13T19:49:50+00:00"
 +++
 ## Context
 
@@ -59,3 +59,11 @@ CLAUDE.md's rule. fmt, clippy `-D warnings`, build and test all run and green.
 
 `docs/ggap-types.md` gained a `NodeAddrs` section: the advertise/bind pairing,
 the membership-not-gossip rule, and what `cluster_only` means now.
+
+Second pass caught the one that mattered most: `NodeAddrs`'s *type-level* doc
+still said "an empty field means 'not known here', never 'known to be absent'".
+That is the exact conflation whole-value merging removed, sitting on the type
+every crate imports — a stale claim in source outranks a correct one in docs.
+Grepping for the phrasing rather than the concept is what missed it the first
+time; "gossip directory" appeared in three more source comments for the same
+reason.

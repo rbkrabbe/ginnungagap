@@ -24,7 +24,7 @@ pub type GgapRaft = Raft<GgapTypeConfig>;
 /// Build a `NotLeader` from openraft's `ForwardToLeader` hint.
 ///
 /// Carries both the leader's node id and the address openraft knew for it: the
-/// id is stable and resolvable through the gossip directory, the address is
+/// id is stable and resolvable through the directory, the address is
 /// only a fallback and may already be stale.
 pub(crate) fn not_leader(fwd: &ForwardToLeader<u64, GgapNode>) -> GgapError {
     GgapError::NotLeader {
