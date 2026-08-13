@@ -28,7 +28,6 @@ use ggap_proto::v1::{kv_service_client::KvServiceClient, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
-use ggap_types::NodeAddrs;
 
 // ---------------------------------------------------------------------------
 // Tuning knobs
@@ -94,10 +93,7 @@ async fn start_node(id: u64) -> BenchNode {
 
     let mut handles = Vec::new();
 
-    let registry = Arc::new(ShardRegistry::new(
-        id,
-        [(id, NodeAddrs::cluster_only(cluster_addr.to_string()))],
-    ));
+    let registry = Arc::new(ShardRegistry::new(id, []));
     let r = router.clone();
     let sc = split_coordinator.clone();
     let sm2 = shard_map.clone();

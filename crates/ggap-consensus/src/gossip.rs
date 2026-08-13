@@ -31,9 +31,6 @@ pub struct GossipTask {
     registry: Arc<ShardRegistry>,
     self_node_id: u64,
     self_cluster_addr: String,
-    /// This node's advertised client address (`--client-addr`). An empty string
-    /// is gossiped as "unknown" and merged away, never dialled.
-    self_client_addr: String,
     cancel: CancellationToken,
     interval: Duration,
     fanout: usize,
@@ -50,7 +47,6 @@ impl GossipTask {
         registry: Arc<ShardRegistry>,
         self_node_id: u64,
         self_cluster_addr: String,
-        self_client_addr: String,
         cancel: CancellationToken,
     ) -> Self {
         GossipTask {
@@ -58,7 +54,6 @@ impl GossipTask {
             registry,
             self_node_id,
             self_cluster_addr,
-            self_client_addr,
             cancel,
             interval: DEFAULT_INTERVAL,
             fanout: DEFAULT_FANOUT,
@@ -97,9 +92,13 @@ impl GossipTask {
         }
     }
 
-    /// Publish status for every locally-hosted shard into the registry and feed
-    /// the node directory from each shard's Raft membership (transitive peer
-    /// discovery).
+    /// Publish status for every locally-hosted shard into the registry and
+    /// derive the node directory from each shard's Raft membership.
+    ///
+    /// The directory is entirely derived here: membership carries both
+    /// addresses for every member, so a node hosting no shards has nothing to
+    /// derive and no membership to appear in. It still learns the cluster by
+    /// gossiping copies in `exchange_round`, which runs regardless.
     async fn refresh_local(&mut self) {
         let shard_ids = self.router.local_shard_ids().await;
         if shard_ids.is_empty() {
@@ -123,27 +122,15 @@ impl GossipTask {
             })
             .collect();
 
-        // Seed the directory with self. This is the only place either address is
-        // originated: every other node learns both by gossiping with us.
-        self.registry
-            .merge_directory([(
-                self.self_node_id,
-                NodeAddrs::new(
-                    self.self_cluster_addr.clone(),
-                    self.self_client_addr.clone(),
-                ),
-            )])
-            .await;
-
         for shard_id in shard_ids {
             let Some(node) = self.router.get_node(shard_id).await else {
                 continue;
             };
             let status = node.cluster_status();
 
-            // Membership carries both addresses, on split-created shards too.
-            // `merge_directory` merges field-wise, so a feed that knows only one
-            // of them cannot blank the other (tk-11b6).
+            // Membership is the whole entry, on split-created shards too: this
+            // node's own addresses arrive here like every other member's, so no
+            // address is ever originated locally.
             self.registry
                 .merge_directory(
                     status
@@ -247,9 +234,9 @@ pub fn node_to_proto((node_id, addrs): (u64, NodeAddrs)) -> GossipNode {
     }
 }
 
-/// A peer that predates `client_addr` sends the field as an empty string (prost
-/// decodes an absent proto3 scalar to its default), which `merge_directory`
-/// treats as "unknown" and skips.
+/// A member that advertises no client address sends the field as an empty
+/// string, which is also what prost decodes an absent proto3 scalar to. Both
+/// mean the same thing here: nothing can forward a client request to that node.
 pub fn node_from_proto(n: GossipNode) -> (u64, NodeAddrs) {
     (
         n.node_id,
@@ -306,7 +293,7 @@ mod tests {
         assert_eq!(back, addrs);
     }
 
-    /// An old peer sends no client_addr; prost decodes the absent field to "".
+    /// A member advertising no client address round-trips as cluster-only.
     #[test]
     fn proto_round_trip_tolerates_absent_client_addr() {
         let (id, back) = node_from_proto(GossipNode {

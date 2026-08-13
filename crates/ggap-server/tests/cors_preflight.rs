@@ -24,7 +24,6 @@ use ggap_consensus::{
 use ggap_server::serve_cluster_with_listener;
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
-use ggap_types::NodeAddrs;
 
 #[tokio::test]
 async fn cors_preflight_returns_allow_origin() {
@@ -74,10 +73,7 @@ async fn cors_preflight_returns_allow_origin() {
         shard_map: shard_map.clone(),
     }));
 
-    let registry = Arc::new(ShardRegistry::new(
-        1,
-        [(1u64, NodeAddrs::cluster_only(addr.to_string()))],
-    ));
+    let registry = Arc::new(ShardRegistry::new(1, []));
 
     tokio::spawn(run_split_handler(
         split_rx,
