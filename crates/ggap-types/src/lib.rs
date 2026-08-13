@@ -78,8 +78,9 @@ impl NodeAddrs {
         }
     }
 
-    /// Only the cluster address is known — the shape of an entry for a peer
-    /// whose client address has not reached this node yet.
+    /// A node that advertises no client address, so nothing can forward a
+    /// client request to it. Production paths always supply both; this is for
+    /// harnesses that serve no client API.
     pub fn cluster_only(cluster_addr: impl Into<String>) -> Self {
         NodeAddrs {
             cluster_addr: cluster_addr.into(),

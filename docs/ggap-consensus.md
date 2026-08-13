@@ -75,20 +75,40 @@ The production `RaftNode` implementation. It:
   reads; `ClusterNode` keeps openraft types out of the `ggap-server` dependency
   tree.
 
-  Both addresses travel inside the Raft membership (`GgapNode`, the openraft
-  `Node` for this cluster): cluster bootstrap, `AddLearner` and a split's
+  **Both addresses live in the Raft membership** (`GgapNode`, the openraft
+  `Node` for this cluster). Cluster bootstrap, `AddLearner` and a split's
   `source_members` each put a full `NodeAddrs` into consensus state — a
   split-created shard inherits both addresses for every member, on the split
-  itself and again from `bootstrap_members` after a restart — so
-  `GossipTask::refresh_local` re-derives both from membership every tick. That
-  is also what bootstraps gossip at all, since a fresh node's directory holds
-  only itself and gossip needs a peer address before it can learn peer
-  addresses. A node still originates its own entry from its configured
-  advertised addresses (`--cluster-addr` / `--client-addr`), and gossip is still
-  how addresses cross between nodes that share no shard.
+  itself and again from `bootstrap_members` after a restart. `refresh_local`
+  derives the directory from `raft.metrics()` every tick, and **no node
+  originates its own entry**: a node's addresses reach its own directory the
+  same way every peer's do, through membership.
 
-  A feed can still supply just one field — an uninitialised shard's membership
-  is empty, and a peer may be known by its cluster address alone — so
-  `merge_directory` merges **field by field** and treats an empty field as
-  "unknown", never as "cleared". A whole-value merge would let the once-per-tick
-  membership refresh blank client addresses learned elsewhere.
+  The directory is therefore a *cache of committed state*. Entries for shards a
+  node hosts are **derived** and authoritative; entries for shards it does not
+  host are **copies** carried by gossip, which is the only reason gossip still
+  exchanges the directory at all. Stop the gossip task entirely and a node still
+  reports both addresses for every peer in a shard it hosts.
+
+  `merge_directory` replaces **whole values**: an entry is a copy of one
+  membership record, and its two fields belong together. The rule it depends on
+  is about *provenance, not content* — every entry comes from membership, and
+  which addresses that record carries is membership's business. So merging an
+  entry with no client address **clears** a previously-known one rather than
+  treating the gap as "unknown, don't touch", and that is what makes a stale
+  address retractable at all. In production both are always present
+  (`AddLearner` rejects an empty `client_addr`; both CLI flags have non-empty
+  defaults), so clearing is reachable only where a test harness builds
+  cluster-only membership on purpose.
+
+  Bootstrap gossip peers are *not* directory entries. `ShardRegistry::new` takes
+  `seed_peers` as `(node_id, cluster_addr)` into a separate field that
+  `peers_excluding_self` unions in and `snapshot_for_gossip` never emits, so a
+  dial hint can never be gossiped over a fully-known entry. Nothing in
+  `ggap-node` passes any: a node joins by being added to a shard's membership,
+  which is exactly what tells it about the cluster (tk-9bcd tracks whether the
+  parameter earns its keep).
+
+  **Still open:** copied entries are ordered last-write-wins, so a peer holding
+  an older copy can overwrite a newer one. tk-c4fc stamps them with the
+  membership `(term, index)` they came from; tk-1bf0 is the same problem.

@@ -2,7 +2,7 @@
 id = "tk-1a8d"
 title = "Record the derived-directory model in docs and CLAUDE.md"
 kind = "task"
-status = "open"
+status = "done"
 size = "s"
 priority = 2
 blocked_by = ["tk-11b6"]
@@ -10,8 +10,10 @@ tags = []
 created = "2026-07-30T19:07:52+00:00"
 spec_approved = false
 review = "none"
-touched = []
+touched = ["docs/ggap-consensus.md", "docs/ggap-types.md", "crates/ggap-types/src/lib.rs", "CLAUDE.md"]
 parent = "tk-d08a"
+base = "4061c944cab000799f8137e4a84a173cb0be8684"
+closed = "2026-08-13T19:47:30+00:00"
 +++
 ## Context
 
@@ -35,9 +37,25 @@ Runs in parallel with tk-c4fc.
 
 ## Acceptance
 
-- [ ] No doc still describes `client_addr` as gossip-originated or explains the
-      field-wise merge as load-bearing.
-- [ ] CLAUDE.md carries the constraint that per-node addresses belong in
-      membership, not gossip.
-- [ ] CLAUDE.md's Current State reflects what the directory is now.
-- [ ] Markdown-only, so the checklist is skipped per CLAUDE.md.
+- [x] No doc still describes `client_addr` as gossip-originated or explains the
+      field-wise merge as load-bearing. `docs/ggap-consensus.md` now states the
+      derived-directory model, the derived-vs-copied distinction, whole-value
+      merging and the seed-peers separation.
+- [x] CLAUDE.md carries the constraint that per-node addresses belong in
+      membership, not gossip — phrased to generalise, since the trap is the
+      *next* per-node fact someone gossips.
+- [x] CLAUDE.md's Current State reflects what the directory is now, and narrows
+      the known gap to placement rather than deleting it.
+- [ ] ~~Markdown-only, so the checklist is skipped per CLAUDE.md.~~ Not
+      markdown-only after all — see below. Checklist run and green.
+
+## Note: not markdown-only
+
+`NodeAddrs::cluster_only`'s doc comment said "the shape of an entry for a peer
+whose client address has not reached this node yet", which is the two-feed model
+this epic removed. Leaving it would have put a stale claim in the source while
+the docs stated the opposite, so it is fixed here — making this a code change by
+CLAUDE.md's rule. fmt, clippy `-D warnings`, build and test all run and green.
+
+`docs/ggap-types.md` gained a `NodeAddrs` section: the advertise/bind pairing,
+the membership-not-gossip rule, and what `cluster_only` means now.
