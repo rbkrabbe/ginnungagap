@@ -8,6 +8,11 @@ Decisions anchored here to avoid re-discussion.
 - **`ggap-types` has no gRPC dependency** — all crates import domain types from here; proto types never leak inward.
 - **All storage keys are prefixed with `be_u64(shard_id)`** — multi-shard is live (shards are created by splits), so this prefix is load-bearing, not a placeholder. Never remove it "for simplicity".
 - **`RaftNode` always carries `ShardId`** — a node hosting multiple shards is `HashMap<ShardId, RaftNode>` (realized via `ShardRouter`). Keep `ShardId` threaded through every Raft-facing type.
+- **Per-node addresses live in Raft membership, never in gossip** — both
+  addresses ride inside `GgapNode`, so a change is an ordered, committed
+  `change_membership`. `ShardRegistry`'s directory is a *cache* of that, derived
+  from `raft.metrics()`; no node originates its own entry. A new per-node fact
+  belongs in membership too — gossiping one reintroduces the races this replaced.
 - **Use `tokio::time` everywhere, never `std::time::Instant`** — `tokio::time` can be paused and advanced by simulation harnesses. Direct use of `std::time` breaks deterministic simulation testing. Applies to `TtlGcTask`, `LeaseManager`, timeouts, and any other time-dependent code.
 
 ## Tech Stack (settled)
@@ -72,11 +77,18 @@ just `ShardId(0)`. What exists today:
 - gRPC (Kv + Admin) is shard-aware; Watch, snapshots, metrics, and tracing are wired.
 - Consensus is exercised by deterministic simulation tests in `ggap-consensus/tests/`.
 
-**Known gap:** there is no cluster-wide membership/placement view, so a node can only
-report Raft status for the shards it hosts locally; `AdminService` "zeroes out" (rather
-than fabricates) consensus fields for non-hosted shards. Closing this needs a gossip /
-shard-registry layer — see the open issue tracking it. A placement driver (`ggap-pd`) for
-automatic rebalancing is also still future work.
+- Node addresses are carried by Raft membership; the directory in `ShardRegistry`
+  is derived from it and cached, and gossip only copies entries between nodes
+  that share no shard.
+
+**Known gap:** *placement* has no cluster-wide view. Addresses are solved —
+membership carries them, so any node reports both for every peer in a shard it
+hosts, with the gossip task stopped. What is still eventually-consistent is
+which node hosts which shard: `AdminService` answers for a non-hosted shard from
+gossiped `ShardEntry` copies, ageing rather than fabricating, and zeroes out
+consensus fields when it has never heard of a shard at all. Copied *directory*
+entries are still last-write-wins (tk-c4fc adds the membership `(term, index)`
+stamp). A placement driver (`ggap-pd`) for automatic rebalancing is future work.
 # Task tracking
 
 All work is tracked in `.tasks/` via the `tk` CLI. This file is loaded into every

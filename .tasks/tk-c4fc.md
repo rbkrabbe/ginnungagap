@@ -12,6 +12,7 @@ spec_approved = false
 review = "none"
 touched = []
 parent = "tk-d08a"
+base = "4061c944cab000799f8137e4a84a173cb0be8684"
 +++
 ## Context
 
@@ -43,3 +44,9 @@ as a stale duplicate.
       shard in that membership, and stays changed across several gossip rounds.
 - [ ] tk-1bf0 is closed with a pointer here.
 - [ ] Full checklist green: fmt, clippy -D warnings, build, test.
+
+### Q1 [open] A (term, index) stamp is only comparable within one Raft group. After a split the new shard inherits the source's member set (split.rs:121-145,194), so a node derives entries for the same peer from several shards' memberships in a single refresh_local tick — stamps from unrelated clocks. How should two derived entries for the same node be ordered?
+- a) Derived entries are all equally authoritative; stamp orders copied-vs-copied only — simplest, keeps one entry per node; a peer in two shards can flap between their views while a change_membership is applied shard-by-shard
+- b) Key the directory by (node_id, shard_id) so stamps are only ever compared within a shard — exact, no incomparable comparisons; changes the directory shape and every reader (admin_service, forwarder tk-2cb2) must pick a shard or reconcile
+- c) Compare within a shard, deterministic tiebreak across shards (lowest shard_id wins) — convergent and cheap; can pin a stale address when the tiebreak shard lags behind a shard that already applied the change
+> unanswered

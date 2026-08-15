@@ -47,10 +47,10 @@ struct TestNode {
     fsm: Arc<FjallStateMachine>,
     cluster_addr: SocketAddr,
     /// The address the client listener is actually bound to. The directory
-    /// entry other nodes gossip about this node must resolve to this.
+    /// entry other nodes learn about this node must resolve to this.
     client_addr: SocketAddr,
     /// The advertised form of `client_addr` — what goes into Raft membership
-    /// and the gossip directory.
+    /// and, derived from it, the directory.
     advertised_client_addr: String,
     registry: Arc<ShardRegistry>,
     raft_node: Arc<OpenRaftNode>,
@@ -660,7 +660,7 @@ async fn add_learner_updates_membership() {
 
 /// Assert a `NotLeader` carries both halves of the hint, and that they agree.
 ///
-/// The id is what a forwarder actually resolves through the gossip directory,
+/// The id is what a forwarder actually resolves through the directory,
 /// so it must be present; the address is the fallback. Rather than pinning the
 /// hint to whichever node was leader when the test started — the leader can
 /// move at any time — this checks the pair is internally consistent: the node
@@ -1038,7 +1038,7 @@ async fn start_observer(id: u64, seed_id: u64, seed_addr: SocketAddr) -> Observe
         shard_map: shard_map.clone(),
     }));
     // Self addr is a dummy (the observer serves nothing and never dials itself);
-    // the seed gives it an entry point into the cluster's gossip directory.
+    // the seed gives it an entry point into the cluster.
     let self_addr = format!("127.0.0.1:1{id}");
     // The observer is in no shard's membership, so nothing puts it in any
     // directory — including its own. It reaches the cluster through the seed.
