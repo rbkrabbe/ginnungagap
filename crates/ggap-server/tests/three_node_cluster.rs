@@ -146,7 +146,8 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
                 router.clone(),
                 registry.clone(),
                 id,
-                cluster_addr.to_string(),
+                NodeAddrs::new(cluster_addr.to_string(), self_client_addr.clone()),
+                1,
                 CancellationToken::new(),
             )
             .with_interval(Duration::from_millis(50))
@@ -1037,18 +1038,21 @@ async fn start_observer(id: u64, seed_id: u64, seed_addr: SocketAddr) -> Observe
         router: router.clone(),
         shard_map: shard_map.clone(),
     }));
-    // Self addr is a dummy (the observer serves nothing and never dials itself);
-    // the seed gives it an entry point into the cluster.
+    // Self addr is a dummy: the observer serves nothing. It still publishes its
+    // own descriptor like any node, so peers learn it and dial back — those
+    // dials fail, which is the harness's business and not the cluster's.
     let self_addr = format!("127.0.0.1:1{id}");
-    // The observer is in no shard's membership, so nothing puts it in any
-    // directory — including its own. It reaches the cluster through the seed.
+    // The observer is in no shard's membership, so no membership-derived feed
+    // mentions it. It reaches the cluster through the seed — the case seed_peers
+    // exists for.
     let registry = Arc::new(ShardRegistry::new(id, [(seed_id, seed_addr.to_string())]));
     let handle = tokio::spawn(
         GossipTask::new(
             router.clone(),
             registry.clone(),
             id,
-            self_addr,
+            NodeAddrs::cluster_only(self_addr),
+            1,
             CancellationToken::new(),
         )
         .with_interval(Duration::from_millis(50))

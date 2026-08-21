@@ -91,6 +91,39 @@ impl NodeAddrs {
     }
 }
 
+/// A node's self-published addresses plus the counter that orders them.
+///
+/// Authored by exactly one node: the one it describes. `incarnation` is
+/// boot-scoped — addresses come from CLI flags, so they can only change across a
+/// restart, and a counter bumped once per start is a sufficient clock. Highest
+/// incarnation wins, which is what lets a node move and have the cluster
+/// converge on its new address.
+///
+/// Incarnation 0 means "published on this node's behalf, not by it": the
+/// membership-derived feed in `ggap-consensus` copies a member's addresses into
+/// the directory at that rank. A node's own publications start at 1, so they
+/// always supersede a descriptor someone else wrote for it.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct NodeDescriptor {
+    pub addrs: NodeAddrs,
+    pub incarnation: u64,
+}
+
+impl NodeDescriptor {
+    /// A descriptor a node published about itself.
+    pub fn new(addrs: NodeAddrs, incarnation: u64) -> Self {
+        NodeDescriptor { addrs, incarnation }
+    }
+
+    /// A descriptor written on a node's behalf, at incarnation 0.
+    pub fn hint(addrs: NodeAddrs) -> Self {
+        NodeDescriptor {
+            addrs,
+            incarnation: 0,
+        }
+    }
+}
+
 /// Stored in last_applied metadata
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogId {
