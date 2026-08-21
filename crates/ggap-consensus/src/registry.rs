@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-use ggap_types::{NodeAddrs, ShardId};
+use ggap_types::{NodeDescriptor, ShardId};
 
 /// One shard's placement + lightweight Raft status as last known to this node.
 ///
@@ -54,9 +54,10 @@ pub struct ShardRegistry {
     /// statement about a node's addresses, and gossiping one out would push a
     /// half-known node over a fully-known one.
     seed_peers: Vec<(u64, String)>,
-    /// `node_id -> addresses`, derived from Raft membership on the nodes that
-    /// host the shard and copied elsewhere by gossip.
-    directory: RwLock<HashMap<u64, NodeAddrs>>,
+    /// `node_id -> descriptor`. Each node publishes its own entry; gossip
+    /// copies it everywhere, and [`Self::merge_directory`] orders copies by
+    /// incarnation.
+    directory: RwLock<HashMap<u64, NodeDescriptor>>,
     /// Best-known entry per shard.
     shards: RwLock<HashMap<ShardId, ShardEntry>>,
 }
@@ -119,28 +120,38 @@ impl ShardRegistry {
         )
     }
 
-    /// Merge a batch of directory entries, replacing whole values.
+    /// Merge a batch of descriptors, ordered by incarnation: **highest wins**,
+    /// ties resolved in favour of the incoming entry.
     ///
-    /// Every entry is a copy of a committed Raft membership record — derived
-    /// locally by [`crate::gossip`] or copied from a peer that derived it — so
-    /// no source knows half of a node's addresses. Which addresses the record
-    /// carries is membership's business: a member with no client address is a
-    /// node nothing can forward a client request to, and merging it *clears* a
-    /// previously-known one rather than treating the gap as "unknown, don't
-    /// touch". That is what lets a stale address be retracted at all. An entry
-    /// with neither address describes no node and is skipped.
+    /// A descriptor is authored by the node it describes, so its incarnation is
+    /// a clock over exactly one writer's publications and comparing two copies
+    /// is unambiguous. That is what lets a node move: it restarts at a higher
+    /// incarnation and outbids every stale copy in flight.
     ///
-    /// In production both are always present — bootstrap and a split's
-    /// `source_members` carry a full `NodeAddrs`, and `AddLearner` rejects an
-    /// empty `client_addr` — so clearing is reachable only where a harness
-    /// builds cluster-only membership on purpose.
-    pub async fn merge_directory(&self, entries: impl IntoIterator<Item = (u64, NodeAddrs)>) {
+    /// The membership-derived merge in [`crate::gossip`] writes at incarnation
+    /// 0: it copies what a member advertised when it joined, which is not that
+    /// member speaking for itself. A node's own publications start at 1 and
+    /// therefore always supersede it. Ties going to the incoming entry keep that
+    /// feed last-write-wins among its own entries, which is what lets a stale
+    /// address be retracted before the node it describes has published
+    /// anything.
+    ///
+    /// A descriptor is a whole value: merging one with no client address
+    /// *clears* a previously-known one rather than treating the gap as
+    /// "unknown, don't touch". An entry with neither address describes no node
+    /// and is skipped.
+    pub async fn merge_directory(&self, entries: impl IntoIterator<Item = (u64, NodeDescriptor)>) {
         let mut dir = self.directory.write().await;
-        for (node_id, addrs) in entries {
-            if addrs.cluster_addr.is_empty() && addrs.client_addr.is_empty() {
+        for (node_id, desc) in entries {
+            if desc.addrs.cluster_addr.is_empty() && desc.addrs.client_addr.is_empty() {
                 continue;
             }
-            dir.insert(node_id, addrs);
+            match dir.get(&node_id) {
+                Some(existing) if existing.incarnation > desc.incarnation => {}
+                _ => {
+                    dir.insert(node_id, desc);
+                }
+            }
         }
     }
 
@@ -150,7 +161,7 @@ impl ShardRegistry {
             .read()
             .await
             .get(&node_id)
-            .map(|a| a.cluster_addr.clone())
+            .map(|d| d.addrs.cluster_addr.clone())
             .filter(|a| !a.is_empty())
     }
 
@@ -164,7 +175,7 @@ impl ShardRegistry {
             .read()
             .await
             .get(&node_id)
-            .map(|a| a.client_addr.clone())
+            .map(|d| d.addrs.client_addr.clone())
             .filter(|a| !a.is_empty())
     }
 
@@ -174,9 +185,9 @@ impl ShardRegistry {
     /// the same node.
     pub async fn peers_excluding_self(&self) -> Vec<(u64, String)> {
         let mut by_id: HashMap<u64, String> = self.seed_peers.iter().cloned().collect();
-        for (id, addrs) in self.directory.read().await.iter() {
-            if !addrs.cluster_addr.is_empty() {
-                by_id.insert(*id, addrs.cluster_addr.clone());
+        for (id, desc) in self.directory.read().await.iter() {
+            if !desc.addrs.cluster_addr.is_empty() {
+                by_id.insert(*id, desc.addrs.cluster_addr.clone());
             }
         }
         by_id.remove(&self.self_node_id);
@@ -189,13 +200,13 @@ impl ShardRegistry {
 
     /// The full view to push to a peer (or return from `Exchange`). Sorted for
     /// deterministic output.
-    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, NodeAddrs)>, Vec<ShardEntry>) {
-        let mut dir: Vec<(u64, NodeAddrs)> = self
+    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, NodeDescriptor)>, Vec<ShardEntry>) {
+        let mut dir: Vec<(u64, NodeDescriptor)> = self
             .directory
             .read()
             .await
             .iter()
-            .map(|(id, addrs)| (*id, addrs.clone()))
+            .map(|(id, desc)| (*id, desc.clone()))
             .collect();
         dir.sort_by_key(|(id, _)| *id);
 
@@ -220,6 +231,18 @@ impl ShardRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ggap_types::NodeAddrs;
+
+    /// A descriptor a node published about itself.
+    fn own(cluster: &str, client: &str, incarnation: u64) -> NodeDescriptor {
+        NodeDescriptor::new(NodeAddrs::new(cluster, client), incarnation)
+    }
+
+    /// An incarnation-0 entry, as the membership-derived feed produces.
+    fn hint(addrs: NodeAddrs) -> NodeDescriptor {
+        NodeDescriptor::hint(addrs)
+    }
 
     fn entry(shard_id: ShardId, term: u64, version: u64, origin: u64) -> ShardEntry {
         ShardEntry {
@@ -267,9 +290,9 @@ mod tests {
     async fn peers_exclude_self() {
         let reg = ShardRegistry::new(1, []);
         reg.merge_directory([
-            (1, NodeAddrs::cluster_only("a")),
-            (2, NodeAddrs::cluster_only("b")),
-            (3, NodeAddrs::cluster_only("c")),
+            (1, hint(NodeAddrs::cluster_only("a"))),
+            (2, hint(NodeAddrs::cluster_only("b"))),
+            (3, hint(NodeAddrs::cluster_only("c"))),
         ])
         .await;
         let peers = reg.peers_excluding_self().await;
@@ -286,7 +309,7 @@ mod tests {
             vec![(2, "seed:17001".into())]
         );
 
-        reg.merge_directory([(2, NodeAddrs::new("real:17001", "real:17000"))])
+        reg.merge_directory([(2, hint(NodeAddrs::new("real:17001", "real:17000")))])
             .await;
         assert_eq!(
             reg.peers_excluding_self().await,
@@ -306,20 +329,23 @@ mod tests {
     #[tokio::test]
     async fn merge_directory_ignores_empty_addr() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, NodeAddrs::default()), (3, NodeAddrs::cluster_only("c"))])
-            .await;
+        reg.merge_directory([
+            (2, hint(NodeAddrs::default())),
+            (3, hint(NodeAddrs::cluster_only("c"))),
+        ])
+        .await;
         assert_eq!(reg.directory_addr(2).await, None);
         assert_eq!(reg.directory_addr(3).await, Some("c".into()));
     }
 
-    /// Whole-value replacement: an entry is a snapshot of one membership record,
-    /// so a later one overwrites both fields together.
+    /// Whole-value replacement at equal incarnation: a descriptor overwrites
+    /// both fields together, never one at a time.
     #[tokio::test]
     async fn merge_directory_replaces_whole_entry() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, NodeAddrs::new("host:17001", "host:17000"))])
+        reg.merge_directory([(2, hint(NodeAddrs::new("host:17001", "host:17000")))])
             .await;
-        reg.merge_directory([(2, NodeAddrs::new("moved:17001", "moved:17000"))])
+        reg.merge_directory([(2, hint(NodeAddrs::new("moved:17001", "moved:17000")))])
             .await;
 
         assert_eq!(reg.directory_addr(2).await, Some("moved:17001".into()));
@@ -335,9 +361,9 @@ mod tests {
     #[tokio::test]
     async fn merge_directory_clears_a_client_addr_the_new_entry_lacks() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, NodeAddrs::new("host:17001", "host:17000"))])
+        reg.merge_directory([(2, hint(NodeAddrs::new("host:17001", "host:17000")))])
             .await;
-        reg.merge_directory([(2, NodeAddrs::cluster_only("host:17001"))])
+        reg.merge_directory([(2, hint(NodeAddrs::cluster_only("host:17001")))])
             .await;
 
         assert_eq!(reg.client_addr(2).await, None);
@@ -352,9 +378,9 @@ mod tests {
     #[tokio::test]
     async fn merge_directory_clears_a_cluster_addr_the_new_entry_lacks() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, NodeAddrs::new("host:17001", "host:17000"))])
+        reg.merge_directory([(2, hint(NodeAddrs::new("host:17001", "host:17000")))])
             .await;
-        reg.merge_directory([(2, NodeAddrs::new("", "host:17000"))])
+        reg.merge_directory([(2, hint(NodeAddrs::new("", "host:17000")))])
             .await;
 
         assert_eq!(reg.directory_addr(2).await, None);
@@ -367,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn client_addr_absent_for_unknown_and_for_cluster_only_node() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, NodeAddrs::cluster_only("host:17001"))])
+        reg.merge_directory([(2, hint(NodeAddrs::cluster_only("host:17001")))])
             .await;
 
         assert_eq!(reg.client_addr(99).await, None, "unknown node");
@@ -380,19 +406,82 @@ mod tests {
     #[tokio::test]
     async fn peers_exclude_nodes_with_no_cluster_addr() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, NodeAddrs::new("", "host:17000"))])
+        reg.merge_directory([(2, hint(NodeAddrs::new("", "host:17000")))])
             .await;
 
         assert!(reg.peers_excluding_self().await.is_empty());
         assert_eq!(reg.client_addr(2).await, Some("host:17000".into()));
     }
 
+    /// The ordering rule itself: a stale copy still in flight loses to the
+    /// descriptor the node published after it moved.
+    #[tokio::test]
+    async fn lower_incarnation_cannot_overwrite_higher() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("moved:17001", "moved:17000", 7))])
+            .await;
+        reg.merge_directory([(2, own("old:17001", "old:17000", 6))])
+            .await;
+
+        assert_eq!(reg.directory_addr(2).await, Some("moved:17001".into()));
+        assert_eq!(reg.client_addr(2).await, Some("moved:17000".into()));
+    }
+
+    /// The move that motivates the epic: a node restarted at a new address wins
+    /// over the entry every peer already holds.
+    #[tokio::test]
+    async fn higher_incarnation_replaces_a_known_address() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("old:17001", "old:17000", 1))])
+            .await;
+        reg.merge_directory([(2, own("moved:17001", "moved:17000", 2))])
+            .await;
+
+        assert_eq!(reg.directory_addr(2).await, Some("moved:17001".into()));
+    }
+
+    /// The coexistence rule, from both sides: while the membership-derived feed
+    /// still runs, its incarnation-0 entries fill in for a node that has not
+    /// published yet, and lose to that node the moment it does — no matter which
+    /// order the two feeds arrive in.
+    #[tokio::test]
+    async fn a_self_published_descriptor_outranks_the_membership_derived_feed() {
+        let reg = ShardRegistry::new(1, []);
+
+        // Derived-first: membership fills the gap, self-publication takes over.
+        reg.merge_directory([(2, hint(NodeAddrs::new("derived:17001", "derived:17000")))])
+            .await;
+        assert_eq!(reg.directory_addr(2).await, Some("derived:17001".into()));
+        reg.merge_directory([(2, own("self:17001", "self:17000", 1))])
+            .await;
+        assert_eq!(reg.directory_addr(2).await, Some("self:17001".into()));
+
+        // Derived-second: the feed re-runs every tick and must not claw it back.
+        reg.merge_directory([(2, hint(NodeAddrs::new("derived:17001", "derived:17000")))])
+            .await;
+        assert_eq!(reg.directory_addr(2).await, Some("self:17001".into()));
+    }
+
+    /// Sole authorship: a peer gossiping a stale copy of *our* descriptor cannot
+    /// change what we say about ourselves. Incarnation ordering is the whole
+    /// mechanism — there is no special case for self.
+    #[tokio::test]
+    async fn a_peers_stale_copy_of_our_own_descriptor_loses() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(1, own("me:17001", "me:17000", 4))])
+            .await;
+        reg.merge_directory([(1, own("me-old:17001", "me-old:17000", 3))])
+            .await;
+
+        assert_eq!(reg.directory_addr(1).await, Some("me:17001".into()));
+    }
+
     #[tokio::test]
     async fn snapshot_carries_both_addrs() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(1, NodeAddrs::new("c1:17001", "c1:17000"))])
+        reg.merge_directory([(1, own("c1:17001", "c1:17000", 3))])
             .await;
         let (dir, _) = reg.snapshot_for_gossip().await;
-        assert_eq!(dir, vec![(1, NodeAddrs::new("c1:17001", "c1:17000"))]);
+        assert_eq!(dir, vec![(1, own("c1:17001", "c1:17000", 3))]);
     }
 }

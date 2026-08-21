@@ -118,6 +118,12 @@ struct Config {
     observability: ObservabilityConfig,
 }
 
+/// Incarnation this node publishes its own descriptor at. A constant until the
+/// boot counter is persisted (tk-98e9): correct on a first boot, but a node that
+/// restarts at a new address republishes at the same rank its peers already
+/// hold, so the move does not reliably converge.
+const SELF_INCARNATION: u64 = 1;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use clap::Parser;
@@ -361,19 +367,21 @@ async fn main() -> anyhow::Result<()> {
         shard_map: shard_map.clone(),
     }));
 
-    // 7b. Cluster-wide shard registry + gossip task. The directory is derived
-    //     from each hosted shard's Raft membership — including this node's own
-    //     entry — and gossip carries copies to nodes that share no shard, so any
-    //     node can report consensus state for shards it does not host locally.
-    //     No bootstrap seeds: a node joins by being added to a shard's
-    //     membership, which is exactly what tells it about the cluster.
+    // 7b. Cluster-wide shard registry + gossip task. This node publishes its own
+    //     addresses into the directory each tick; the rest is derived from each
+    //     hosted shard's Raft membership, and gossip carries copies to nodes that
+    //     share no shard, so any node can report consensus state for shards it
+    //     does not host locally. No bootstrap seeds: a node joins by being added
+    //     to a shard's membership, which is exactly what tells it about the
+    //     cluster.
     let registry = Arc::new(ShardRegistry::new(cli.node_id, []));
     tokio::spawn(
         GossipTask::new(
             router.clone(),
             registry.clone(),
             cli.node_id,
-            cli.cluster_addr.clone(),
+            self_addrs.clone(),
+            SELF_INCARNATION,
             shutdown.child_token(),
         )
         .run(),

@@ -24,6 +24,10 @@ pub struct AdminServiceImpl {
     registry: Arc<ShardRegistry>,
 }
 
+// These helpers feed the tonic trait methods directly, so their error type is
+// `tonic::Status` whether we like it or not — 176 bytes against the lint's
+// 128-byte threshold.
+#[allow(clippy::result_large_err)]
 impl AdminServiceImpl {
     pub fn new(
         router: Arc<ShardRouter>,

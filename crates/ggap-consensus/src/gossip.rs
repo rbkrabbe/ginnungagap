@@ -17,7 +17,7 @@ use ggap_proto::v1::{
     gossip_service_client::GossipServiceClient, GossipNode, GossipShardEntry, GossipState,
 };
 
-use ggap_types::NodeAddrs;
+use ggap_types::{NodeAddrs, NodeDescriptor};
 
 use crate::registry::{ShardEntry, ShardRegistry};
 use crate::router::ShardRouter;
@@ -30,7 +30,12 @@ pub struct GossipTask {
     router: Arc<ShardRouter>,
     registry: Arc<ShardRegistry>,
     self_node_id: u64,
-    self_cluster_addr: String,
+    /// This node's own addresses, published into the directory each tick.
+    self_addrs: NodeAddrs,
+    /// Orders this node's publications. Boot-scoped and >= 1, so a descriptor
+    /// written on this node's behalf at incarnation 0 is superseded on the
+    /// first tick.
+    incarnation: u64,
     cancel: CancellationToken,
     interval: Duration,
     fanout: usize,
@@ -46,14 +51,16 @@ impl GossipTask {
         router: Arc<ShardRouter>,
         registry: Arc<ShardRegistry>,
         self_node_id: u64,
-        self_cluster_addr: String,
+        self_addrs: NodeAddrs,
+        incarnation: u64,
         cancel: CancellationToken,
     ) -> Self {
         GossipTask {
             router,
             registry,
             self_node_id,
-            self_cluster_addr,
+            self_addrs,
+            incarnation,
             cancel,
             interval: DEFAULT_INTERVAL,
             fanout: DEFAULT_FANOUT,
@@ -92,14 +99,23 @@ impl GossipTask {
         }
     }
 
-    /// Publish status for every locally-hosted shard into the registry and
-    /// derive the node directory from each shard's Raft membership.
+    /// Publish this node's own descriptor, then status for every locally-hosted
+    /// shard, deriving the rest of the directory from each shard's membership.
     ///
-    /// The directory is entirely derived here: membership carries both
-    /// addresses for every member, so a node hosting no shards has nothing to
-    /// derive and no membership to appear in. It still learns the cluster by
-    /// gossiping copies in `exchange_round`, which runs regardless.
+    /// Self-publication comes first and is not gated on hosting a shard: a node
+    /// is the sole author of its own addresses, so it must say where it is even
+    /// while it hosts nothing — after a drain, or before placement. The
+    /// membership-derived merge below is a second feed writing the same map at
+    /// incarnation 0; it fills in nodes that have not reached us directly and
+    /// loses to them as soon as they do.
     async fn refresh_local(&mut self) {
+        self.registry
+            .merge_directory([(
+                self.self_node_id,
+                NodeDescriptor::new(self.self_addrs.clone(), self.incarnation),
+            )])
+            .await;
+
         let shard_ids = self.router.local_shard_ids().await;
         if shard_ids.is_empty() {
             return;
@@ -128,16 +144,20 @@ impl GossipTask {
             };
             let status = node.cluster_status();
 
-            // Membership is the whole entry, on split-created shards too: this
-            // node's own addresses arrive here like every other member's, so no
-            // address is ever originated locally.
+            // Membership addresses enter at incarnation 0: they are a copy of
+            // what some node advertised when it joined, not that node speaking
+            // for itself. This node's own entry is among them and is outranked
+            // by the self-publication above. Once a node has published directly,
+            // this feed can no longer correct its address — which is why the
+            // incarnation it publishes at must actually advance across a
+            // restart.
             self.registry
                 .merge_directory(
                     status
                         .voters
                         .iter()
                         .chain(status.learners.iter())
-                        .map(|(id, addrs)| (*id, addrs.clone())),
+                        .map(|(id, addrs)| (*id, NodeDescriptor::hint(addrs.clone()))),
                 )
                 .await;
 
@@ -178,7 +198,7 @@ impl GossipTask {
             let (peer_id, addr) = peers[self.peer_cursor % peers.len()].clone();
             self.peer_cursor = self.peer_cursor.wrapping_add(1);
 
-            if addr == self.self_cluster_addr {
+            if addr == self.self_addrs.cluster_addr {
                 continue;
             }
             if let Err(e) = self.exchange_with(&addr).await {
@@ -226,23 +246,27 @@ pub async fn merge_gossip_state(registry: &ShardRegistry, state: GossipState) {
     }
 }
 
-pub fn node_to_proto((node_id, addrs): (u64, NodeAddrs)) -> GossipNode {
+pub fn node_to_proto((node_id, desc): (u64, NodeDescriptor)) -> GossipNode {
     GossipNode {
         node_id,
-        cluster_addr: addrs.cluster_addr,
-        client_addr: addrs.client_addr,
+        cluster_addr: desc.addrs.cluster_addr,
+        client_addr: desc.addrs.client_addr,
+        incarnation: desc.incarnation,
     }
 }
 
 /// A member that advertises no client address sends the field as an empty
 /// string, which is also what prost decodes an absent proto3 scalar to. Both
 /// mean the same thing here: nothing can forward a client request to that node.
-pub fn node_from_proto(n: GossipNode) -> (u64, NodeAddrs) {
+pub fn node_from_proto(n: GossipNode) -> (u64, NodeDescriptor) {
     (
         n.node_id,
-        NodeAddrs {
-            cluster_addr: n.cluster_addr,
-            client_addr: n.client_addr,
+        NodeDescriptor {
+            addrs: NodeAddrs {
+                cluster_addr: n.cluster_addr,
+                client_addr: n.client_addr,
+            },
+            incarnation: n.incarnation,
         },
     )
 }
@@ -286,11 +310,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proto_round_trip_preserves_both_addrs() {
-        let addrs = NodeAddrs::new("host:17001", "host:17000");
-        let (id, back) = node_from_proto(node_to_proto((7, addrs.clone())));
+    fn proto_round_trip_preserves_both_addrs_and_incarnation() {
+        let desc = NodeDescriptor::new(NodeAddrs::new("host:17001", "host:17000"), 5);
+        let (id, back) = node_from_proto(node_to_proto((7, desc.clone())));
         assert_eq!(id, 7);
-        assert_eq!(back, addrs);
+        assert_eq!(back, desc);
     }
 
     /// A member advertising no client address round-trips as cluster-only.
@@ -300,8 +324,30 @@ mod tests {
             node_id: 7,
             cluster_addr: "host:17001".into(),
             client_addr: String::new(),
+            incarnation: 2,
         });
         assert_eq!(id, 7);
-        assert_eq!(back, NodeAddrs::cluster_only("host:17001"));
+        assert_eq!(
+            back,
+            NodeDescriptor::new(NodeAddrs::cluster_only("host:17001"), 2)
+        );
+    }
+
+    /// A peer running the pre-incarnation wire format sends no field at all;
+    /// prost decodes that to 0, which is exactly the "written on its behalf"
+    /// rank — so an old peer's copies never outbid a self-published descriptor.
+    #[test]
+    fn an_absent_incarnation_decodes_as_a_hint() {
+        let (_, back) = node_from_proto(GossipNode {
+            node_id: 7,
+            cluster_addr: "host:17001".into(),
+            client_addr: "host:17000".into(),
+            incarnation: 0,
+        });
+        assert_eq!(back.incarnation, 0);
+        assert_eq!(
+            back,
+            NodeDescriptor::hint(NodeAddrs::new("host:17001", "host:17000"))
+        );
     }
 }

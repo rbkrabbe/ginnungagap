@@ -47,6 +47,10 @@ pub struct KvServiceImpl {
     watch_output_buffer: usize,
 }
 
+// These helpers feed the tonic trait methods directly, so their error type is
+// `tonic::Status` whether we like it or not — 176 bytes against the lint's
+// 128-byte threshold.
+#[allow(clippy::result_large_err)]
 impl KvServiceImpl {
     pub fn new(
         router: Arc<ShardRouter>,
