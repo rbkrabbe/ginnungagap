@@ -101,13 +101,24 @@ The production `RaftNode` implementation. It:
   defaults), so clearing is reachable only where a test harness builds
   cluster-only membership on purpose.
 
+  The directory is also **cached on disk** (`ggap-storage`'s `DirectoryStore`,
+  one `meta` record). The gossip task writes it out after each round when it has
+  changed, and `ggap-node` seeds the registry from it before starting the task.
+  This buys immediacy, not capability: peers re-seed a restarted node within a
+  gossip round anyway, but a node that restarts and is elected before that
+  happens can resolve its peers straight away. Incarnations are persisted with
+  the entries, so a restored entry still outranks the stale copies in flight.
+  Being a cache, it never blocks a boot — a missing or corrupt record logs a
+  warning and starts the node with an empty directory.
+
   Bootstrap gossip peers are *not* directory entries. `ShardRegistry::new` takes
   `seed_peers` as `(node_id, cluster_addr)` into a separate field that
   `peers_excluding_self` unions in and `snapshot_for_gossip` never emits, so a
   dial hint can never be gossiped over a fully-known entry. Nothing in
   `ggap-node` passes any: a node joins by being added to a shard's membership,
-  which is exactly what tells it about the cluster (tk-9bcd tracks whether the
-  parameter earns its keep).
+  which is exactly what tells it about the cluster. `seed_peers` survives for
+  nodes in no membership that nobody will ever dial — the observer harness in
+  `ggap-server/tests/three_node_cluster.rs`, and later `ggap-pd`.
 
   **Still open:** copied entries are ordered last-write-wins, so a peer holding
   an older copy can overwrite a newer one. tk-c4fc stamps them with the

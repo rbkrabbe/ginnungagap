@@ -64,6 +64,11 @@ pub fn ttl_shard_prefix(shard_id: ShardId) -> [u8; 8] {
     shard_id.to_be_bytes()
 }
 
+/// Sentinel `shard_id` prefixing `meta` keys that describe *this node* rather
+/// than one shard — the shard map and the persisted directory. Never a real
+/// shard id, so a node-scoped key can never collide with a shard's.
+pub const NODE_SCOPED: ShardId = u64::MAX;
+
 /// `meta` partition: `shard(8) ++ label_utf8`
 pub fn meta_key(shard_id: ShardId, label: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + label.len());
@@ -125,6 +130,11 @@ mod tests {
         let key = data_key(42, "hello");
         assert_eq!(&key[..8], &42u64.to_be_bytes());
         assert_eq!(&key[8..], b"hello");
+    }
+
+    #[test]
+    fn node_scoped_keys_sort_past_every_shard() {
+        assert!(meta_key(u64::MAX - 1, "zzz") < meta_key(NODE_SCOPED, ""));
     }
 
     #[test]

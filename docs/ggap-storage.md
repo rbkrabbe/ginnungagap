@@ -31,6 +31,20 @@ scan for `"foo\x00"` cannot accidentally match entries for the key `"foobar"`.
 Without this delimiter, the prefix `shard ++ "foo"` would be a prefix of
 `shard ++ "foobar\x00..." ` and the scan would return spurious results.
 
+**Node-scoped meta keys.** A few `meta` records describe *this node* rather than
+one shard: the shard map (`shard:<id>` labels) and the persisted directory
+(`directory`). They share the `NODE_SCOPED` sentinel shard id (`u64::MAX`), which
+no real shard can take, and are distinguished by label — so a scan for one must
+match on `meta_key(NODE_SCOPED, "<label prefix>")`, never on the sentinel alone.
+
+**The persisted directory (`directory.rs`).** `DirectoryStore` writes the whole
+`node_id -> NodeDescriptor` map as one record and reads it back at startup. It is
+a cache of gossip whose only job is immediacy: a node that restarts and is
+elected before any peer has gossiped to it resolves its peers straight away
+instead of failing sends until it is dialled. `load` therefore never fails — a
+missing, unreadable or corrupt record warns and yields an empty directory, and
+the node re-learns it from the first peer that dials it.
+
 **TTL index sort order.** Sorting by `expires_at_ns` first means the GC task can
 find the next-to-expire key with a single prefix scan, taking only the first
 result — O(1) rather than a full scan of the index.

@@ -4,3 +4,5 @@
 .tasks/.claims.json
 .tasks/.claims.lock
 .tasks/.state/
+
+.DS_Store

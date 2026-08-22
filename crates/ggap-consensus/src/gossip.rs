@@ -17,6 +17,7 @@ use ggap_proto::v1::{
     gossip_service_client::GossipServiceClient, GossipNode, GossipShardEntry, GossipState,
 };
 
+use ggap_storage::DirectoryStore;
 use ggap_types::{NodeAddrs, NodeDescriptor};
 
 use crate::registry::{ShardEntry, ShardRegistry};
@@ -40,6 +41,11 @@ pub struct GossipTask {
     interval: Duration,
     fanout: usize,
     rpc_timeout: Duration,
+    /// Where the directory is cached for the next boot. `None` disables
+    /// persistence — a registry built by hand in a test needs none.
+    directory_store: Option<DirectoryStore>,
+    /// What was last written, so an unchanged directory costs no write.
+    persisted_directory: Vec<(u64, NodeDescriptor)>,
     /// Monotonic heartbeat counter bumped each time we publish local status.
     version: u64,
     /// Rotating cursor over the peer list (avoids a `rand` prod dependency).
@@ -65,6 +71,8 @@ impl GossipTask {
             interval: DEFAULT_INTERVAL,
             fanout: DEFAULT_FANOUT,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            directory_store: None,
+            persisted_directory: Vec::new(),
             version: 0,
             peer_cursor: 0,
         }
@@ -85,6 +93,14 @@ impl GossipTask {
         self
     }
 
+    /// Cache the directory to disk after every round, so the next boot resolves
+    /// peers without waiting to be dialled. The caller is expected to have
+    /// seeded the registry from the same store before starting the task.
+    pub fn with_directory_store(mut self, store: DirectoryStore) -> Self {
+        self.directory_store = Some(store);
+        self
+    }
+
     pub async fn run(mut self) {
         loop {
             tokio::select! {
@@ -96,6 +112,7 @@ impl GossipTask {
             }
             self.refresh_local().await;
             self.exchange_round().await;
+            self.persist_directory().await;
         }
     }
 
@@ -203,6 +220,27 @@ impl GossipTask {
             }
             if let Err(e) = self.exchange_with(&addr).await {
                 tracing::debug!(node_id = self.self_node_id, peer_id, %addr, error = %e, "gossip exchange failed");
+            }
+        }
+    }
+
+    /// Write the directory out if it changed since the last round. Failing to
+    /// write is not fatal: the cache only buys immediacy on the next boot, and
+    /// a node that starts without one is re-seeded by the first peer to dial
+    /// it. Persisting after the exchange captures what peers just told us as
+    /// well as what we published.
+    async fn persist_directory(&mut self) {
+        let Some(store) = &self.directory_store else {
+            return;
+        };
+        let dir = self.registry.directory_snapshot().await;
+        if dir == self.persisted_directory {
+            return;
+        }
+        match store.save(&dir) {
+            Ok(()) => self.persisted_directory = dir,
+            Err(e) => {
+                tracing::warn!(node_id = self.self_node_id, error = %e, "cannot persist the directory");
             }
         }
     }
