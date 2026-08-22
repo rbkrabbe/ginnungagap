@@ -93,7 +93,7 @@ jobs:
 
       - name: Clippy
         if: steps.changes.outputs.code == 'true'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build
         if: steps.changes.outputs.code == 'true'
@@ -101,4 +101,4 @@ jobs:
 
       - name: Test
         if: steps.changes.outputs.code == 'true'
-        run: cargo test --all
+        run: cargo test --all --all-features

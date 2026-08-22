@@ -55,10 +55,16 @@ following and fix any errors:
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets
-cargo test --all --quiet
+cargo test --all --all-features --quiet
 ```
 
 CI enforces all four checks — a push that skips them will fail.
+
+`--all-features` is load-bearing on the clippy and test lines: `test-utils` is
+the only feature in the workspace, and `split_crash_bugs` is
+`required-features = ["test-utils"]`. Without it cargo skips that target
+silently — no skip line, no warning, an all-green run. `cargo build` stays
+feature-free so the crash-injection helpers never reach a production build.
 
 A change that touches no code — only `.tasks/*.md` or other markdown — skips
 the checklist. CI applies the same rule and reports success without running
