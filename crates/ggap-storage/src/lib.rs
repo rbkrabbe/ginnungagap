@@ -1,3 +1,4 @@
+pub mod directory;
 pub mod fjall;
 pub mod keys;
 pub mod mem;
@@ -6,6 +7,7 @@ pub mod traits;
 pub mod ttl;
 pub mod types;
 
+pub use directory::DirectoryStore;
 pub use fjall::SplitApplied;
 pub use shard_map::ShardMap;
 pub use traits::{LogStorage, StateMachineStore};

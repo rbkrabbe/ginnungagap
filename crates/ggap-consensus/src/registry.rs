@@ -1,9 +1,13 @@
 //! In-memory, eventually-consistent view of cluster-wide shard placement and
 //! per-shard Raft status, populated by the gossip task ([`crate::gossip`]).
 //!
-//! The registry is a rebuildable cache — nothing here is persisted. It lets any
-//! node answer `ListShards` / `ClusterStatus` for shards it does not host
-//! locally, degrading gracefully (entries simply age) when a peer is
+//! The registry is a rebuildable cache. Its shard entries are never persisted;
+//! its directory is written out by the gossip task and read back at startup
+//! ([`ggap_storage::DirectoryStore`]) so a restarted node can resolve peers
+//! before anyone gossips to it — persistence buys immediacy, not authority.
+//!
+//! It lets any node answer `ListShards` / `ClusterStatus` for shards it does
+//! not host locally, degrading gracefully (entries simply age) when a peer is
 //! unreachable. It holds no gRPC types; the proto <-> [`ShardEntry`] conversion
 //! lives in [`crate::gossip`].
 
@@ -65,7 +69,10 @@ pub struct ShardRegistry {
 impl ShardRegistry {
     /// Create a registry with bootstrap gossip peers as `(node_id,
     /// cluster_addr)`. A node added to a shard by `AddLearner` needs none: it
-    /// reaches the cluster through the Raft membership it is given.
+    /// reaches the cluster through the Raft membership it is given, and a
+    /// restart resolves its peers from the persisted directory. Seeds are for
+    /// nodes in no membership, which nobody will ever dial — the observer
+    /// harness, and later `ggap-pd`.
     pub fn new(self_node_id: u64, seed_peers: impl IntoIterator<Item = (u64, String)>) -> Self {
         ShardRegistry {
             self_node_id,
@@ -198,9 +205,9 @@ impl ShardRegistry {
         peers
     }
 
-    /// The full view to push to a peer (or return from `Exchange`). Sorted for
-    /// deterministic output.
-    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, NodeDescriptor)>, Vec<ShardEntry>) {
+    /// The whole directory, sorted by node id. Gossip pushes it to peers and
+    /// the gossip task persists it; both want a stable order.
+    pub async fn directory_snapshot(&self) -> Vec<(u64, NodeDescriptor)> {
         let mut dir: Vec<(u64, NodeDescriptor)> = self
             .directory
             .read()
@@ -209,7 +216,13 @@ impl ShardRegistry {
             .map(|(id, desc)| (*id, desc.clone()))
             .collect();
         dir.sort_by_key(|(id, _)| *id);
+        dir
+    }
 
+    /// The full view to push to a peer (or return from `Exchange`). Sorted for
+    /// deterministic output.
+    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, NodeDescriptor)>, Vec<ShardEntry>) {
+        let dir = self.directory_snapshot().await;
         let mut shards: Vec<ShardEntry> = self.shards.read().await.values().cloned().collect();
         shards.sort_by_key(|e| e.shard_id);
         (dir, shards)

@@ -6,16 +6,16 @@ use tokio::sync::RwLock;
 use ggap_types::{GgapError, KeyRange, ShardId, ShardInfo, ShardState};
 
 use crate::fjall::FjallStore;
-use crate::keys::meta_key;
+use crate::keys::{meta_key, NODE_SCOPED};
 
-/// Sentinel shard_id used as the prefix for ShardMap metadata in the `meta`
-/// keyspace. This must never collide with a real shard_id.
-const SHARD_MAP_PREFIX: ShardId = u64::MAX;
+/// Label prefix for the ShardMap's own records inside the node-scoped `meta`
+/// namespace, which it shares with the persisted directory
+/// ([`crate::directory`]). Scans must match on it, not on the sentinel alone.
+const SHARD_LABEL_PREFIX: &str = "shard:";
 
 pub(crate) fn shard_map_key(shard_id: ShardId) -> Vec<u8> {
-    // meta_key(SHARD_MAP_PREFIX, "shard:XXXX") where XXXX is be_u64(shard_id)
-    let label = format!("shard:{}", shard_id);
-    meta_key(SHARD_MAP_PREFIX, &label)
+    let label = format!("{SHARD_LABEL_PREFIX}{shard_id}");
+    meta_key(NODE_SCOPED, &label)
 }
 
 /// Key used to store bootstrap membership for a shard created by a split.
@@ -47,7 +47,7 @@ pub struct ShardMap {
 impl ShardMap {
     /// Load all shard entries from storage and build the in-memory cache.
     pub fn load(store: Arc<FjallStore>) -> Result<Self, GgapError> {
-        let prefix = SHARD_MAP_PREFIX.to_be_bytes().to_vec();
+        let prefix = meta_key(NODE_SCOPED, SHARD_LABEL_PREFIX);
         let mut shards = BTreeMap::new();
 
         for guard in store.meta.prefix(&prefix) {

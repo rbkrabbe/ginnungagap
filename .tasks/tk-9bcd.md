@@ -2,7 +2,7 @@
 id = "tk-9bcd"
 title = "No CLI flag populates ShardRegistry seed_peers"
 kind = "task"
-status = "open"
+status = "dropped"
 size = "m"
 priority = 2
 blocked_by = []
@@ -43,3 +43,17 @@ second option and then needing the first is the worse order.
 - [ ] Either `seed_peers` has a production entry point, or it is gone.
 - [ ] If it stays, a node started with only a seed and hosting no shard is
       covered by a test that does not construct `ShardRegistry` by hand.
+
+## Resolution (tk-c593)
+
+Neither option: `seed_peers` stays, and no CLI flag is added. tk-ef8d Q2 settled
+that a joining node is *dialled* and never dials — `AddLearner` leaves a non-seed
+fresh node's Raft uninitialized until the leader reaches it, and one inbound
+`Exchange` hands it the responder's whole view. tk-c593 persists the directory,
+so a restart resolves its peers immediately rather than waiting for that.
+
+That leaves `seed_peers` with the scope it always deserved: nodes in **no**
+membership, which nothing will ever dial — the observer harness in
+`ggap-server/tests/three_node_cluster.rs`, and later `ggap-pd`. There is no
+production entry point because there is no production node in that state yet; the
+flag belongs to whichever change first ships one, not here.

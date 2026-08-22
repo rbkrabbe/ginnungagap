@@ -79,7 +79,9 @@ just `ShardId(0)`. What exists today:
 
 - Node addresses are carried by Raft membership; the directory in `ShardRegistry`
   is derived from it and cached, and gossip only copies entries between nodes
-  that share no shard.
+  that share no shard. The directory is also persisted to the `meta` keyspace
+  and restored at startup, so a restart resolves peers without waiting to be
+  dialled; it is a cache, so a corrupt record starts the node empty.
 
 **Known gap:** *placement* has no cluster-wide view. Addresses are solved —
 membership carries them, so any node reports both for every peer in a shard it
