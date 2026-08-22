@@ -90,8 +90,11 @@ just `ShardId(0)`. What exists today:
   dialled; it is a cache, so a corrupt record starts the node empty.
   A node publishes its own descriptor at an incarnation taken from a boot
   counter in the same keyspace, incremented each start, so a restart at a new
-  address outranks every copy of the old one. Wiping the data dir restarts that
-  count: an address change made across a wipe needs a fresh node id.
+  address outranks every copy of the old one. A node that starts *below* the
+  rank its peers hold can never win back authorship of its own address, so an
+  unusable counter recovers its rank from the persisted directory's self-entry
+  and fails the boot if that is unreadable too. Wiping the data dir loses both
+  records: an address change made across a wipe needs a fresh node id.
 
 **Known gap:** *placement* has no cluster-wide view. Addresses are solved —
 membership carries them, so any node reports both for every peer in a shard it

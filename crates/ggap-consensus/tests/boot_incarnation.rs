@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use ggap_consensus::{merge_gossip_state, ShardRegistry};
 use ggap_proto::v1::{GossipNode, GossipState};
 use ggap_storage::fjall::FjallStore;
-use ggap_storage::BootCounter;
+use ggap_storage::{BootCounter, DirectoryStore};
 use ggap_types::{NodeAddrs, NodeDescriptor};
 
 fn desc(cluster: &str, client: &str, incarnation: u64) -> NodeDescriptor {
@@ -37,7 +37,7 @@ fn gossip_from(sender: u64, nodes: &[(u64, NodeDescriptor)]) -> GossipState {
 /// this node's descriptor at that rank into a fresh registry.
 async fn boot(dir: &TempDir, cluster: &str, client: &str) -> (u64, ShardRegistry) {
     let store = FjallStore::open(dir.path()).unwrap();
-    let incarnation = BootCounter::new(store).advance();
+    let incarnation = BootCounter::new(store, 1).advance().unwrap();
     let registry = ShardRegistry::new(1, []);
     registry
         .merge_directory([(1, desc(cluster, client, incarnation))])
@@ -105,6 +105,65 @@ async fn a_restarted_node_at_a_new_address_outranks_its_own_stale_copy() {
         moved.directory_addr(1).await,
         Some("new:17001".into()),
         "a stale copy must not overwrite the descriptor at its own author"
+    );
+}
+
+/// A corrupt counter must not cost the node its rank while the directory still
+/// records it. The node restarts at a new address with an unreadable counter,
+/// recovers what it last published from the persisted directory, and still
+/// outranks the copy its peer holds.
+///
+/// The directory here is written by the node itself across the earlier boots,
+/// not planted by the test: recovery reads back what the running system left.
+#[tokio::test]
+async fn a_corrupt_counter_recovers_its_rank_and_still_outranks_a_peer() {
+    let dir = TempDir::new().unwrap();
+
+    // Two boots at the old address, each persisting a directory containing this
+    // node's own entry at the rank it published.
+    let mut last = 0;
+    for _ in 0..2 {
+        let (incarnation, registry) = boot(&dir, "old:17001", "old:17000").await;
+        let store = FjallStore::open(dir.path()).unwrap();
+        DirectoryStore::new(store)
+            .save(&registry.directory_snapshot().await)
+            .unwrap();
+        last = incarnation;
+    }
+    assert_eq!(last, 2, "two boots must reach rank 2");
+
+    // A peer holding what that second boot published.
+    let peer = ShardRegistry::new(2, []);
+    merge_gossip_state(
+        &peer,
+        gossip_from(1, &[(1, desc("old:17001", "old:17000", last))]),
+    )
+    .await;
+
+    // The counter rots; the directory does not.
+    let store = FjallStore::open(dir.path()).unwrap();
+    store
+        .node
+        .insert(ggap_storage::keys::node_key("boot_counter"), b"xx".to_vec())
+        .unwrap();
+    drop(store);
+
+    let (recovered, _) = boot(&dir, "new:17001", "new:17000").await;
+    assert_eq!(
+        recovered,
+        last + 1,
+        "the rank must be recovered from the directory, not restarted at 1"
+    );
+
+    merge_gossip_state(
+        &peer,
+        gossip_from(1, &[(1, desc("new:17001", "new:17000", recovered))]),
+    )
+    .await;
+    assert_eq!(
+        peer.directory_addr(1).await,
+        Some("new:17001".into()),
+        "a recovered rank must still outrank the copy the peer holds"
     );
 }
 

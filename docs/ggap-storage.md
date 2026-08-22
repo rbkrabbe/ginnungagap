@@ -58,7 +58,10 @@ a cache of gossip whose only job is immediacy: a node that restarts and is
 elected before any peer has gossiped to it resolves its peers straight away
 instead of failing sends until it is dialled. `load` therefore never fails — a
 missing, unreadable or corrupt record warns and yields an empty directory, and
-the node re-learns it from the first peer that dials it.
+the node re-learns it from the first peer that dials it. `try_load` is the same
+read without that collapse — `Ok(None)` for absent, `Err` for present-and-
+unreadable — because the boot counter's recovery needs to tell a first boot from
+an unrankable one.
 
 **The boot counter (`boot_counter.rs`).** `BootCounter::advance` reads the
 `u64` at `"boot_counter"`, writes back one more, and returns it: the incarnation
@@ -68,14 +71,36 @@ over its publications — a node that restarts at a new address outranks every c
 of the old one still in flight, including the copies its peers hold of *its own*
 entry, which ties would otherwise hand back to the stale side.
 
-Like the directory, it never fails a boot: an absent record is a first boot and
-yields 1, and an unreadable, corrupt or unwritable one warns and restarts the
-count. Both cost only the guarantee that this boot outranks the last.
+Starting *low* is worse than not starting at all, which is what shapes the
+failure handling. A node that publishes below the rank its peers hold does not
+merely lose an ordering guarantee: peers' copies win on rank, the local
+self-publication loses the same comparison every gossip tick, and since the
+gossip round re-snapshots the directory per peer, the node forwards the stale
+address about itself. It cannot recover, and it looks healthy while doing it.
 
-*Wiping the data dir loses the count.* A node restarted from an empty data dir
-publishes at 1 again and cannot outbid peers still holding a higher incarnation
-for its id, so its new address never takes. **An address change made across a
-wipe needs a fresh node id.**
+So `advance` reads in this order, and fails the boot rather than return a rank
+it knows to be unfounded:
+
+| Counter | Directory | Result |
+|---|---|---|
+| absent | *not consulted* | 1 — a first boot |
+| readable | *not consulted* | one above it |
+| unusable | absent, or no entry for this node | 1 — a first boot |
+| unusable | holds this node's entry | one above the rank it records |
+| unusable | present and unreadable | **the boot fails** |
+
+An *absent* counter deliberately does not consult the directory. A node
+re-seeded by its peers before it ever published has a directory entry it did not
+write, and adopting that as its own rank would invent a history.
+
+A counter that cannot be *written* is only a warning: this boot is still
+correctly ranked, and the next one re-uses this incarnation — a tie, which the
+self-publication wins back on the following tick, not a deficit.
+
+*Wiping the data dir loses the count*, and no recovery covers it: both records go
+together, so the node restarts at 1 and cannot outbid peers still holding a
+higher incarnation for its id. **An address change made across a wipe needs a
+fresh node id.**
 
 **TTL index sort order.** Sorting by `expires_at_ns` first means the GC task can
 find the next-to-expire key with a single prefix scan, taking only the first
