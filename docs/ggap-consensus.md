@@ -102,7 +102,7 @@ The production `RaftNode` implementation. It:
   cluster-only membership on purpose.
 
   The directory is also **cached on disk** (`ggap-storage`'s `DirectoryStore`,
-  one `meta` record). The gossip task writes it out after each round when it has
+  one `node` record). The gossip task writes it out after each round when it has
   changed, and `ggap-node` seeds the registry from it before starting the task.
   This buys immediacy, not capability: peers re-seed a restarted node within a
   gossip round anyway, but a node that restarts and is elected before that

@@ -6,16 +6,15 @@ use tokio::sync::RwLock;
 use ggap_types::{GgapError, KeyRange, ShardId, ShardInfo, ShardState};
 
 use crate::fjall::FjallStore;
-use crate::keys::{meta_key, NODE_SCOPED};
+use crate::keys::{meta_key, node_shard_key};
 
-/// Label prefix for the ShardMap's own records inside the node-scoped `meta`
-/// namespace, which it shares with the persisted directory
-/// ([`crate::directory`]). Scans must match on it, not on the sentinel alone.
-const SHARD_LABEL_PREFIX: &str = "shard:";
+/// Label prefix for the ShardMap's own records inside the `node` keyspace,
+/// which it shares with the persisted directory ([`crate::directory`]). Scans
+/// must match on it so a directory record is never decoded as a `ShardInfo`.
+const SHARD_KEY_LABEL: &str = "shard:";
 
 pub(crate) fn shard_map_key(shard_id: ShardId) -> Vec<u8> {
-    let label = format!("{SHARD_LABEL_PREFIX}{shard_id}");
-    meta_key(NODE_SCOPED, &label)
+    node_shard_key(SHARD_KEY_LABEL, shard_id)
 }
 
 /// Key used to store bootstrap membership for a shard created by a split.
@@ -35,7 +34,10 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Result<T, GgapEr
         .map_err(|e| GgapError::Storage(e.to_string()))
 }
 
-/// Persistent shard-to-range mapping backed by the `meta` keyspace of fjall.
+/// Persistent shard-to-range mapping backed by the `node` keyspace of fjall.
+///
+/// These records are a node fact keyed by shard id, not shard-scoped data:
+/// `all_shards` is what decides which Raft groups *this node* starts.
 ///
 /// The ShardMap tracks which `ShardId` owns which `KeyRange`. It keeps an
 /// in-memory cache that is loaded on startup and updated on mutations.
@@ -47,10 +49,9 @@ pub struct ShardMap {
 impl ShardMap {
     /// Load all shard entries from storage and build the in-memory cache.
     pub fn load(store: Arc<FjallStore>) -> Result<Self, GgapError> {
-        let prefix = meta_key(NODE_SCOPED, SHARD_LABEL_PREFIX);
         let mut shards = BTreeMap::new();
 
-        for guard in store.meta.prefix(&prefix) {
+        for guard in store.node.prefix(SHARD_KEY_LABEL.as_bytes()) {
             let (_, v) = guard
                 .into_inner()
                 .map_err(|e| GgapError::Storage(e.to_string()))?;
@@ -103,7 +104,7 @@ impl ShardMap {
     /// Remove a shard entry.
     pub async fn remove_shard(&self, shard_id: ShardId) -> Result<(), GgapError> {
         self.store
-            .meta
+            .node
             .remove(shard_map_key(shard_id))
             .map_err(|e| GgapError::Storage(e.to_string()))?;
         self.shards.write().await.remove(&shard_id);
@@ -141,7 +142,7 @@ impl ShardMap {
         let key = shard_map_key(info.shard_id);
         let val = encode(info)?;
         self.store
-            .meta
+            .node
             .insert(key, val)
             .map_err(|e| GgapError::Storage(e.to_string()))
     }
@@ -234,6 +235,38 @@ mod tests {
         let shards = map2.all_shards().await;
         assert_eq!(shards.len(), 1);
         assert_eq!(shards[0].shard_id, 0);
+    }
+
+    /// Records are keyed by big-endian shard id, so a scan of the keyspace
+    /// yields them in numeric order rather than the decimal-label order that
+    /// put "shard:10" before "shard:2".
+    #[tokio::test]
+    async fn records_scan_in_numeric_shard_order() {
+        let (_dir, store) = open_store();
+        let map = ShardMap::load(store.clone()).unwrap();
+        for id in [2u64, 10, 1] {
+            map.put_shard(ShardInfo {
+                shard_id: id,
+                range: KeyRange {
+                    start: String::new(),
+                    end: String::new(),
+                },
+                state: ShardState::Active,
+            })
+            .await
+            .unwrap();
+        }
+
+        let scanned: Vec<ShardId> = store
+            .node
+            .prefix(SHARD_KEY_LABEL.as_bytes())
+            .map(|g| {
+                decode::<ShardInfo>(&g.into_inner().unwrap().1)
+                    .unwrap()
+                    .shard_id
+            })
+            .collect();
+        assert_eq!(scanned, vec![1, 2, 10]);
     }
 
     #[tokio::test]

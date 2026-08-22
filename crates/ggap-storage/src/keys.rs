@@ -64,10 +64,24 @@ pub fn ttl_shard_prefix(shard_id: ShardId) -> [u8; 8] {
     shard_id.to_be_bytes()
 }
 
-/// Sentinel `shard_id` prefixing `meta` keys that describe *this node* rather
-/// than one shard — the shard map and the persisted directory. Never a real
-/// shard id, so a node-scoped key can never collide with a shard's.
-pub const NODE_SCOPED: ShardId = u64::MAX;
+/// `node` partition: bare `label_utf8`.
+///
+/// Keys here describe *this node* rather than one shard, so they carry no
+/// shard prefix — the `node` keyspace is the sole exception to the rule that
+/// every storage key is prefixed with `be_u64(shard_id)`.
+pub fn node_key(label: &str) -> Vec<u8> {
+    label.as_bytes().to_vec()
+}
+
+/// `node` partition: `label_utf8 ++ shard(8)`, for node-scoped records that are
+/// keyed by shard id. The label separates one family of records from another
+/// within the keyspace; the big-endian id makes scan order numeric order.
+pub fn node_shard_key(label: &str, shard_id: ShardId) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(label.len() + 8);
+    buf.extend_from_slice(label.as_bytes());
+    buf.extend_from_slice(&shard_id.to_be_bytes());
+    buf
+}
 
 /// `meta` partition: `shard(8) ++ label_utf8`
 pub fn meta_key(shard_id: ShardId, label: &str) -> Vec<u8> {
@@ -133,8 +147,21 @@ mod tests {
     }
 
     #[test]
-    fn node_scoped_keys_sort_past_every_shard() {
-        assert!(meta_key(u64::MAX - 1, "zzz") < meta_key(NODE_SCOPED, ""));
+    fn node_keys_carry_no_shard_prefix() {
+        assert_eq!(node_key("directory"), b"directory".to_vec());
+    }
+
+    #[test]
+    fn node_shard_keys_sort_numerically() {
+        assert!(node_shard_key("shard:", 2) < node_shard_key("shard:", 10));
+        assert!(node_shard_key("shard:", 10) < node_shard_key("shard:", u64::MAX));
+    }
+
+    #[test]
+    fn node_shard_keys_stay_within_their_label() {
+        let key = node_shard_key("shard:", 7);
+        assert!(key.starts_with(b"shard:"));
+        assert!(!key.starts_with(b"directory"));
     }
 
     #[test]

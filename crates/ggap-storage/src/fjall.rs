@@ -33,13 +33,14 @@ fn fjall_err(e: fjall::Error) -> GgapError {
 }
 
 // ---------------------------------------------------------------------------
-// FjallStore — shared handle wrapping all five keyspaces
+// FjallStore — shared handle wrapping all six keyspaces
 // ---------------------------------------------------------------------------
 
 /// Shared storage handle.
 ///
-/// All five keyspaces live in a single fjall `Database` so that cross-keyspace
-/// write batches are atomic.
+/// All six keyspaces live in a single fjall `Database` so that cross-keyspace
+/// write batches are atomic — a split commits data movement, `last_applied`
+/// and the node keyspace's shard map records in one batch.
 pub struct FjallStore {
     /// The underlying fjall database.
     pub db: fjall::Database,
@@ -53,6 +54,10 @@ pub struct FjallStore {
     pub ttl_index: fjall::Keyspace,
     /// Miscellaneous metadata: `shard(8) ++ label_utf8` → bincode(value)
     pub meta: fjall::Keyspace,
+    /// State describing *this node* rather than one shard, so the only
+    /// keyspace whose keys carry no shard prefix: the shard map
+    /// (`"shard:" ++ shard(8)`) and the persisted directory (`"directory"`).
+    pub node: fjall::Keyspace,
 }
 
 impl FjallStore {
@@ -74,6 +79,9 @@ impl FjallStore {
         let meta = db
             .keyspace("meta", fjall::KeyspaceCreateOptions::default)
             .map_err(fjall_err)?;
+        let node = db
+            .keyspace("node", fjall::KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
         Ok(Arc::new(FjallStore {
             db,
             raft_log,
@@ -81,6 +89,7 @@ impl FjallStore {
             history,
             ttl_index,
             meta,
+            node,
         }))
     }
 }
@@ -484,14 +493,14 @@ impl StateMachineStore for FjallStateMachine {
 
                 // 4. Persist updated source ShardMap entry (narrowed range).
                 batch.insert(
-                    &store.meta,
+                    &store.node,
                     shard_map_key(shard_id),
                     sm_encode(&updated_source)?,
                 );
 
                 // 5. Persist new shard ShardMap entry.
                 batch.insert(
-                    &store.meta,
+                    &store.node,
                     shard_map_key(new_shard_id),
                     sm_encode(&new_shard)?,
                 );

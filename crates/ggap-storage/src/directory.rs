@@ -15,15 +15,15 @@ use std::sync::Arc;
 use ggap_types::{GgapError, NodeDescriptor};
 
 use crate::fjall::FjallStore;
-use crate::keys::{meta_key, NODE_SCOPED};
+use crate::keys::node_key;
 
-/// The whole directory is one `meta` record: it is written and read as a unit,
+/// The whole directory is one `node` record: it is written and read as a unit,
 /// so per-node keys would buy nothing but a range scan.
 fn directory_key() -> Vec<u8> {
-    meta_key(NODE_SCOPED, "directory")
+    node_key("directory")
 }
 
-/// Reads and writes the persisted directory in the `meta` keyspace.
+/// Reads and writes the persisted directory in the `node` keyspace.
 pub struct DirectoryStore {
     store: Arc<FjallStore>,
 }
@@ -36,7 +36,7 @@ impl DirectoryStore {
     /// The persisted directory, or an empty one if there is nothing usable to
     /// read. Sorted by node id, as [`Self::save`] wrote it.
     pub fn load(&self) -> Vec<(u64, NodeDescriptor)> {
-        let bytes = match self.store.meta.get(directory_key()) {
+        let bytes = match self.store.node.get(directory_key()) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Vec::new(),
             Err(e) => {
@@ -58,7 +58,7 @@ impl DirectoryStore {
         let bytes = bincode::serde::encode_to_vec(entries, bincode::config::standard())
             .map_err(|e| GgapError::Storage(e.to_string()))?;
         self.store
-            .meta
+            .node
             .insert(directory_key(), bytes)
             .map_err(|e| GgapError::Storage(e.to_string()))
     }
@@ -117,15 +117,16 @@ mod tests {
     fn a_corrupt_record_loads_empty() {
         let (store, _tempdir) = store();
         store
-            .meta
+            .node
             .insert(directory_key(), b"not bincode".to_vec())
             .unwrap();
 
         assert_eq!(DirectoryStore::new(store).load(), vec![]);
     }
 
-    /// The directory shares the node-scoped sentinel with the shard map, so a
-    /// persisted directory must be invisible to `ShardMap::load`.
+    /// The directory shares the `node` keyspace with the shard map, so a
+    /// persisted directory must be invisible to `ShardMap::load` — which scans
+    /// by label prefix, never the whole keyspace.
     #[tokio::test]
     async fn the_shard_map_ignores_the_directory_record() {
         let (store, _tempdir) = store();
