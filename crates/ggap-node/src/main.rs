@@ -21,7 +21,7 @@ use ggap_storage::{
     fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
     keys::meta_key,
     ttl::TtlGcTask,
-    DirectoryStore, ShardMap,
+    BootCounter, DirectoryStore, ShardMap,
 };
 use ggap_types::{DomainWatchEvent, NodeAddrs};
 
@@ -117,12 +117,6 @@ struct Config {
     server: ServerConfig,
     observability: ObservabilityConfig,
 }
-
-/// Incarnation this node publishes its own descriptor at. A constant until the
-/// boot counter is persisted (tk-98e9): correct on a first boot, but a node that
-/// restarts at a new address republishes at the same rank its peers already
-/// hold, so the move does not reliably converge.
-const SELF_INCARNATION: u64 = 1;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -221,6 +215,18 @@ async fn main() -> anyhow::Result<()> {
         .initialize_default()
         .await
         .context("failed to initialize default shard")?;
+
+    // 2b. Take this boot's incarnation. It ranks the descriptor this node
+    //     publishes for itself, so a restart at a new address outranks every
+    //     copy of the old one still in flight — including the copies peers hold
+    //     of this node's own entry. Wiping the data dir restarts the count, so
+    //     an address change made across a wipe needs a fresh node id.
+    let self_incarnation = BootCounter::new(store.clone()).advance();
+    tracing::info!(
+        node_id = cli.node_id,
+        incarnation = self_incarnation,
+        "publishing this node's addresses at this incarnation"
+    );
 
     // 3. Create watch broadcast channel and FSM (shared across all shards).
     let (watch_tx, _watch_rx) =
@@ -375,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
     //     to a shard's membership, which is exactly what tells it about the
     //     cluster.
     //
-    //     The directory is cached in the `meta` keyspace and read back here, so
+    //     The directory is cached in the `node` keyspace and read back here, so
     //     a node that restarts and is elected before any peer has gossiped to it
     //     resolves its peers straight away instead of failing sends until it is
     //     dialled. It is a cache of gossip: a missing or corrupt record starts
@@ -395,7 +401,7 @@ async fn main() -> anyhow::Result<()> {
             registry.clone(),
             cli.node_id,
             self_addrs.clone(),
-            SELF_INCARNATION,
+            self_incarnation,
             shutdown.child_token(),
         )
         .with_directory_store(directory_store)

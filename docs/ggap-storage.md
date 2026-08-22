@@ -34,9 +34,10 @@ Without this delimiter, the prefix `shard ++ "foo"` would be a prefix of
 `shard ++ "foobar\x00..." ` and the scan would return spurious results.
 
 **The `node` keyspace.** Some records describe *this node* rather than one
-shard: the shard map (`"shard:" ++ shard(8)`) and the persisted directory
-(`"directory"`). They live in their own keyspace and are the one exception to
-the shard-prefix rule — a fact with no shard does not get a fake shard id.
+shard: the shard map (`"shard:" ++ shard(8)`), the persisted directory
+(`"directory"`) and the boot counter (`"boot_counter"`). They live in their own
+keyspace and are the one exception to the shard-prefix rule — a fact with no
+shard does not get a fake shard id.
 Records are separated by label, so a scan for one family must match on its
 label prefix, never the bare keyspace: `ShardMap::load` scanning everything
 would try to decode the directory record as a `ShardInfo` and fail the boot.
@@ -58,6 +59,23 @@ elected before any peer has gossiped to it resolves its peers straight away
 instead of failing sends until it is dialled. `load` therefore never fails — a
 missing, unreadable or corrupt record warns and yields an empty directory, and
 the node re-learns it from the first peer that dials it.
+
+**The boot counter (`boot_counter.rs`).** `BootCounter::advance` reads the
+`u64` at `"boot_counter"`, writes back one more, and returns it: the incarnation
+this node publishes its own descriptor at for the rest of the process. Because a
+descriptor is authored by the node it describes, that counter is a complete clock
+over its publications — a node that restarts at a new address outranks every copy
+of the old one still in flight, including the copies its peers hold of *its own*
+entry, which ties would otherwise hand back to the stale side.
+
+Like the directory, it never fails a boot: an absent record is a first boot and
+yields 1, and an unreadable, corrupt or unwritable one warns and restarts the
+count. Both cost only the guarantee that this boot outranks the last.
+
+*Wiping the data dir loses the count.* A node restarted from an empty data dir
+publishes at 1 again and cannot outbid peers still holding a higher incarnation
+for its id, so its new address never takes. **An address change made across a
+wipe needs a fresh node id.**
 
 **TTL index sort order.** Sorting by `expires_at_ns` first means the GC task can
 find the next-to-expire key with a single prefix scan, taking only the first
