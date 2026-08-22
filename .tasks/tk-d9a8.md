@@ -2,7 +2,7 @@
 id = "tk-d9a8"
 title = "split_crash_bugs never runs: neither the checklist nor CI enables test-utils"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "s"
 priority = 2
 blocked_by = []
@@ -12,6 +12,7 @@ spec_approved = false
 review = "none"
 touched = []
 base = "01477fc53e3c90be6b6401a471f2daa1f8663285"
+closed = "2026-08-22T08:39:03+00:00"
 +++
 ## Context
 

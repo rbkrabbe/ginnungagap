@@ -202,10 +202,10 @@ async fn a_corrupt_record_starts_empty_and_still_converges() {
         persist_directory(store.clone(), registry).await;
 
         // Truncating the record leaves bincode with a prefix it cannot decode.
-        let key = ggap_storage::keys::meta_key(ggap_storage::keys::NODE_SCOPED, "directory");
-        let mut bytes = store.meta.get(&key).unwrap().unwrap().to_vec();
+        let key = ggap_storage::keys::node_key("directory");
+        let mut bytes = store.node.get(&key).unwrap().unwrap().to_vec();
         bytes.truncate(bytes.len() / 2);
-        store.meta.insert(&key, bytes).unwrap();
+        store.node.insert(&key, bytes).unwrap();
     }
 
     let store = FjallStore::open(tempdir.path()).unwrap();

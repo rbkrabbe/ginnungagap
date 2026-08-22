@@ -7,10 +7,11 @@ shim lives in `ggap-consensus`.
 
 ## Key encoding (`keys.rs`)
 
-Every storage key starts with `be_u64(shard_id)`. This prefix is **never
-omitted**. Multi-shard is live (splits create shards), and the prefix is what
-isolates them: a range scan bounded to `[shard_prefix, shard_prefix+1)` naturally
-covers exactly one shard.
+Every key in a shard-scoped keyspace starts with `be_u64(shard_id)`. This prefix
+is **never omitted**. Multi-shard is live (splits create shards), and the prefix
+is what isolates them: a range scan bounded to `[shard_prefix, shard_prefix+1)`
+naturally covers exactly one shard. The `node` keyspace is the sole exception —
+see below.
 
 ### Partition layouts
 
@@ -21,6 +22,7 @@ covers exactly one shard.
 | `history` | `shard(8) ++ key_utf8 ++ \x00 ++ version(8)` | `bincode(KvEntry)` |
 | `ttl_index` | `shard(8) ++ expires_at_ns_be_i64(8) ++ key_utf8` | `b""` |
 | `meta` | `shard(8) ++ label_utf8` | `bincode(value)` |
+| `node` | `label_utf8` (`++ shard(8)` where keyed by shard) | `bincode(value)` |
 
 All multi-byte integers are big-endian so that lexicographic byte order matches
 numeric order, making range queries correct without any post-sort step.
@@ -31,11 +33,23 @@ scan for `"foo\x00"` cannot accidentally match entries for the key `"foobar"`.
 Without this delimiter, the prefix `shard ++ "foo"` would be a prefix of
 `shard ++ "foobar\x00..." ` and the scan would return spurious results.
 
-**Node-scoped meta keys.** A few `meta` records describe *this node* rather than
-one shard: the shard map (`shard:<id>` labels) and the persisted directory
-(`directory`). They share the `NODE_SCOPED` sentinel shard id (`u64::MAX`), which
-no real shard can take, and are distinguished by label — so a scan for one must
-match on `meta_key(NODE_SCOPED, "<label prefix>")`, never on the sentinel alone.
+**The `node` keyspace.** Some records describe *this node* rather than one
+shard: the shard map (`"shard:" ++ shard(8)`) and the persisted directory
+(`"directory"`). They live in their own keyspace and are the one exception to
+the shard-prefix rule — a fact with no shard does not get a fake shard id.
+Records are separated by label, so a scan for one family must match on its
+label prefix, never the bare keyspace: `ShardMap::load` scanning everything
+would try to decode the directory record as a `ShardInfo` and fail the boot.
+
+The shard map's records are keyed by shard id, but that does not make them
+shard-scoped data. The `be_u64(shard_id)` prefix exists so `[be(N), be(N+1))`
+isolates one shard's bytes; nothing scans the shard map that way. What it holds
+is a node fact — `all_shards` is what decides which Raft groups this node
+starts.
+
+`node` lives in the same fjall `Database` as every other keyspace, so a batch
+still spans it: a split commits data movement, `last_applied`, both shard map
+records and `bootstrap_members` together or not at all.
 
 **The persisted directory (`directory.rs`).** `DirectoryStore` writes the whole
 `node_id -> NodeDescriptor` map as one record and reads it back at startup. It is

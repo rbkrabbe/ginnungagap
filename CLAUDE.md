@@ -6,7 +6,7 @@ Decisions anchored here to avoid re-discussion.
 
 - **Pure Rust only** — `fjall` for storage, never RocksDB or any C FFI crate.
 - **`ggap-types` has no gRPC dependency** — all crates import domain types from here; proto types never leak inward.
-- **All storage keys are prefixed with `be_u64(shard_id)`** — multi-shard is live (shards are created by splits), so this prefix is load-bearing, not a placeholder. Never remove it "for simplicity".
+- **All keys in shard-scoped keyspaces are prefixed with `be_u64(shard_id)`** — multi-shard is live (shards are created by splits), so this prefix is load-bearing, not a placeholder. Never remove it "for simplicity". The `node` keyspace is the single exception: it holds state describing *this node* rather than any shard (the shard map, the persisted directory), keyed by bare label. A fact with no shard belongs there, never under a fake shard id.
 - **`RaftNode` always carries `ShardId`** — a node hosting multiple shards is `HashMap<ShardId, RaftNode>` (realized via `ShardRouter`). Keep `ShardId` threaded through every Raft-facing type.
 - **Per-node addresses live in Raft membership, never in gossip** — both
   addresses ride inside `GgapNode`, so a change is an ordered, committed
