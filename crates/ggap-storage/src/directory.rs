@@ -36,21 +36,34 @@ impl DirectoryStore {
     /// The persisted directory, or an empty one if there is nothing usable to
     /// read. Sorted by node id, as [`Self::save`] wrote it.
     pub fn load(&self) -> Vec<(u64, NodeDescriptor)> {
-        let bytes = match self.store.node.get(directory_key()) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Vec::new(),
+        match self.try_load() {
+            Ok(Some(entries)) => entries,
+            Ok(None) => Vec::new(),
             Err(e) => {
                 tracing::warn!(error = %e, "cannot read the persisted directory; starting empty");
-                return Vec::new();
-            }
-        };
-        match bincode::serde::decode_from_slice(&bytes, bincode::config::standard()) {
-            Ok((entries, _)) => entries,
-            Err(e) => {
-                tracing::warn!(error = %e, "persisted directory is corrupt; starting empty");
                 Vec::new()
             }
         }
+    }
+
+    /// The persisted directory, distinguishing *absent* from *unusable*:
+    /// `Ok(None)` is a record that was never written, `Err` one that is there
+    /// and cannot be read.
+    ///
+    /// [`Self::load`] collapses both into an empty directory, which is right
+    /// for a cache. [`crate::BootCounter`] cannot: it recovers this node's rank
+    /// from the self-entry here when its own record is corrupt, and a directory
+    /// that exists but cannot be decoded means the rank is unknown rather than
+    /// unset — a difference between a first boot and an unrankable one.
+    pub fn try_load(&self) -> Result<Option<Vec<(u64, NodeDescriptor)>>, GgapError> {
+        let bytes = match self.store.node.get(directory_key()) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(GgapError::Storage(e.to_string())),
+        };
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .map(|(entries, _)| Some(entries))
+            .map_err(|e| GgapError::Storage(format!("persisted directory is corrupt: {e}")))
     }
 
     /// Replace the persisted directory with `entries`.
@@ -122,6 +135,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(DirectoryStore::new(store).load(), vec![]);
+    }
+
+    /// `try_load` exists to tell these two apart, which `load` cannot.
+    #[test]
+    fn try_load_separates_an_absent_record_from_an_unreadable_one() {
+        let (store, _tempdir) = store();
+        assert_eq!(DirectoryStore::new(store.clone()).try_load().unwrap(), None);
+
+        store
+            .node
+            .insert(directory_key(), b"not bincode".to_vec())
+            .unwrap();
+        assert!(DirectoryStore::new(store).try_load().is_err());
     }
 
     /// The directory shares the `node` keyspace with the shard map, so a

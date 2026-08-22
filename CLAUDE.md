@@ -6,7 +6,7 @@ Decisions anchored here to avoid re-discussion.
 
 - **Pure Rust only** — `fjall` for storage, never RocksDB or any C FFI crate.
 - **`ggap-types` has no gRPC dependency** — all crates import domain types from here; proto types never leak inward.
-- **All keys in shard-scoped keyspaces are prefixed with `be_u64(shard_id)`** — multi-shard is live (shards are created by splits), so this prefix is load-bearing, not a placeholder. Never remove it "for simplicity". The `node` keyspace is the single exception: it holds state describing *this node* rather than any shard (the shard map, the persisted directory), keyed by bare label. A fact with no shard belongs there, never under a fake shard id.
+- **All keys in shard-scoped keyspaces are prefixed with `be_u64(shard_id)`** — multi-shard is live (shards are created by splits), so this prefix is load-bearing, not a placeholder. Never remove it "for simplicity". The `node` keyspace is the single exception: it holds state describing *this node* rather than any shard (the shard map, the persisted directory, the boot counter), keyed by bare label. A fact with no shard belongs there, never under a fake shard id.
 - **`RaftNode` always carries `ShardId`** — a node hosting multiple shards is `HashMap<ShardId, RaftNode>` (realized via `ShardRouter`). Keep `ShardId` threaded through every Raft-facing type.
 - **Per-node addresses live in Raft membership, never in gossip** — both
   addresses ride inside `GgapNode`, so a change is an ordered, committed
@@ -85,9 +85,16 @@ just `ShardId(0)`. What exists today:
 
 - Node addresses are carried by Raft membership; the directory in `ShardRegistry`
   is derived from it and cached, and gossip only copies entries between nodes
-  that share no shard. The directory is also persisted to the `meta` keyspace
+  that share no shard. The directory is also persisted to the `node` keyspace
   and restored at startup, so a restart resolves peers without waiting to be
   dialled; it is a cache, so a corrupt record starts the node empty.
+  A node publishes its own descriptor at an incarnation taken from a boot
+  counter in the same keyspace, incremented each start, so a restart at a new
+  address outranks every copy of the old one. A node that starts *below* the
+  rank its peers hold can never win back authorship of its own address, so an
+  unusable counter recovers its rank from the persisted directory's self-entry
+  and fails the boot if that is unreadable too. Wiping the data dir loses both
+  records: an address change made across a wipe needs a fresh node id.
 
 **Known gap:** *placement* has no cluster-wide view. Addresses are solved —
 membership carries them, so any node reports both for every peer in a shard it
