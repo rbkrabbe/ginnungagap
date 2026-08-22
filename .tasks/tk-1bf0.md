@@ -2,7 +2,7 @@
 id = "tk-1bf0"
 title = "Directory entries have no version, so a changed address may not converge"
 kind = "task"
-status = "open"
+status = "dropped"
 size = "m"
 priority = 2
 blocked_by = []
@@ -14,6 +14,28 @@ touched = []
 discovered_from = "tk-c507"
 +++
 ## Context
+
+## Dropped 2026-08-22 — the defect is fixed, by neither route proposed here
+
+**The bug described below is closed.** `ShardRegistry::merge_directory` is no
+longer last-write-wins: it orders by incarnation, highest wins (tk-8978), and
+tk-98e9 made the incarnation a boot counter persisted in the data dir, so it
+actually advances across a restart. A stale copy can no longer overwrite a fresh
+one, and the node that owns an address outranks every copy of it in flight.
+
+Dropped rather than done because neither fix written here is what shipped. The
+origin-stamped counter in the original text was superseded by tk-c4fc's
+membership `(term, index)` stamp, and that in turn was superseded by tk-ef8d,
+which removes addresses from membership so there is no stamp to take. tk-c4fc is
+dropped alongside this.
+
+Do not re-file this defect. If a stale address does overwrite a fresh one now,
+it is a bug in the incarnation rule (tk-8978) or the counter (tk-98e9), not a
+missing version.
+
+Closed early, ahead of tk-0ae1, so `tk ready` stops offering it as live work.
+
+Everything below is the pre-supersession draft, kept for provenance.
 
 Found by adversarial review of tk-c507.
 
