@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
+    ShardRegistry,
 };
 use ggap_storage::{
     fjall::{FjallLogStorage, FjallStateMachine, FjallStore},
@@ -19,7 +20,8 @@ async fn single_node_leader_write_read() {
     let fsm = Arc::new(FjallStateMachine::new(store.clone()));
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
-    let net = GgapNetworkFactory::new(0);
+    // A single-node Raft dials nobody, so an empty directory is enough.
+    let net = GgapNetworkFactory::new(0, Arc::new(ShardRegistry::new(1, [])));
     let cfg = build_raft_config(50, 150, 300, 500);
 
     let raft = Arc::new(GgapRaft::new(1, cfg, net, log_store, sm).await.unwrap());

@@ -95,6 +95,11 @@ just `ShardId(0)`. What exists today:
   unusable counter recovers its rank from the persisted directory's self-entry
   and fails the boot if that is unreadable too. Wiping the data dir loses both
   records: an address change made across a wipe needs a fresh node id.
+  `GgapNetwork` resolves its target through the directory on **every** RPC and
+  reads no address out of membership, so a node that moves is dialled on the
+  next send with no new client; an id the directory cannot resolve fails the
+  RPC, which openraft treats as an unreachable peer and retries. The registry
+  is therefore built before any Raft group in `ggap-node/src/main.rs`.
 
 **Known gap:** *placement* has no cluster-wide view. Addresses are solved —
 membership carries them, so any node reports both for every peer in a shard it

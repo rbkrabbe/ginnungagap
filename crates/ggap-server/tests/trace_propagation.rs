@@ -99,12 +99,14 @@ async fn start_single_node() -> TestNode {
 
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
+    // A single-node Raft dials nobody, so an empty directory is enough.
+    let registry = Arc::new(ShardRegistry::new(1, []));
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
         GgapRaft::new(
             1,
             raft_cfg.clone(),
-            GgapNetworkFactory::new(0),
+            GgapNetworkFactory::new(0, registry.clone()),
             log_store,
             sm,
         )
@@ -133,7 +135,6 @@ async fn start_single_node() -> TestNode {
         shard_map: shard_map.clone(),
     }));
 
-    let registry = Arc::new(ShardRegistry::new(1, []));
     let mut handles = Vec::new();
     let r = router.clone();
     let sc = split_coordinator;

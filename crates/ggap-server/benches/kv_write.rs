@@ -28,6 +28,7 @@ use ggap_proto::v1::{kv_service_client::KvServiceClient, PutRequest};
 use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
+use ggap_types::{NodeAddrs, NodeDescriptor};
 
 // ---------------------------------------------------------------------------
 // Tuning knobs
@@ -48,6 +49,7 @@ const REPORT_INTERVAL: usize = 100_000;
 struct BenchNode {
     id: u64,
     raft: Arc<GgapRaft>,
+    registry: Arc<ShardRegistry>,
     cluster_addr: SocketAddr,
     client_addr: SocketAddr,
     _tempdir: TempDir,
@@ -61,10 +63,19 @@ async fn start_node(id: u64) -> BenchNode {
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     let cfg = build_raft_config(HEARTBEAT_MS, ELECTION_MIN_MS, ELECTION_MAX_MS, 50_000);
+    // Raft resolves peers through the directory; no gossip task runs here, so
+    // `BenchCluster::start` seeds it once every node's port is known.
+    let registry = Arc::new(ShardRegistry::new(id, []));
     let raft = Arc::new(
-        GgapRaft::new(id, cfg, GgapNetworkFactory::new(0), log_store, sm)
-            .await
-            .unwrap_or_else(|e| panic!("node {id} init: {e}")),
+        GgapRaft::new(
+            id,
+            cfg,
+            GgapNetworkFactory::new(0, registry.clone()),
+            log_store,
+            sm,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("node {id} init: {e}")),
     );
 
     let cluster_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -93,13 +104,12 @@ async fn start_node(id: u64) -> BenchNode {
 
     let mut handles = Vec::new();
 
-    let registry = Arc::new(ShardRegistry::new(id, []));
     let r = router.clone();
     let sc = split_coordinator.clone();
     let sm2 = shard_map.clone();
+    let reg = registry.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) =
-            serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry, vec![]).await
+        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, reg, vec![]).await
         {
             eprintln!("node {id} cluster: {e}");
         }
@@ -117,6 +127,7 @@ async fn start_node(id: u64) -> BenchNode {
 
     BenchNode {
         id,
+        registry,
         raft,
         cluster_addr,
         client_addr,
@@ -139,6 +150,21 @@ impl BenchCluster {
             .iter()
             .map(|n| (n.id, GgapNode::cluster_only(n.cluster_addr.to_string())))
             .collect();
+
+        // Seed every directory, since nothing here gossips.
+        let directory: Vec<(u64, NodeDescriptor)> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.id,
+                    NodeDescriptor::hint(NodeAddrs::cluster_only(n.cluster_addr.to_string())),
+                )
+            })
+            .collect();
+        for node in &nodes {
+            node.registry.merge_directory(directory.clone()).await;
+        }
+
         nodes[0]
             .raft
             .initialize(members)

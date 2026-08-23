@@ -39,6 +39,8 @@ async fn cors_preflight_returns_allow_origin() {
     fsm_builder.set_shard_map(shard_map.clone());
     let fsm = Arc::new(fsm_builder);
 
+    // A single-node Raft dials nobody, so an empty directory is enough.
+    let registry = Arc::new(ShardRegistry::new(1, []));
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
@@ -46,7 +48,7 @@ async fn cors_preflight_returns_allow_origin() {
         GgapRaft::new(
             1,
             raft_cfg.clone(),
-            GgapNetworkFactory::new(0),
+            GgapNetworkFactory::new(0, registry.clone()),
             log_store,
             sm,
         )
@@ -73,8 +75,6 @@ async fn cors_preflight_returns_allow_origin() {
         shard_map: shard_map.clone(),
     }));
 
-    let registry = Arc::new(ShardRegistry::new(1, []));
-
     tokio::spawn(run_split_handler(
         split_rx,
         store.clone(),
@@ -82,6 +82,7 @@ async fn cors_preflight_returns_allow_origin() {
         router.clone(),
         1,
         raft_cfg,
+        registry.clone(),
     ));
 
     // Bootstrap single-node Raft.

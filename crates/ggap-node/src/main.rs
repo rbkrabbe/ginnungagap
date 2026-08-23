@@ -252,6 +252,27 @@ async fn main() -> anyhow::Result<()> {
     // 4. Create ShardRouter.
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
 
+    // 4b. Cluster-wide shard registry. It has to exist before any Raft group,
+    //     because `GgapNetwork` resolves every outbound RPC's target address
+    //     through its directory. No bootstrap seeds: a node joins by being added
+    //     to a shard's membership, which is exactly what tells it about the
+    //     cluster.
+    //
+    //     The directory is cached in the `node` keyspace and read back here, so
+    //     a node that restarts and is elected before any peer has gossiped to it
+    //     resolves its peers straight away instead of failing sends until it is
+    //     dialled. It is a cache of gossip: a missing or corrupt record starts
+    //     the node with an empty directory rather than failing the boot.
+    let registry = Arc::new(ShardRegistry::new(cli.node_id, []));
+    let directory_store = DirectoryStore::new(store.clone());
+    let persisted_directory = directory_store.load();
+    tracing::info!(
+        node_id = cli.node_id,
+        entries = persisted_directory.len(),
+        "restored the persisted directory"
+    );
+    registry.merge_directory(persisted_directory).await;
+
     // 5. Start a Raft group for each shard in the ShardMap.
     let shards = shard_map.all_shards().await;
     let raft_cfg = build_raft_config(
@@ -265,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
         let shard_id = shard_info.shard_id;
         let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), shard_id);
         let sm = GgapStateMachine::new(fsm.clone(), shard_id);
-        let net = GgapNetworkFactory::new(shard_id);
+        let net = GgapNetworkFactory::new(shard_id, registry.clone());
 
         let raft = Arc::new(
             GgapRaft::new(cli.node_id, raft_cfg.clone(), net, log_store, sm)
@@ -372,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
         router.clone(),
         cli.node_id,
         raft_cfg.clone(),
+        registry.clone(),
     ));
 
     // 7. Create the SplitCoordinator.
@@ -380,28 +402,11 @@ async fn main() -> anyhow::Result<()> {
         shard_map: shard_map.clone(),
     }));
 
-    // 7b. Cluster-wide shard registry + gossip task. This node publishes its own
-    //     addresses into the directory each tick; the rest is derived from each
-    //     hosted shard's Raft membership, and gossip carries copies to nodes that
-    //     share no shard, so any node can report consensus state for shards it
-    //     does not host locally. No bootstrap seeds: a node joins by being added
-    //     to a shard's membership, which is exactly what tells it about the
-    //     cluster.
-    //
-    //     The directory is cached in the `node` keyspace and read back here, so
-    //     a node that restarts and is elected before any peer has gossiped to it
-    //     resolves its peers straight away instead of failing sends until it is
-    //     dialled. It is a cache of gossip: a missing or corrupt record starts
-    //     the node with an empty directory rather than failing the boot.
-    let registry = Arc::new(ShardRegistry::new(cli.node_id, []));
-    let directory_store = DirectoryStore::new(store.clone());
-    let persisted_directory = directory_store.load();
-    tracing::info!(
-        node_id = cli.node_id,
-        entries = persisted_directory.len(),
-        "restored the persisted directory"
-    );
-    registry.merge_directory(persisted_directory).await;
+    // 7b. Gossip task. This node publishes its own addresses into the directory
+    //     each tick; the rest is derived from each hosted shard's Raft
+    //     membership, and gossip carries copies to nodes that share no shard, so
+    //     any node can report consensus state for shards it does not host
+    //     locally.
     tokio::spawn(
         GossipTask::new(
             router.clone(),
