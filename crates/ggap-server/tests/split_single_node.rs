@@ -6,7 +6,7 @@
 //! Run with:
 //!   cargo test -p ggap-server --test split_single_node -- --nocapture
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,8 +24,9 @@ use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
 use ggap_types::{KvCommand, KvResponse, NodeAddrs, NodeDescriptor, ReadMode, WriteMode};
 
-/// This node's directory entry. Both addresses are set: a split resolves them
-/// from the directory and must hand the whole entry to the shard it creates.
+/// This node's directory entry. Nothing in the split path reads it any more —
+/// it is here so the assertion that no address reaches `bootstrap_members` has
+/// an address it could plausibly have picked up.
 fn self_addrs() -> NodeAddrs {
     NodeAddrs::new("127.0.0.1:7001", "127.0.0.1:8001")
 }
@@ -57,9 +58,8 @@ async fn setup() -> TestSetup {
     fsm_builder.set_shard_map(shard_map.clone());
     let fsm = Arc::new(fsm_builder);
 
-    // A single-node Raft dials nobody, but the split resolves its source
-    // members' addresses through the directory, so this node's own entry has to
-    // be in it.
+    // A single-node Raft dials nobody, so the directory is only here to be a
+    // source of addresses the split must not copy anywhere.
     let registry = Arc::new(ShardRegistry::new(1, []));
     registry
         .merge_directory([(1u64, NodeDescriptor::new(self_addrs(), 1))])
@@ -225,11 +225,11 @@ async fn split_partitions_data_correctly() {
 }
 
 /// A shard created by a split bootstraps its Raft group from `source_members`,
-/// so whatever those omit the new shard never has. Membership carries the id;
-/// both addresses are resolved from the directory into `bootstrap_members`,
-/// which is what a restart re-initialises the shard from.
+/// so an id those omit is a peer the new shard never has. Ids are all they
+/// carry: `bootstrap_members`, which is what a restart re-initialises the shard
+/// from, holds no address even though the directory has one to offer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn split_carries_both_addresses_to_new_shard() {
+async fn split_carries_member_ids_to_new_shard() {
     let s = setup().await;
 
     let new_shard_id = s.split_coordinator.split(0, "m").await.unwrap();
@@ -243,17 +243,25 @@ async fn split_carries_both_addresses_to_new_shard() {
         "split-created shard must start with every source member"
     );
 
-    // The addresses, resolved from the directory and persisted — what a restart
-    // initialises from.
+    // The ids persisted with the split data — what a restart initialises from.
     let raw = s
         .store
         .meta
         .get(meta_key(new_shard_id, "bootstrap_members"))
         .unwrap()
         .expect("bootstrap_members written with the split");
-    let (members, _): (BTreeMap<u64, NodeAddrs>, _) =
+    let (members, _): (BTreeSet<u64>, _) =
         bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
-    assert_eq!(members, BTreeMap::from([(1u64, self_addrs())]));
+    assert_eq!(members, BTreeSet::from([1u64]));
+
+    // And nothing else: the encoded record contains neither of this node's
+    // addresses, which the directory could have supplied at split time.
+    for addr in [self_addrs().cluster_addr, self_addrs().client_addr] {
+        assert!(
+            !raw.windows(addr.len()).any(|w| w == addr.as_bytes()),
+            "bootstrap_members contains the address {addr}"
+        );
+    }
 
     s.raft.shutdown().await.unwrap();
 }

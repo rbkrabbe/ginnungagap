@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +7,7 @@ use openraft::ServerState;
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
 use ggap_storage::SplitApplied;
-use ggap_types::{GgapError, KvCommand, KvResponse, NodeAddrs, ShardId, ShardInfo, ShardState};
+use ggap_types::{GgapError, KvCommand, KvResponse, ShardId, ShardInfo, ShardState};
 
 use crate::config::GgapNode;
 use crate::log_store::GgapLogStorage;
@@ -32,8 +32,7 @@ pub struct SplitCoordinatorConfig {
 pub struct SplitCoordinator {
     router: Arc<ShardRouter>,
     shard_map: Arc<ShardMap>,
-    /// Resolves the source membership's ids to the addresses the new shard's
-    /// members are recorded with, and the leader's for a `NotLeader`.
+    /// Resolves the leader's address for a `NotLeader`.
     registry: Arc<ShardRegistry>,
 }
 
@@ -123,10 +122,10 @@ impl SplitCoordinator {
             .await
             .ok_or(GgapError::ShardNotFound(shard_id))?;
 
-        // 2. Read source shard membership from Raft metrics. Membership is ids;
-        //    the addresses `KvCommand::Split` carries are resolved from the
-        //    directory (tk-abf8 drops them from the command entirely).
-        let source_ids: Vec<u64> = {
+        // 2. Read source shard membership from Raft metrics — ids, which is all
+        //    the new shard needs. Each one resolves to an address through the
+        //    directory, at split time and on every restart after it.
+        let source_ids: BTreeSet<u64> = {
             let metrics = source_node.raft().metrics().borrow().clone();
             metrics
                 .membership_config
@@ -135,16 +134,6 @@ impl SplitCoordinator {
                 .map(|(id, _)| *id)
                 .collect()
         };
-        let mut source_addrs: BTreeMap<u64, NodeAddrs> = BTreeMap::new();
-        for id in &source_ids {
-            source_addrs.insert(
-                *id,
-                NodeAddrs {
-                    cluster_addr: self.registry.directory_addr(*id).await.unwrap_or_default(),
-                    client_addr: self.registry.client_addr(*id).await.unwrap_or_default(),
-                },
-            );
-        }
         let source_members: BTreeMap<u64, GgapNode> =
             source_ids.iter().map(|id| (*id, GgapNode {})).collect();
 
@@ -162,7 +151,7 @@ impl SplitCoordinator {
             split_key: split_key.to_string(),
             new_shard_id,
             source_range: source_info.range.clone(),
-            source_members: source_addrs,
+            source_members: source_ids,
         };
         let write_result = match source_node.raft().client_write(cmd).await {
             Ok(r) => r,

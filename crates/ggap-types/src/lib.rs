@@ -54,10 +54,10 @@ pub struct ShardInfo {
 
 /// The gRPC addresses at which a node can be reached.
 ///
-/// Lives here rather than in `ggap-consensus` because both the directory and
-/// `KvCommand::Split` need the same shape, and this crate depends on neither
-/// openraft nor gRPC. Whoever holds these decides how they are reconciled; the
-/// type itself carries no merge policy.
+/// Lives here rather than in `ggap-consensus` because the directory, the
+/// gossip wire format and the admin API all need the same shape, and this crate
+/// depends on neither openraft nor gRPC. Whoever holds these decides how they
+/// are reconciled; the type itself carries no merge policy.
 ///
 /// An empty field means the node advertises no such address — nothing can reach
 /// it there. `ShardRegistry` treats that as a fact to propagate, not a gap to
@@ -170,12 +170,11 @@ pub enum KvCommand {
         split_key: String,
         new_shard_id: ShardId,
         source_range: KeyRange,
-        /// Raft membership for the new shard: node_id → both addresses.
-        /// Stored atomically alongside the data movement so that on restart
-        /// main.rs can initialise the new shard with the correct peers.
-        /// Carries `NodeAddrs` rather than the `GgapNode` that Raft membership
-        /// carries, so this crate stays free of any openraft dependency.
-        source_members: std::collections::BTreeMap<u64, NodeAddrs>,
+        /// Raft membership for the new shard, as node ids. Stored atomically
+        /// alongside the data movement so that on restart main.rs can
+        /// initialise the new shard with the correct peers; each id resolves to
+        /// an address through the directory.
+        source_members: std::collections::BTreeSet<u64>,
     },
 }
 
