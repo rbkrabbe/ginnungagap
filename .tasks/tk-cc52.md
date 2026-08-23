@@ -2,7 +2,7 @@
 id = "tk-cc52"
 title = "GgapNetwork resolves the target address per RPC through the registry"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "m"
 priority = 2
 blocked_by = ["tk-c593"]
@@ -14,6 +14,7 @@ touched = []
 parent = "tk-ef8d"
 base = "454cb05d990b59fd8bef90353dbc3c4c69c7d906"
 reviewed_at = "2026-08-23T14:33:09+00:00"
+closed = "2026-08-23T14:35:16+00:00"
 +++
 ## Context
 
