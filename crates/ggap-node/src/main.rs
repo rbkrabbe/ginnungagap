@@ -23,7 +23,7 @@ use ggap_storage::{
     ttl::TtlGcTask,
     BootCounter, DirectoryStore, ShardMap,
 };
-use ggap_types::{DomainWatchEvent, NodeAddrs};
+use ggap_types::{DomainWatchEvent, NodeAddrs, NodeDescriptor};
 
 mod observability;
 
@@ -317,17 +317,21 @@ async fn main() -> anyhow::Result<()> {
                             .with_context(|| {
                                 format!("failed to decode bootstrap_members for shard {shard_id}")
                             })?;
-                    Some(
-                        addr_map
-                            .into_iter()
-                            .map(|(id, addrs)| (id, GgapNode::from(addrs)))
-                            .collect(),
-                    )
+                    // Membership takes the ids. The addresses recorded with them
+                    // enter the directory as hints, so a restart that predates
+                    // any gossip round can still dial these peers; each node's
+                    // own publication outranks the hint as soon as it arrives.
+                    // tk-abf8 reduces the meta key itself to an id set.
+                    registry
+                        .merge_directory(
+                            addr_map
+                                .iter()
+                                .map(|(id, addrs)| (*id, NodeDescriptor::hint(addrs.clone()))),
+                        )
+                        .await;
+                    Some(addr_map.into_keys().map(|id| (id, GgapNode {})).collect())
                 }
-                Ok(None) if cli.seed => Some(BTreeMap::from([(
-                    cli.node_id,
-                    GgapNode::from(self_addrs.clone()),
-                )])),
+                Ok(None) if cli.seed => Some(BTreeMap::from([(cli.node_id, GgapNode {})])),
                 Ok(None) => None,
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -356,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
             fsm.clone(),
             shard_id,
             cli.node_id,
+            registry.clone(),
             tokio::time::Duration::from_millis(config.consistency.lease_duration_ms),
         ));
         let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
@@ -400,13 +405,13 @@ async fn main() -> anyhow::Result<()> {
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
+        registry: registry.clone(),
     }));
 
     // 7b. Gossip task. This node publishes its own addresses into the directory
-    //     each tick; the rest is derived from each hosted shard's Raft
-    //     membership, and gossip carries copies to nodes that share no shard, so
-    //     any node can report consensus state for shards it does not host
-    //     locally.
+    //     each tick and carries the whole view to peers, so every node learns
+    //     every other node's address from its author and any node can report
+    //     consensus state for shards it does not host locally.
     tokio::spawn(
         GossipTask::new(
             router.clone(),

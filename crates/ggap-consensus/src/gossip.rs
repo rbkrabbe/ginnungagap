@@ -117,14 +117,13 @@ impl GossipTask {
     }
 
     /// Publish this node's own descriptor, then status for every locally-hosted
-    /// shard, deriving the rest of the directory from each shard's membership.
+    /// shard.
     ///
-    /// Self-publication comes first and is not gated on hosting a shard: a node
-    /// is the sole author of its own addresses, so it must say where it is even
-    /// while it hosts nothing — after a drain, or before placement. The
-    /// membership-derived merge below is a second feed writing the same map at
-    /// incarnation 0; it fills in nodes that have not reached us directly and
-    /// loses to them as soon as they do.
+    /// Self-publication is not gated on hosting a shard: a node is the sole
+    /// author of its own addresses, so it must say where it is even while it
+    /// hosts nothing — after a drain, or before placement. Every other node's
+    /// address arrives the same way, as its own descriptor carried here by
+    /// gossip; membership holds ids and cannot supply one.
     async fn refresh_local(&mut self) {
         self.registry
             .merge_directory([(
@@ -161,23 +160,6 @@ impl GossipTask {
             };
             let status = node.cluster_status();
 
-            // Membership addresses enter at incarnation 0: they are a copy of
-            // what some node advertised when it joined, not that node speaking
-            // for itself. This node's own entry is among them and is outranked
-            // by the self-publication above. Once a node has published directly,
-            // this feed can no longer correct its address — which is why the
-            // incarnation it publishes at must actually advance across a
-            // restart.
-            self.registry
-                .merge_directory(
-                    status
-                        .voters
-                        .iter()
-                        .chain(status.learners.iter())
-                        .map(|(id, addrs)| (*id, NodeDescriptor::hint(addrs.clone()))),
-                )
-                .await;
-
             let (range_start, range_end, state) = shard_meta
                 .get(&shard_id)
                 .cloned()
@@ -190,8 +172,8 @@ impl GossipTask {
                     range_end,
                     state,
                     leader_id: status.leader_id,
-                    voters: status.voters.iter().map(|(id, _)| *id).collect(),
-                    learners: status.learners.iter().map(|(id, _)| *id).collect(),
+                    voters: status.voters,
+                    learners: status.learners,
                     term: status.term,
                     last_applied: status.last_applied,
                     version: self.version,

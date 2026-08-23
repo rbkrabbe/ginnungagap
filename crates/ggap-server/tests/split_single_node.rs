@@ -22,10 +22,10 @@ use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::keys::meta_key;
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
-use ggap_types::{KvCommand, KvResponse, NodeAddrs, ReadMode, WriteMode};
+use ggap_types::{KvCommand, KvResponse, NodeAddrs, NodeDescriptor, ReadMode, WriteMode};
 
-/// The membership entry for the single node. Both addresses are set: a split
-/// must hand the whole entry to the shard it creates.
+/// This node's directory entry. Both addresses are set: a split resolves them
+/// from the directory and must hand the whole entry to the shard it creates.
 fn self_addrs() -> NodeAddrs {
     NodeAddrs::new("127.0.0.1:7001", "127.0.0.1:8001")
 }
@@ -57,8 +57,13 @@ async fn setup() -> TestSetup {
     fsm_builder.set_shard_map(shard_map.clone());
     let fsm = Arc::new(fsm_builder);
 
-    // A single-node Raft dials nobody, so an empty directory is enough.
+    // A single-node Raft dials nobody, but the split resolves its source
+    // members' addresses through the directory, so this node's own entry has to
+    // be in it.
     let registry = Arc::new(ShardRegistry::new(1, []));
+    registry
+        .merge_directory([(1u64, NodeDescriptor::new(self_addrs(), 1))])
+        .await;
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
@@ -74,10 +79,10 @@ async fn setup() -> TestSetup {
         .unwrap(),
     );
 
-    // Initialize as single-node cluster. Both addresses are populated so the
-    // split path can be checked for carrying them through to the new shard.
+    // Initialize as single-node cluster. Membership is the id alone; the
+    // addresses the split carries come from the directory seeded above.
     let mut members = BTreeMap::new();
-    members.insert(1u64, GgapNode::from(self_addrs()));
+    members.insert(1u64, GgapNode {});
     raft.initialize(members).await.unwrap();
 
     // Wait for leader.
@@ -92,6 +97,7 @@ async fn setup() -> TestSetup {
         fsm.clone(),
         0,
         1,
+        registry.clone(),
         tokio::time::Duration::from_millis(100),
     ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
@@ -111,6 +117,7 @@ async fn setup() -> TestSetup {
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
+        registry: registry.clone(),
     }));
 
     TestSetup {
@@ -218,9 +225,9 @@ async fn split_partitions_data_correctly() {
 }
 
 /// A shard created by a split bootstraps its Raft group from `source_members`,
-/// so whatever those omit the new shard never has. Both addresses must reach it
-/// twice over: in the membership initialised at split time, and in the
-/// `bootstrap_members` a restart re-initialises it from.
+/// so whatever those omit the new shard never has. Membership carries the id;
+/// both addresses are resolved from the directory into `bootstrap_members`,
+/// which is what a restart re-initialises the shard from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_carries_both_addresses_to_new_shard() {
     let s = setup().await;
@@ -232,11 +239,12 @@ async fn split_carries_both_addresses_to_new_shard() {
     let status = new_node.cluster_status();
     assert_eq!(
         status.voters,
-        vec![(1u64, self_addrs())],
-        "split-created shard must start with both addresses for every member"
+        vec![1u64],
+        "split-created shard must start with every source member"
     );
 
-    // The same membership persisted, which is what a restart initialises from.
+    // The addresses, resolved from the directory and persisted — what a restart
+    // initialises from.
     let raw = s
         .store
         .meta

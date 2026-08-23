@@ -88,6 +88,7 @@ async fn start_node(id: u64) -> BenchNode {
         fsm.clone(),
         0,
         id,
+        registry.clone(),
         tokio::time::Duration::from_millis(4000),
     ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
@@ -100,6 +101,7 @@ async fn start_node(id: u64) -> BenchNode {
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
+        registry: registry.clone(),
     }));
 
     let mut handles = Vec::new();
@@ -146,10 +148,7 @@ impl BenchCluster {
         for id in 1..=(count as u64) {
             nodes.push(start_node(id).await);
         }
-        let members: BTreeMap<u64, GgapNode> = nodes
-            .iter()
-            .map(|n| (n.id, GgapNode::cluster_only(n.cluster_addr.to_string())))
-            .collect();
+        let members: BTreeMap<u64, GgapNode> = nodes.iter().map(|n| (n.id, GgapNode {})).collect();
 
         // Seed every directory, since nothing here gossips.
         let directory: Vec<(u64, NodeDescriptor)> = nodes

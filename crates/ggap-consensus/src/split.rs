@@ -21,6 +21,7 @@ use crate::state_machine::GgapStateMachine;
 pub struct SplitCoordinatorConfig {
     pub router: Arc<ShardRouter>,
     pub shard_map: Arc<ShardMap>,
+    pub registry: Arc<ShardRegistry>,
 }
 
 /// Coordinates the split of a shard's key range into two shards.
@@ -31,6 +32,9 @@ pub struct SplitCoordinatorConfig {
 pub struct SplitCoordinator {
     router: Arc<ShardRouter>,
     shard_map: Arc<ShardMap>,
+    /// Resolves the source membership's ids to the addresses the new shard's
+    /// members are recorded with, and the leader's for a `NotLeader`.
+    registry: Arc<ShardRegistry>,
 }
 
 impl SplitCoordinator {
@@ -38,6 +42,7 @@ impl SplitCoordinator {
         SplitCoordinator {
             router: cfg.router,
             shard_map: cfg.shard_map,
+            registry: cfg.registry,
         }
     }
 
@@ -118,16 +123,30 @@ impl SplitCoordinator {
             .await
             .ok_or(GgapError::ShardNotFound(shard_id))?;
 
-        // 2. Read source shard membership from Raft metrics.
-        let source_members: BTreeMap<u64, GgapNode> = {
+        // 2. Read source shard membership from Raft metrics. Membership is ids;
+        //    the addresses `KvCommand::Split` carries are resolved from the
+        //    directory (tk-abf8 drops them from the command entirely).
+        let source_ids: Vec<u64> = {
             let metrics = source_node.raft().metrics().borrow().clone();
             metrics
                 .membership_config
                 .membership()
                 .nodes()
-                .map(|(id, node)| (*id, node.clone()))
+                .map(|(id, _)| *id)
                 .collect()
         };
+        let mut source_addrs: BTreeMap<u64, NodeAddrs> = BTreeMap::new();
+        for id in &source_ids {
+            source_addrs.insert(
+                *id,
+                NodeAddrs {
+                    cluster_addr: self.registry.directory_addr(*id).await.unwrap_or_default(),
+                    client_addr: self.registry.client_addr(*id).await.unwrap_or_default(),
+                },
+            );
+        }
+        let source_members: BTreeMap<u64, GgapNode> =
+            source_ids.iter().map(|id| (*id, GgapNode {})).collect();
 
         // 3. Allocate new shard id.
         let new_shard_id = self.shard_map.next_shard_id().await;
@@ -143,17 +162,17 @@ impl SplitCoordinator {
             split_key: split_key.to_string(),
             new_shard_id,
             source_range: source_info.range.clone(),
-            source_members: source_members
-                .iter()
-                .map(|(id, node)| (*id, NodeAddrs::from(node.clone())))
-                .collect(),
+            source_members: source_addrs,
         };
-        let write_result = source_node.raft().client_write(cmd).await.map_err(|e| {
-            if let Some(fwd) = e.forward_to_leader() {
-                return crate::node::not_leader(fwd);
+        let write_result = match source_node.raft().client_write(cmd).await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(fwd) = e.forward_to_leader() {
+                    return Err(crate::node::not_leader(&self.registry, fwd).await);
+                }
+                return Err(GgapError::Consensus(format!("Split propose failed: {e}")));
             }
-            GgapError::Consensus(format!("Split propose failed: {e}"))
-        })?;
+        };
 
         // Validate the response.
         match write_result.data {
@@ -273,6 +292,7 @@ pub async fn run_split_handler(
             fsm.clone(),
             new_shard_id,
             node_id,
+            registry.clone(),
             // Lease duration of zero — the coordinator will initialize membership.
             tokio::time::Duration::from_secs(0),
         ));

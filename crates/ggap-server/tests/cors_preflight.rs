@@ -65,6 +65,7 @@ async fn cors_preflight_returns_allow_origin() {
         fsm.clone(),
         0,
         1,
+        registry.clone(),
         Duration::from_millis(300),
     ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
@@ -73,6 +74,7 @@ async fn cors_preflight_returns_allow_origin() {
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
+        registry: registry.clone(),
     }));
 
     tokio::spawn(run_split_handler(

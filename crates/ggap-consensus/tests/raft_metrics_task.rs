@@ -58,8 +58,7 @@ async fn start_single_node_raft() -> (Arc<GgapRaft>, TempDir) {
         .expect("raft init"),
     );
 
-    let members: BTreeMap<u64, GgapNode> =
-        BTreeMap::from([(1, GgapNode::cluster_only("127.0.0.1:0"))]);
+    let members: BTreeMap<u64, GgapNode> = BTreeMap::from([(1, GgapNode::default())]);
     raft.initialize(members).await.expect("cluster init");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
