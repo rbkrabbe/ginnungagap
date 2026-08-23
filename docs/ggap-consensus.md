@@ -70,36 +70,50 @@ The production `RaftNode` implementation. It:
 - **`SplitCoordinator` / `run_split_handler`** create new shards from a range
   split via `KvCommand::Split`.
 - **`ShardRegistry` + `GossipTask`** maintain a cluster-wide view of which node
-  hosts which shard, plus a `node_id -> NodeAddrs` directory holding each node's
+  hosts which shard, plus a `node_id -> NodeDescriptor` directory holding each node's
   cluster and client gRPC addresses. `LeaseManager` backs lease-based leader
   reads; `ClusterNode` keeps openraft types out of the `ggap-server` dependency
   tree.
 
-  **Both addresses live in the Raft membership** (`GgapNode`, the openraft
-  `Node` for this cluster). Cluster bootstrap, `AddLearner` and a split's
-  `source_members` each put a full `NodeAddrs` into consensus state — a
-  split-created shard inherits both addresses for every member, on the split
-  itself and again from `bootstrap_members` after a restart. `refresh_local`
-  derives the directory from `raft.metrics()` every tick, and **no node
-  originates its own entry**: a node's addresses reach its own directory the
-  same way every peer's do, through membership.
+  **Membership carries ids; the directory resolves addresses.** `GgapNode`, the
+  openraft `Node` for this cluster, is an empty struct — it exists because
+  openraft needs a `Node` type, and it is where a future consensus-only field
+  belongs. Cluster bootstrap, `AddLearner` and a split's `source_members` all
+  put ids alone into consensus state. `GgapNetwork` resolves its target through
+  the directory on **every** RPC, so a node that moves is dialled at its new
+  address on the next send with no new client, and an id the directory cannot
+  resolve fails the RPC — which openraft treats as an unreachable peer and
+  retries.
 
-  The directory is therefore a *cache of committed state*. Entries for shards a
-  node hosts are **derived** and authoritative; entries for shards it does not
-  host are **copies** carried by gossip, which is the only reason gossip still
-  exchanges the directory at all. Stop the gossip task entirely and a node still
-  reports both addresses for every peer in a shard it hosts.
+  **Every node is the sole author of its own descriptor.** `refresh_local`
+  publishes `(cluster_addr, client_addr, incarnation)` for this node each tick,
+  whether or not it hosts a shard, and gossip carries it everywhere.
+  `merge_directory` orders copies by **incarnation, highest wins**: a node
+  restarted at a new address publishes at a higher incarnation and outbids every
+  stale copy in flight. The incarnation comes from a boot counter persisted in
+  the `node` keyspace and starts at 1.
 
-  `merge_directory` replaces **whole values**: an entry is a copy of one
-  membership record, and its two fields belong together. The rule it depends on
-  is about *provenance, not content* — every entry comes from membership, and
-  which addresses that record carries is membership's business. So merging an
-  entry with no client address **clears** a previously-known one rather than
-  treating the gap as "unknown, don't touch", and that is what makes a stale
-  address retractable at all. In production both are always present
-  (`AddLearner` rejects an empty `client_addr`; both CLI flags have non-empty
-  defaults), so clearing is reachable only where a test harness builds
-  cluster-only membership on purpose.
+  `AddLearner` is the one exception, and only in appearance. It still carries
+  the joining node's addresses over the wire — they are how the cluster first
+  learns where that node is, since nothing could dial it otherwise — and writes
+  them into the leader's directory at **incarnation 0**. The node's own first
+  publication outranks that hint immediately, so authorship is never actually
+  divided.
+
+  The directory is therefore the *source of truth* for addresses, not a cache of
+  anything. Gossip is the only path an address travels: stop the gossip task on
+  a node and it can still route Raft traffic to peers it already knows, but it
+  learns nothing about a node that moves.
+
+  `merge_directory` replaces **whole values**: a descriptor is one node's
+  complete statement about where it can be reached, so its two fields belong
+  together. Merging a descriptor with no client address **clears** a
+  previously-known one rather than treating the gap as "unknown, don't touch",
+  which is what makes a stale address retractable at all. A descriptor with
+  neither address describes no node and is skipped. In production both are
+  always present (`AddLearner` rejects an empty `client_addr`; both CLI flags
+  have non-empty defaults), so clearing is reachable only where a test harness
+  publishes a cluster-only descriptor on purpose.
 
   The directory is also **cached on disk** (`ggap-storage`'s `DirectoryStore`,
   one `node` record). The gossip task writes it out after each round when it has
@@ -120,6 +134,5 @@ The production `RaftNode` implementation. It:
   nodes in no membership that nobody will ever dial — the observer harness in
   `ggap-server/tests/three_node_cluster.rs`, and later `ggap-pd`.
 
-  **Still open:** copied entries are ordered last-write-wins, so a peer holding
-  an older copy can overwrite a newer one. tk-c4fc stamps them with the
-  membership `(term, index)` they came from; tk-1bf0 is the same problem.
+  **Still open:** nothing removes a departed node from the directory, and the
+  removal now outlives a restart (tk-c47e).

@@ -1,8 +1,10 @@
 //! In-memory, eventually-consistent view of cluster-wide shard placement and
 //! per-shard Raft status, populated by the gossip task ([`crate::gossip`]).
 //!
-//! The registry is a rebuildable cache. Its shard entries are never persisted;
-//! its directory is written out by the gossip task and read back at startup
+//! Its directory is the source of truth for node addresses: membership carries
+//! ids, and every send resolves one through here. Shard entries are a
+//! rebuildable cache and are never persisted; the directory is written out by
+//! the gossip task and read back at startup
 //! ([`ggap_storage::DirectoryStore`]) so a restarted node can resolve peers
 //! before anyone gossips to it — persistence buys immediacy, not authority.
 //!
@@ -135,13 +137,11 @@ impl ShardRegistry {
     /// is unambiguous. That is what lets a node move: it restarts at a higher
     /// incarnation and outbids every stale copy in flight.
     ///
-    /// The membership-derived merge in [`crate::gossip`] writes at incarnation
-    /// 0: it copies what a member advertised when it joined, which is not that
-    /// member speaking for itself. A node's own publications start at 1 and
-    /// therefore always supersede it. Ties going to the incoming entry keep that
-    /// feed last-write-wins among its own entries, which is what lets a stale
-    /// address be retracted before the node it describes has published
-    /// anything.
+    /// Incarnation 0 is reserved for a descriptor written on a node's behalf:
+    /// `AddLearner` records where a joining node is before that node has said
+    /// so itself. A node's own publications start at 1 and therefore always
+    /// supersede such a hint. Ties go to the incoming entry, which keeps a feed
+    /// of hints last-write-wins among themselves.
     ///
     /// A descriptor is a whole value: merging one with no client address
     /// *clears* a previously-known one rather than treating the gap as
@@ -252,7 +252,7 @@ mod tests {
         NodeDescriptor::new(NodeAddrs::new(cluster, client), incarnation)
     }
 
-    /// An incarnation-0 entry, as the membership-derived feed produces.
+    /// An incarnation-0 entry, as `AddLearner` produces.
     fn hint(addrs: NodeAddrs) -> NodeDescriptor {
         NodeDescriptor::hint(addrs)
     }
@@ -453,10 +453,9 @@ mod tests {
         assert_eq!(reg.directory_addr(2).await, Some("moved:17001".into()));
     }
 
-    /// The coexistence rule, from both sides: while the membership-derived feed
-    /// still runs, its incarnation-0 entries fill in for a node that has not
-    /// published yet, and lose to that node the moment it does — no matter which
-    /// order the two feeds arrive in.
+    /// The coexistence rule, from both sides: an incarnation-0 hint fills in for
+    /// a node that has not published yet, and loses to that node the moment it
+    /// does — no matter which order the two arrive in.
     #[tokio::test]
     async fn a_self_published_descriptor_outranks_the_membership_derived_feed() {
         let reg = ShardRegistry::new(1, []);

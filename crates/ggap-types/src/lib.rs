@@ -99,9 +99,9 @@ impl NodeAddrs {
 /// incarnation wins, which is what lets a node move and have the cluster
 /// converge on its new address.
 ///
-/// Incarnation 0 means "published on this node's behalf, not by it": the
-/// membership-derived feed in `ggap-consensus` copies a member's addresses into
-/// the directory at that rank. A node's own publications start at 1, so they
+/// Incarnation 0 means "published on this node's behalf, not by it":
+/// `AddLearner` records where a joining node is at that rank, before the node
+/// itself has said anything. A node's own publications start at 1, so they
 /// always supersede a descriptor someone else wrote for it.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct NodeDescriptor {
@@ -257,11 +257,11 @@ pub enum GgapError {
     NotFound,
     /// The receiving node is not the leader for this shard.
     ///
-    /// `leader_id` is the leader's stable node id and `leader` the address that
-    /// was current when the error was constructed. A forwarder should resolve
-    /// `leader_id` through the membership-derived directory and treat `leader`
-    /// only as a
-    /// fallback, since the address can be stale by the time it is read.
+    /// `leader_id` is the leader's stable node id; `leader` is the leader's
+    /// client address, resolved from the directory when the error was built. A
+    /// forwarder inside the cluster resolves `leader_id` itself and ignores
+    /// `leader`, which exists for a caller that has no directory to resolve
+    /// with and can be stale by the time it is read.
     #[error("not the leader; hint: {leader_id:?} at {leader:?}")]
     NotLeader {
         leader_id: Option<u64>,
