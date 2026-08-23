@@ -19,7 +19,7 @@ use std::sync::Arc;
 use ggap_storage::fjall::{FjallStateMachine, FjallStore};
 use ggap_storage::keys::{data_key, meta_key};
 use ggap_storage::{ShardMap, StateMachineStore};
-use ggap_types::{KeyRange, KvCommand, KvResponse, LogId, NodeAddrs};
+use ggap_types::{KeyRange, KvCommand, KvResponse, LogId};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -109,8 +109,7 @@ async fn bug1_nonatomic_split_loses_data_on_crash() {
                         start: String::new(),
                         end: String::new(),
                     },
-                    source_members: [(1u64, NodeAddrs::new("127.0.0.1:7001", "127.0.0.1:8001"))]
-                        .into(),
+                    source_members: [1u64].into(),
                 }),
                 None,
             )
@@ -192,8 +191,7 @@ async fn bug2_no_bootstrap_members_for_split_shard() {
                         start: String::new(),
                         end: String::new(),
                     },
-                    source_members: [(1u64, NodeAddrs::new("127.0.0.1:7001", "127.0.0.1:8001"))]
-                        .into(),
+                    source_members: [1u64].into(),
                 }),
                 None,
             )
@@ -228,14 +226,11 @@ async fn bug2_no_bootstrap_members_for_split_shard() {
         "bootstrap_members must be present after the fix so restart uses correct membership"
     );
 
-    // The stored membership should match what was passed in source_members,
-    // both addresses included: a restart re-initialises the split-created shard
-    // from this key, so whatever it omits the new shard never had.
+    // The stored membership should match what was passed in source_members: a
+    // restart re-initialises the split-created shard from this key, so an id it
+    // omits is a peer the new shard never had. Addresses are the directory's.
     let raw = result.unwrap();
-    let (members, _): (std::collections::BTreeMap<u64, NodeAddrs>, _) =
+    let (members, _): (std::collections::BTreeSet<u64>, _) =
         bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
-    assert_eq!(
-        members.get(&1u64),
-        Some(&NodeAddrs::new("127.0.0.1:7001", "127.0.0.1:8001"))
-    );
+    assert_eq!(members, std::collections::BTreeSet::from([1u64]));
 }

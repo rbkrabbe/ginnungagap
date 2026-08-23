@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ use ggap_storage::{
     ttl::TtlGcTask,
     BootCounter, DirectoryStore, ShardMap,
 };
-use ggap_types::{DomainWatchEvent, NodeAddrs, NodeDescriptor};
+use ggap_types::{DomainWatchEvent, NodeAddrs};
 
 mod observability;
 
@@ -312,24 +312,14 @@ async fn main() -> anyhow::Result<()> {
             let bootstrap_key = meta_key(shard_id, "bootstrap_members");
             let members: Option<BTreeMap<u64, GgapNode>> = match store.meta.get(&bootstrap_key) {
                 Ok(Some(bytes)) => {
-                    let (addr_map, _): (BTreeMap<u64, NodeAddrs>, _) =
+                    let (ids, _): (BTreeSet<u64>, _) =
                         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
                             .with_context(|| {
                                 format!("failed to decode bootstrap_members for shard {shard_id}")
                             })?;
-                    // Membership takes the ids. The addresses recorded with them
-                    // enter the directory as hints, so a restart that predates
-                    // any gossip round can still dial these peers; each node's
-                    // own publication outranks the hint as soon as it arrives.
-                    // tk-abf8 reduces the meta key itself to an id set.
-                    registry
-                        .merge_directory(
-                            addr_map
-                                .iter()
-                                .map(|(id, addrs)| (*id, NodeDescriptor::hint(addrs.clone()))),
-                        )
-                        .await;
-                    Some(addr_map.into_keys().map(|id| (id, GgapNode {})).collect())
+                    // Ids alone. Each resolves through the directory restored
+                    // above, or through the first peer to gossip to this node.
+                    Some(ids.into_iter().map(|id| (id, GgapNode {})).collect())
                 }
                 Ok(None) if cli.seed => Some(BTreeMap::from([(cli.node_id, GgapNode {})])),
                 Ok(None) => None,
