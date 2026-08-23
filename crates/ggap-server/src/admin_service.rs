@@ -56,23 +56,18 @@ impl AdminServiceImpl {
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         let shard_id = req.shard_id.unwrap_or(0);
 
-        // Membership carries both addresses, so a locally hosted shard answers
-        // in full without gossip having run.
-        let to_node_info = |(node_id, addrs): (u64, NodeAddrs)| NodeInfo {
-            node_id,
-            client_addr: addrs.client_addr,
-            cluster_addr: addrs.cluster_addr,
-        };
-
-        // Prefer fresh local openraft metrics when we host the shard.
+        // Prefer fresh local openraft metrics when we host the shard. Consensus
+        // state is local and current — hence `last_observed_age_ms = 0` — while
+        // the ids it names are resolved through the directory, exactly as they
+        // are for a shard we only know by gossip.
         if let Some(node) = self.router.get_node(shard_id).await {
             let status = node.cluster_status();
             return Ok(Response::new(ClusterStatusResponse {
-                nodes: status.voters.into_iter().map(to_node_info).collect(),
+                nodes: self.ids_to_node_infos(&status.voters).await,
                 leader_id: status.leader_id,
                 term: status.term,
                 last_applied: status.last_applied,
-                learners: status.learners.into_iter().map(to_node_info).collect(),
+                learners: self.ids_to_node_infos(&status.learners).await,
                 last_observed_age_ms: Some(0),
             }));
         }
@@ -104,11 +99,11 @@ impl AdminServiceImpl {
         }
     }
 
-    /// Resolve node ids to `NodeInfo`, filling both addresses from the gossiped
+    /// Resolve node ids to `NodeInfo`, filling both addresses from the
     /// directory where known (empty otherwise).
     ///
-    /// Only used for shards this node does not host; a hosted shard reads
-    /// membership directly and needs no directory lookup.
+    /// The directory is the only source of addresses, so hosted and non-hosted
+    /// shards resolve the same way; only where the *ids* come from differs.
     async fn ids_to_node_infos(&self, ids: &[u64]) -> Vec<NodeInfo> {
         let mut out = Vec::with_capacity(ids.len());
         for &node_id in ids {
@@ -261,8 +256,8 @@ impl AdminServiceImpl {
                     range_end,
                     state,
                     leader_id: cs.leader_id,
-                    voters: cs.voters.into_iter().map(|(id, _)| id).collect(),
-                    learners: cs.learners.into_iter().map(|(id, _)| id).collect(),
+                    voters: cs.voters,
+                    learners: cs.learners,
                     term: cs.term,
                     last_applied: cs.last_applied,
                     last_observed_age_ms: Some(0),

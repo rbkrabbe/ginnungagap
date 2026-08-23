@@ -4,7 +4,8 @@ use std::sync::Arc;
 use ggap_storage::fjall::FjallStateMachine;
 use ggap_storage::traits::StateMachineStore;
 use ggap_types::{
-    GgapError, KvCommand, KvEntry, KvResponse, NodeAddrs, ReadMode, ShardId, WriteMode,
+    GgapError, KvCommand, KvEntry, KvResponse, NodeAddrs, NodeDescriptor, ReadMode, ShardId,
+    WriteMode,
 };
 use openraft::{
     error::ForwardToLeader,
@@ -17,22 +18,33 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::config::{GgapNode, GgapTypeConfig};
 use crate::convert::{decode, encode};
+use crate::registry::ShardRegistry;
 use crate::RaftNode;
 
 pub type GgapRaft = Raft<GgapTypeConfig>;
 
-/// Build a `NotLeader` from openraft's `ForwardToLeader` hint.
+/// Build a `NotLeader` from openraft's `ForwardToLeader` hint, resolving the
+/// leader's address through the directory.
 ///
-/// Carries both the leader's node id and the address openraft knew for it: the
-/// id is stable and resolvable through the directory, the address is
-/// only a fallback and may already be stale.
-pub(crate) fn not_leader(fwd: &ForwardToLeader<u64, GgapNode>) -> GgapError {
+/// The hint openraft supplies is the id alone — membership carries nothing
+/// else. The address is the leader's **client** address, because the only
+/// consumer that cannot resolve an id for itself is an external gRPC client
+/// reading `ggap-leader-addr`, and that client dials the client port. Anything
+/// inside the cluster ignores this field and resolves `leader_id` at send time.
+///
+/// `None` means the directory has no client address for the leader; the id is
+/// still there, which is the half a forwarder acts on.
+pub(crate) async fn not_leader(
+    registry: &ShardRegistry,
+    fwd: &ForwardToLeader<u64, GgapNode>,
+) -> GgapError {
+    let leader = match fwd.leader_id {
+        Some(id) => registry.client_addr(id).await,
+        None => None,
+    };
     GgapError::NotLeader {
         leader_id: fwd.leader_id,
-        leader: fwd
-            .leader_node
-            .as_ref()
-            .map(|n: &GgapNode| n.cluster_addr().to_string()),
+        leader,
     }
 }
 
@@ -68,9 +80,10 @@ pub struct ClusterStatus {
     pub term: u64,
     pub leader_id: Option<u64>,
     pub last_applied: u64,
-    /// Both addresses, out of committed Raft membership — no gossip involved.
-    pub voters: Vec<(u64, NodeAddrs)>,
-    pub learners: Vec<(u64, NodeAddrs)>,
+    /// Membership as committed: ids only. Addresses are the directory's to
+    /// resolve, per node and at send time.
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +96,10 @@ pub struct OpenRaftNode {
     shard_id: ShardId,
     #[allow(dead_code)]
     node_id: u64,
+    /// Resolves node ids to addresses: the leader's, for a `NotLeader` hint,
+    /// and a new learner's, which `add_learner` publishes here so the leader
+    /// can dial a node membership no longer describes.
+    registry: Arc<ShardRegistry>,
     lease: tokio::sync::Mutex<LeaseManager>,
 }
 
@@ -92,6 +109,7 @@ impl OpenRaftNode {
         fsm: Arc<FjallStateMachine>,
         shard_id: ShardId,
         node_id: u64,
+        registry: Arc<ShardRegistry>,
         lease_duration: tokio::time::Duration,
     ) -> Self {
         OpenRaftNode {
@@ -99,6 +117,7 @@ impl OpenRaftNode {
             fsm,
             shard_id,
             node_id,
+            registry,
             lease: tokio::sync::Mutex::new(LeaseManager::new(lease_duration)),
         }
     }
@@ -120,12 +139,9 @@ impl OpenRaftNode {
         if is_leader && self.lease.lock().await.is_valid(metrics.current_term) {
             return Ok(());
         }
-        self.raft.ensure_linearizable().await.map_err(|e| {
-            if let Some(fwd) = e.forward_to_leader() {
-                return not_leader(fwd);
-            }
-            GgapError::Consensus(e.to_string())
-        })?;
+        if let Err(e) = self.raft.ensure_linearizable().await {
+            return Err(self.map_raft_err(&e).await);
+        }
         let term = self.raft.metrics().borrow().current_term;
         self.lease.lock().await.renew(term);
         Ok(())
@@ -144,12 +160,11 @@ impl OpenRaftNode {
 
         let mut voters = Vec::new();
         let mut learners = Vec::new();
-        for (nid, node) in membership.nodes() {
-            let pair = (*nid, node.addrs.clone());
+        for (nid, _) in membership.nodes() {
             if voter_ids.contains(nid) {
-                voters.push(pair);
+                voters.push(*nid);
             } else {
-                learners.push(pair);
+                learners.push(*nid);
             }
         }
 
@@ -164,19 +179,25 @@ impl OpenRaftNode {
 
     /// Add a node as a non-voting learner to the Raft group.
     ///
-    /// Both addresses go into membership, so peers learn them by replication
-    /// rather than by gossip. `addrs` is validated by the caller —
-    /// `AdminService::add_learner` rejects an empty address of either kind.
+    /// `addrs` never enters membership; it is written into this node's
+    /// directory as a hint, at incarnation 0, and gossip carries it from there.
+    /// That hint is how the cluster first learns where the joining node is —
+    /// nothing can dial it otherwise — and the node's own first publication, at
+    /// incarnation 1 or above, immediately supersedes it, so sole authorship
+    /// over its addresses is never in doubt. Publishing before the membership
+    /// change means the leader can already resolve the learner when replication
+    /// to it starts.
+    ///
+    /// `addrs` is validated by the caller — `AdminService::add_learner` rejects
+    /// an empty address of either kind.
     pub async fn add_learner(&self, node_id: u64, addrs: NodeAddrs) -> Result<(), GgapError> {
-        self.raft
-            .add_learner(node_id, GgapNode::from(addrs), false)
-            .await
-            .map_err(|e| {
-                if let Some(fwd) = e.forward_to_leader() {
-                    return not_leader(fwd);
-                }
-                GgapError::Consensus(e.to_string())
-            })?;
+        self.registry
+            .merge_directory([(node_id, NodeDescriptor::hint(addrs))])
+            .await;
+
+        if let Err(e) = self.raft.add_learner(node_id, GgapNode {}, false).await {
+            return Err(self.map_raft_err(&e).await);
+        }
         Ok(())
     }
 
@@ -190,19 +211,29 @@ impl OpenRaftNode {
     /// rather than ejected from the cluster, so the operation is reversible
     /// and cannot accidentally cause permanent quorum loss.
     pub async fn change_membership(&self, node_ids: BTreeSet<u64>) -> Result<(), GgapError> {
-        self.raft
+        if let Err(e) = self
+            .raft
             .change_membership(
                 ChangeMembers::<u64, GgapNode>::ReplaceAllVoters(node_ids),
                 true,
             )
             .await
-            .map_err(|e| {
-                if let Some(fwd) = e.forward_to_leader() {
-                    return not_leader(fwd);
-                }
-                GgapError::Consensus(e.to_string())
-            })?;
+        {
+            return Err(self.map_raft_err(&e).await);
+        }
         Ok(())
+    }
+
+    /// Map a raft error to `GgapError`, turning a `ForwardToLeader` into a
+    /// `NotLeader` whose address half is resolved through the directory.
+    async fn map_raft_err<E>(&self, e: &openraft::error::RaftError<u64, E>) -> GgapError
+    where
+        E: std::error::Error + openraft::TryAsRef<ForwardToLeader<u64, GgapNode>>,
+    {
+        if let Some(fwd) = e.forward_to_leader() {
+            return not_leader(&self.registry, fwd).await;
+        }
+        GgapError::Consensus(e.to_string())
     }
 }
 
@@ -224,17 +255,10 @@ impl RaftNode for OpenRaftNode {
         );
         span.set_parent(tracing::Span::current().context());
 
-        self.raft
-            .client_write(cmd)
-            .instrument(span)
-            .await
-            .map(|r| r.data)
-            .map_err(|e| {
-                if let Some(fwd) = e.forward_to_leader() {
-                    return not_leader(fwd);
-                }
-                GgapError::Consensus(e.to_string())
-            })
+        match self.raft.client_write(cmd).instrument(span).await {
+            Ok(r) => Ok(r.data),
+            Err(e) => Err(self.map_raft_err(&e).await),
+        }
     }
 
     async fn read(

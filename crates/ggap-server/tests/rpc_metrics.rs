@@ -95,6 +95,7 @@ async fn start_single_node() -> TestNode {
         fsm.clone(),
         0,
         1,
+        registry.clone(),
         tokio::time::Duration::from_millis(100),
     ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
@@ -105,6 +106,7 @@ async fn start_single_node() -> TestNode {
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
+        registry: registry.clone(),
     }));
 
     let mut handles = Vec::new();
@@ -122,8 +124,7 @@ async fn start_single_node() -> TestNode {
     }));
 
     // Single-node bootstrap.
-    let members: BTreeMap<u64, GgapNode> =
-        BTreeMap::from([(1, GgapNode::cluster_only(cluster_addr.to_string()))]);
+    let members: BTreeMap<u64, GgapNode> = BTreeMap::from([(1, GgapNode::default())]);
     raft.initialize(members).await.expect("cluster init");
 
     // Wait until this node is leader so writes are accepted.

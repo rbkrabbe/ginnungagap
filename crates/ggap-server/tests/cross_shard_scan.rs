@@ -78,6 +78,7 @@ async fn setup() -> TestSetup {
         fsm.clone(),
         0,
         1,
+        registry.clone(),
         tokio::time::Duration::from_millis(100),
     ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
@@ -96,6 +97,7 @@ async fn setup() -> TestSetup {
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
         shard_map: shard_map.clone(),
+        registry: registry.clone(),
     }));
 
     let cfg = KvServiceConfig::default();

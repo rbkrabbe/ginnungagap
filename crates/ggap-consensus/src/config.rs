@@ -1,64 +1,20 @@
 use std::sync::Arc;
 
-use ggap_types::{KvCommand, KvResponse, NodeAddrs};
+use ggap_types::{KvCommand, KvResponse};
 use openraft::{Config, SnapshotPolicy};
 
 /// The openraft `Node` for this cluster: everything membership carries about a
-/// peer beyond its id.
+/// peer beyond its id — which is, deliberately, nothing.
 ///
-/// Wraps the `ggap-types` domain type rather than being it, so a future
-/// consensus-only field — a placement zone, say — has a home that is not the
-/// shared domain crate. openraft's `Node` is a blanket-impl marker trait over
-/// `Debug + Clone + Default + Eq + serde`, so no `impl Node` is needed here and
-/// `ggap-types` keeps its openraft-free dependency list.
-///
-/// Membership is the source of truth for both addresses.
+/// Addresses live in `ShardRegistry`'s directory and are resolved per RPC, so
+/// membership is a set of ids and a node can move without a membership change.
+/// The type stays because openraft needs a `Node`, and it is where a future
+/// consensus-only field — a placement zone, say — belongs. openraft's `Node` is
+/// a blanket-impl marker trait over `Debug + Clone + Default + Eq + serde`, so
+/// no `impl Node` is needed here and `ggap-types` keeps its openraft-free
+/// dependency list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GgapNode {
-    pub addrs: NodeAddrs,
-}
-
-impl GgapNode {
-    /// Only the cluster address is known — for a caller that has no client
-    /// address to offer, such as a test fixture or a hand-written peer list.
-    pub fn cluster_only(cluster_addr: impl Into<String>) -> Self {
-        GgapNode {
-            addrs: NodeAddrs::cluster_only(cluster_addr),
-        }
-    }
-
-    /// Cluster gRPC endpoint. This is what `RaftNetwork` dials.
-    pub fn cluster_addr(&self) -> &str {
-        &self.addrs.cluster_addr
-    }
-
-    /// Client-facing gRPC endpoint. Empty means "not known here".
-    pub fn client_addr(&self) -> &str {
-        &self.addrs.client_addr
-    }
-}
-
-impl From<NodeAddrs> for GgapNode {
-    fn from(addrs: NodeAddrs) -> Self {
-        GgapNode { addrs }
-    }
-}
-
-/// The seam at the `ggap-types` boundary: `KvCommand::Split` carries membership
-/// as `NodeAddrs`, since `ggap-types` has no openraft dependency.
-impl From<GgapNode> for NodeAddrs {
-    fn from(node: GgapNode) -> Self {
-        node.addrs
-    }
-}
-
-/// Prints the cluster address alone, matching what openraft's `BasicNode` used
-/// to print, so membership logs and error text stay greppable.
-impl std::fmt::Display for GgapNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.addrs.cluster_addr)
-    }
-}
+pub struct GgapNode {}
 
 openraft::declare_raft_types!(
     pub GgapTypeConfig:

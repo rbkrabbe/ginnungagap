@@ -288,24 +288,6 @@ mod tests {
         GgapNetworkFactory::new(0, registry)
     }
 
-    /// The assertion that makes the next task a deletion rather than a fix:
-    /// membership still carries both addresses, and the network path reads
-    /// neither. A `GgapNode` pointing somewhere else changes nothing.
-    #[tokio::test]
-    async fn new_client_ignores_the_address_in_membership() {
-        let mut factory = factory_with(vec![(
-            2,
-            NodeDescriptor::hint(NodeAddrs::cluster_only("directory:17001")),
-        )])
-        .await;
-
-        let net = factory
-            .new_client(2, &GgapNode::cluster_only("membership:17001"))
-            .await;
-
-        assert_eq!(net.resolve().await, Some("directory:17001".into()));
-    }
-
     /// Resolution happens per RPC, so a descriptor that lands between two sends
     /// redirects the second one — openraft never rebuilds the client.
     #[tokio::test]
@@ -471,9 +453,7 @@ mod tests {
     #[tokio::test]
     async fn an_unresolvable_target_fails_the_send() {
         let mut factory = factory_with(vec![]).await;
-        let mut net = factory
-            .new_client(2, &GgapNode::cluster_only("membership:17001"))
-            .await;
+        let mut net = factory.new_client(2, &GgapNode::default()).await;
 
         assert_eq!(net.resolve().await, None);
         let err = net

@@ -56,11 +56,12 @@ async fn start_watch_node(broadcast_capacity: usize) -> TestNode {
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     let raft_cfg = build_raft_config(50, 150, 300, 500);
+    let registry = Arc::new(ShardRegistry::new(1, []));
     let raft = Arc::new(
         GgapRaft::new(
             1,
             raft_cfg,
-            GgapNetworkFactory::new(0, Arc::new(ShardRegistry::new(1, []))),
+            GgapNetworkFactory::new(0, registry.clone()),
             log_store,
             sm,
         )
@@ -82,6 +83,7 @@ async fn start_watch_node(broadcast_capacity: usize) -> TestNode {
         fsm.clone(),
         0,
         1,
+        registry.clone(),
         tokio::time::Duration::from_millis(100),
     ));
     let cluster = Arc::new(OpenRaftCluster::new(raft.clone()));
