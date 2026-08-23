@@ -15,8 +15,8 @@ use tempfile::TempDir;
 
 use ggap_consensus::{
     build_raft_config, run_split_handler, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft,
-    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRouter, SplitCoordinator,
-    SplitCoordinatorConfig,
+    GgapStateMachine, OpenRaftCluster, OpenRaftNode, RaftNode, ShardRegistry, ShardRouter,
+    SplitCoordinator, SplitCoordinatorConfig,
 };
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::keys::meta_key;
@@ -57,6 +57,8 @@ async fn setup() -> TestSetup {
     fsm_builder.set_shard_map(shard_map.clone());
     let fsm = Arc::new(fsm_builder);
 
+    // A single-node Raft dials nobody, so an empty directory is enough.
+    let registry = Arc::new(ShardRegistry::new(1, []));
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), 0);
     let sm = GgapStateMachine::new(fsm.clone(), 0);
@@ -64,7 +66,7 @@ async fn setup() -> TestSetup {
         GgapRaft::new(
             1,
             raft_cfg.clone(),
-            GgapNetworkFactory::new(0),
+            GgapNetworkFactory::new(0, registry.clone()),
             log_store,
             sm,
         )
@@ -103,6 +105,7 @@ async fn setup() -> TestSetup {
         router.clone(),
         1, // node_id
         raft_cfg,
+        registry.clone(),
     ));
 
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {

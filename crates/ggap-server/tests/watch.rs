@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
-    OpenRaftCluster, OpenRaftNode, ShardRouter,
+    OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter,
 };
 use ggap_server::{serve_client_with_listener, KvServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
@@ -57,9 +57,15 @@ async fn start_watch_node(broadcast_capacity: usize) -> TestNode {
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
-        GgapRaft::new(1, raft_cfg, GgapNetworkFactory::new(0), log_store, sm)
-            .await
-            .unwrap(),
+        GgapRaft::new(
+            1,
+            raft_cfg,
+            GgapNetworkFactory::new(0, Arc::new(ShardRegistry::new(1, []))),
+            log_store,
+            sm,
+        )
+        .await
+        .unwrap(),
     );
 
     let mut members = BTreeMap::new();

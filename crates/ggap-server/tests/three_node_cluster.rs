@@ -30,7 +30,9 @@ use ggap_server::{
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
 use ggap_storage::ShardMap;
-use ggap_types::{GgapError, KvCommand, KvResponse, NodeAddrs, ReadMode, WriteMode};
+use ggap_types::{
+    GgapError, KvCommand, KvResponse, NodeAddrs, NodeDescriptor, ReadMode, WriteMode,
+};
 
 use ggap_proto::v1::admin_service_server::AdminService;
 use ggap_proto::v1::{
@@ -86,11 +88,14 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
     let sm = GgapStateMachine::new(fsm.clone(), 0);
     // Fast timeouts so tests finish quickly.
     let raft_cfg = build_raft_config(50, 150, 300, 500);
+    // The registry has to exist before Raft: every outbound Raft RPC resolves
+    // its target's address through the directory.
+    let registry = Arc::new(ShardRegistry::new(id, []));
     let raft = Arc::new(
         GgapRaft::new(
             id,
             raft_cfg.clone(),
-            GgapNetworkFactory::new(0),
+            GgapNetworkFactory::new(0, registry.clone()),
             log_store,
             sm,
         )
@@ -125,6 +130,7 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
         router.clone(),
         id,
         raft_cfg,
+        registry.clone(),
     ));
 
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
@@ -132,11 +138,10 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
         shard_map: shard_map.clone(),
     }));
 
-    // Cluster registry + fast gossip task (short interval for snappy tests).
-    // Both listeners bind 127.0.0.1 on an ephemeral port, so the bind address is
-    // also the advertised one.
+    // Fast gossip task (short interval for snappy tests). Both listeners bind
+    // 127.0.0.1 on an ephemeral port, so the bind address is also the advertised
+    // one.
     let self_client_addr = client_addr.to_string();
-    let registry = Arc::new(ShardRegistry::new(id, []));
 
     let mut handles = Vec::new();
 
@@ -233,6 +238,23 @@ impl TestCluster {
                 )
             })
             .collect();
+
+        // Seed every node's directory with nothing but the *cluster* addresses.
+        // Raft resolves its peers there, so without this a no-gossip cluster
+        // could never elect a leader; withholding the client addresses keeps
+        // membership the only path those can have taken.
+        let directory: Vec<(u64, NodeDescriptor)> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.id,
+                    NodeDescriptor::hint(NodeAddrs::cluster_only(n.cluster_addr.to_string())),
+                )
+            })
+            .collect();
+        for node in &nodes {
+            node.registry.merge_directory(directory.clone()).await;
+        }
 
         // Only one node calls initialize(); the others learn about the cluster
         // through the consensus protocol.
@@ -707,13 +729,15 @@ async fn client_addr_comes_from_membership_without_gossip() {
     let leader_idx = cluster.wait_for_leader().await;
     let follower = &cluster.nodes[(0..3).find(|&i| i != leader_idx).unwrap()];
 
-    // Nothing seeds the directory and nothing refreshes it, so it is empty —
-    // this node's own entry included. Every address in the response below has
-    // to have come from membership.
+    // The directory holds only the cluster addresses Raft needs to dial, seeded
+    // by `start_with_gossip`, and nothing refreshes it. No client address is in
+    // there, so every one in the response below came from membership.
     let (directory, _) = follower.registry.snapshot_for_gossip().await;
     assert!(
-        directory.is_empty(),
-        "node {} has directory entries with gossip stopped: {directory:?}",
+        directory
+            .iter()
+            .all(|(_, d)| d.addrs.client_addr.is_empty()),
+        "node {} has directory client addresses with gossip stopped: {directory:?}",
         follower.id,
     );
 

@@ -13,6 +13,7 @@ use crate::config::GgapNode;
 use crate::log_store::GgapLogStorage;
 use crate::network::GgapNetworkFactory;
 use crate::node::{GgapRaft, OpenRaftCluster, OpenRaftNode};
+use crate::registry::ShardRegistry;
 use crate::router::ShardRouter;
 use crate::state_machine::GgapStateMachine;
 
@@ -242,6 +243,7 @@ pub async fn run_split_handler(
     router: Arc<ShardRouter>,
     node_id: u64,
     raft_config: Arc<openraft::Config>,
+    registry: Arc<ShardRegistry>,
 ) {
     while let Some(event) = rx.recv().await {
         let new_shard_id = event.new_shard_id;
@@ -252,7 +254,7 @@ pub async fn run_split_handler(
 
         let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), new_shard_id);
         let sm = GgapStateMachine::new(fsm.clone(), new_shard_id);
-        let net = GgapNetworkFactory::new(new_shard_id);
+        let net = GgapNetworkFactory::new(new_shard_id, registry.clone());
 
         let raft = match GgapRaft::new(node_id, raft_config.clone(), net, log_store, sm).await {
             Ok(r) => Arc::new(r),

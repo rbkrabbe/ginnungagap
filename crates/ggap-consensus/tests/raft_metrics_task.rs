@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use ggap_consensus::{
     build_raft_config, GgapLogStorage, GgapNetworkFactory, GgapNode, GgapRaft, GgapStateMachine,
-    RaftMetricsTask,
+    RaftMetricsTask, ShardRegistry,
 };
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
@@ -47,9 +47,15 @@ async fn start_single_node_raft() -> (Arc<GgapRaft>, TempDir) {
     let sm = GgapStateMachine::new(fsm, 0);
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     let raft = Arc::new(
-        GgapRaft::new(1, raft_cfg, GgapNetworkFactory::new(0), log_store, sm)
-            .await
-            .expect("raft init"),
+        GgapRaft::new(
+            1,
+            raft_cfg,
+            GgapNetworkFactory::new(0, Arc::new(ShardRegistry::new(1, []))),
+            log_store,
+            sm,
+        )
+        .await
+        .expect("raft init"),
     );
 
     let members: BTreeMap<u64, GgapNode> =
