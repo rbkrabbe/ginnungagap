@@ -2,7 +2,7 @@
 id = "tk-abf8"
 title = "source_members and bootstrap_members become id sets"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "m"
 priority = 2
 blocked_by = ["tk-51b4"]
@@ -14,6 +14,7 @@ touched = []
 parent = "tk-ef8d"
 base = "35c97c3e43cb05880e1bc8cf5c6412ea790226dd"
 reviewed_at = "2026-08-23T17:53:55+00:00"
+closed = "2026-08-23T17:57:05+00:00"
 +++
 ## Context
 
