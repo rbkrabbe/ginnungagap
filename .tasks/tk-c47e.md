@@ -2,7 +2,7 @@
 id = "tk-c47e"
 title = "Nothing removes a departed node from the directory, and now the removal outlives a restart"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "m"
 priority = 3
 blocked_by = []
@@ -14,6 +14,7 @@ touched = []
 discovered_from = "tk-c593"
 base = "bd91826c0f7f539690186149185896ea4effa49f"
 reviewed_at = "2026-08-25T19:50:46+00:00"
+closed = "2026-08-25T19:55:18+00:00"
 +++
 ## Context
 
