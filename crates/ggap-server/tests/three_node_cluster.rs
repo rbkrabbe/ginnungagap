@@ -1323,8 +1323,8 @@ async fn gossip_converges_on_every_node_client_addr() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // ~10 further gossip ticks at the 50ms test interval, so the
-    // membership-derived refresh has run many times over.
+    // ~10 further gossip ticks at the 50ms test interval, so every node has
+    // re-published and re-exchanged many times over.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     for node in &cluster.nodes {

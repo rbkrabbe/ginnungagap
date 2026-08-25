@@ -12,8 +12,9 @@ Shared domain types imported by every other crate. Has no workspace dependencies
 ## `NodeAddrs`
 
 A node's two advertised gRPC addresses. Lives here because every crate needs
-them and `ggap-types` has no openraft dependency; `ggap-consensus` wraps them in
-`GgapNode`, the openraft `Node` impl that carries them through Raft membership.
+them and `ggap-types` has no openraft dependency. `NodeDescriptor` pairs them
+with an incarnation to make one node's self-published statement about where it
+can be reached; `ShardRegistry`'s directory is a map of those.
 
 | Field | Advertised by | Dialled by |
 |-------|--------------|-----------|
@@ -24,16 +25,21 @@ Advertise and bind are separate on both, which is what makes an advertised port
 differ from a bound one — a NAT or port-mapped deployment is expressible, though
 nothing tests it.
 
-**Addresses belong in Raft membership, not gossip.** Both travel inside
-`GgapNode` through bootstrap, `AddLearner` and a split's `source_members`, so a
-change rides `change_membership` — ordered, committed, durable — instead of
-racing through gossip. `ShardRegistry`'s directory derives from membership and
-is a cache of it. See `docs/ggap-consensus.md`.
+**Addresses belong in the directory, not in Raft membership.** Consensus
+carries identity — bootstrap, `AddLearner` and a split's `source_members` all
+put ids alone into the log — and the directory resolves that identity to an
+address at send time. A node publishes its own descriptor and gossip carries it,
+so a node can move without a membership change, which is what multi-raft needs:
+one address change would otherwise mean a committed membership change in every
+shard that node hosts. Ordering comes from the incarnation, not from the log.
+See `docs/ggap-consensus.md`.
 
-`cluster_only` builds an entry with no client address. That is a member nothing
-can forward a client request to, not a gap awaiting a second source: production
-paths always supply both (`AddLearner` rejects an empty `client_addr`), and the
-constructor exists for test harnesses that serve no client API.
+`cluster_only` builds a descriptor with no client address. That is a node
+nothing can forward a client request to, not a gap awaiting a second source:
+production paths always supply both (`AddLearner` rejects an empty
+`client_addr`), and the constructor exists for test harnesses that serve no
+client API. A descriptor with neither address describes no node and the
+directory skips it.
 
 ## `KvEntry`
 
@@ -89,7 +95,7 @@ it is derived from the state transition at apply time.
 | Variant | When |
 |---------|------|
 | `NotFound` | Read for a key that does not exist (internal use; gRPC layer converts to `NOT_FOUND` status). |
-| `NotLeader { leader_id, leader }` | Write or linearizable read rejected because the node is not the current leader. `leader_id` is the leader's stable node id — the half a forwarder resolves through the directory, which derives it from Raft membership. `leader` is the address that was current when the error was built and may be stale; treat it as a fallback. Either may be absent. |
+| `NotLeader { leader_id, leader }` | Write or linearizable read rejected because the node is not the current leader. `leader_id` is the leader's stable node id — the half a forwarder resolves through the directory. `leader` is the leader's **client** address, resolved from the directory when the error was built, for a caller that has no directory of its own to resolve with; it may be stale. Either may be absent. |
 | `VersionConflict` | `expect_version` mismatch. Carries expected and actual values for client diagnostics. |
 | `Timeout` | Operation exceeded the configured deadline. |
 | `Storage(String)` | Unrecoverable I/O or serialization failure. Always fatal to the operation; upper layers should not retry without investigation. |
