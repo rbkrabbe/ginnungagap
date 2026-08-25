@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-use ggap_types::{NodeDescriptor, ShardId};
+use ggap_types::{DirectoryEntry, ShardId};
 
 /// One shard's placement + lightweight Raft status as last known to this node.
 ///
@@ -60,10 +60,11 @@ pub struct ShardRegistry {
     /// statement about a node's addresses, and gossiping one out would push a
     /// half-known node over a fully-known one.
     seed_peers: Vec<(u64, String)>,
-    /// `node_id -> descriptor`. Each node publishes its own entry; gossip
+    /// `node_id -> entry`. Each node publishes its own descriptor; gossip
     /// copies it everywhere, and [`Self::merge_directory`] orders copies by
-    /// incarnation.
-    directory: RwLock<HashMap<u64, NodeDescriptor>>,
+    /// incarnation. A retired node's entry is a tombstone that outranks every
+    /// descriptor for that id.
+    directory: RwLock<HashMap<u64, DirectoryEntry>>,
     /// Best-known entry per shard.
     shards: RwLock<HashMap<ShardId, ShardEntry>>,
 }
@@ -147,41 +148,100 @@ impl ShardRegistry {
     /// *clears* a previously-known one rather than treating the gap as
     /// "unknown, don't touch". An entry with neither address describes no node
     /// and is skipped.
-    pub async fn merge_directory(&self, entries: impl IntoIterator<Item = (u64, NodeDescriptor)>) {
+    ///
+    /// A tombstone sits outside that ordering entirely: it beats every
+    /// descriptor for its id, and nothing beats it. Rank could not do this job,
+    /// because a peer may hold a copy at an incarnation nobody else has seen,
+    /// and a removal one stray copy can undo is not a removal.
+    pub async fn merge_directory<E: Into<DirectoryEntry>>(
+        &self,
+        entries: impl IntoIterator<Item = (u64, E)>,
+    ) {
         let mut dir = self.directory.write().await;
-        for (node_id, desc) in entries {
-            if desc.addrs.cluster_addr.is_empty() && desc.addrs.client_addr.is_empty() {
-                continue;
-            }
-            match dir.get(&node_id) {
-                Some(existing) if existing.incarnation > desc.incarnation => {}
-                _ => {
-                    dir.insert(node_id, desc);
+        for (node_id, entry) in entries {
+            let entry = entry.into();
+            match (dir.get(&node_id), &entry) {
+                // Absolute: a removal is never undone.
+                (Some(DirectoryEntry::Removed), _) => {}
+                (_, DirectoryEntry::Removed) => {
+                    dir.insert(node_id, entry);
+                }
+                (existing, DirectoryEntry::Live(desc)) => {
+                    if desc.addrs.cluster_addr.is_empty() && desc.addrs.client_addr.is_empty() {
+                        continue;
+                    }
+                    let outranked = existing
+                        .and_then(|e| e.descriptor())
+                        .is_some_and(|e| e.incarnation > desc.incarnation);
+                    if !outranked {
+                        dir.insert(node_id, entry);
+                    }
                 }
             }
         }
     }
 
-    /// Cluster address for a node id, if known.
+    /// Tombstone a node's directory entry. Idempotent, and irreversible for as
+    /// long as the cluster lives: see [`DirectoryEntry::Removed`].
+    ///
+    /// This only writes it locally. Gossip carries it to every peer, and it
+    /// survives restarts through the persisted directory.
+    pub async fn retire(&self, node_id: u64) {
+        self.directory
+            .write()
+            .await
+            .insert(node_id, DirectoryEntry::Removed);
+    }
+
+    /// Whether this node holds a tombstone for `node_id`.
+    pub async fn is_retired(&self, node_id: u64) -> bool {
+        self.directory
+            .read()
+            .await
+            .get(&node_id)
+            .is_some_and(|e| e.is_removed())
+    }
+
+    /// The node id the directory maps `cluster_addr` to, if any, ignoring
+    /// tombstones. The reverse of [`Self::directory_addr`]: it answers "who is
+    /// already at this address", which is how a removal frees one — the join
+    /// path's duplicate check keys on it (tk-8d80).
+    pub async fn node_id_at(&self, cluster_addr: &str) -> Option<u64> {
+        self.directory
+            .read()
+            .await
+            .iter()
+            .find(|(_, entry)| {
+                entry
+                    .descriptor()
+                    .is_some_and(|d| d.addrs.cluster_addr == cluster_addr)
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Cluster address for a node id, if known. A retired node resolves to
+    /// `None`, so every send to it fails exactly as one to an unknown id does.
     pub async fn directory_addr(&self, node_id: u64) -> Option<String> {
         self.directory
             .read()
             .await
             .get(&node_id)
+            .and_then(|e| e.descriptor())
             .map(|d| d.addrs.cluster_addr.clone())
             .filter(|a| !a.is_empty())
     }
 
     /// Client-facing address for a node id, if known.
     ///
-    /// `None` covers both an unknown node and a known node that advertises no
-    /// client address. Callers must treat it as "cannot reach this node's client
-    /// API", never dialling the empty string.
+    /// `None` covers an unknown node, a retired one, and a known node that
+    /// advertises no client address. Callers must treat it as "cannot reach
+    /// this node's client API", never dialling the empty string.
     pub async fn client_addr(&self, node_id: u64) -> Option<String> {
         self.directory
             .read()
             .await
             .get(&node_id)
+            .and_then(|e| e.descriptor())
             .map(|d| d.addrs.client_addr.clone())
             .filter(|a| !a.is_empty())
     }
@@ -189,12 +249,19 @@ impl ShardRegistry {
     /// Gossip peers: every known node except self, as `(node_id, cluster_addr)`.
     /// Gossip dials the cluster port, so the client address is irrelevant here.
     /// Bootstrap seeds are included, and a directory entry supersedes a seed for
-    /// the same node.
+    /// the same node. A retired node is dropped even when a seed names it —
+    /// otherwise the one thing a removal must stop, dialling a node that is
+    /// gone, would go on every round.
     pub async fn peers_excluding_self(&self) -> Vec<(u64, String)> {
         let mut by_id: HashMap<u64, String> = self.seed_peers.iter().cloned().collect();
-        for (id, desc) in self.directory.read().await.iter() {
-            if !desc.addrs.cluster_addr.is_empty() {
-                by_id.insert(*id, desc.addrs.cluster_addr.clone());
+        for (id, entry) in self.directory.read().await.iter() {
+            match entry.descriptor() {
+                Some(desc) if !desc.addrs.cluster_addr.is_empty() => {
+                    by_id.insert(*id, desc.addrs.cluster_addr.clone());
+                }
+                _ => {
+                    by_id.remove(id);
+                }
             }
         }
         by_id.remove(&self.self_node_id);
@@ -205,15 +272,17 @@ impl ShardRegistry {
         peers
     }
 
-    /// The whole directory, sorted by node id. Gossip pushes it to peers and
-    /// the gossip task persists it; both want a stable order.
-    pub async fn directory_snapshot(&self) -> Vec<(u64, NodeDescriptor)> {
-        let mut dir: Vec<(u64, NodeDescriptor)> = self
+    /// The whole directory, tombstones included, sorted by node id. Gossip
+    /// pushes it to peers and the gossip task persists it; both want a stable
+    /// order, and both must carry tombstones — a removal spreads and survives
+    /// restarts by exactly the same route a descriptor does.
+    pub async fn directory_snapshot(&self) -> Vec<(u64, DirectoryEntry)> {
+        let mut dir: Vec<(u64, DirectoryEntry)> = self
             .directory
             .read()
             .await
             .iter()
-            .map(|(id, desc)| (*id, desc.clone()))
+            .map(|(id, entry)| (*id, entry.clone()))
             .collect();
         dir.sort_by_key(|(id, _)| *id);
         dir
@@ -221,7 +290,7 @@ impl ShardRegistry {
 
     /// The full view to push to a peer (or return from `Exchange`). Sorted for
     /// deterministic output.
-    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, NodeDescriptor)>, Vec<ShardEntry>) {
+    pub async fn snapshot_for_gossip(&self) -> (Vec<(u64, DirectoryEntry)>, Vec<ShardEntry>) {
         let dir = self.directory_snapshot().await;
         let mut shards: Vec<ShardEntry> = self.shards.read().await.values().cloned().collect();
         shards.sort_by_key(|e| e.shard_id);
@@ -245,7 +314,7 @@ impl ShardRegistry {
 mod tests {
     use super::*;
 
-    use ggap_types::NodeAddrs;
+    use ggap_types::{NodeAddrs, NodeDescriptor};
 
     /// A descriptor a node published about itself.
     fn own(cluster: &str, client: &str, incarnation: u64) -> NodeDescriptor {
@@ -337,6 +406,92 @@ mod tests {
         let reg = ShardRegistry::new(1, [(2, "seed:17001".to_string())]);
         assert_eq!(reg.directory_addr(2).await, None);
         assert_eq!(reg.snapshot_for_gossip().await.0, vec![]);
+    }
+
+    /// The rule the whole removal rests on: a tombstone outranks every
+    /// descriptor for its id, at any incarnation, arriving in any order. A peer
+    /// partitioned across the removal comes back gossiping the copy it kept, and
+    /// it must lose.
+    #[tokio::test]
+    async fn a_tombstone_beats_every_descriptor_for_its_id() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("old:17001", "old:17000", 3))])
+            .await;
+
+        reg.retire(2).await;
+        assert!(reg.is_retired(2).await);
+        assert_eq!(reg.directory_addr(2).await, None);
+        assert_eq!(reg.client_addr(2).await, None);
+
+        // A stale copy, the highest incarnation a peer could hold, and the
+        // node's own republication after a restart: all lose.
+        reg.merge_directory([(2, own("old:17001", "old:17000", 3))])
+            .await;
+        reg.merge_directory([(2, own("back:17001", "back:17000", u64::MAX))])
+            .await;
+        assert!(reg.is_retired(2).await);
+        assert_eq!(reg.directory_addr(2).await, None);
+    }
+
+    /// The other direction: a tombstone arriving over gossip retires a node this
+    /// registry still believes in, whatever rank it holds for it.
+    #[tokio::test]
+    async fn a_gossiped_tombstone_retires_a_live_entry() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("host:17001", "host:17000", 9))])
+            .await;
+
+        reg.merge_directory([(2, DirectoryEntry::Removed)]).await;
+
+        assert!(reg.is_retired(2).await);
+        assert!(reg.peers_excluding_self().await.is_empty());
+    }
+
+    /// A tombstone must travel and must be written down, so it has to appear in
+    /// the snapshot both gossip and the persisted directory are built from.
+    #[tokio::test]
+    async fn tombstones_are_gossiped_and_persisted() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("host:17001", "host:17000", 1))])
+            .await;
+        reg.retire(2).await;
+
+        assert_eq!(
+            reg.directory_snapshot().await,
+            vec![(2, DirectoryEntry::Removed)]
+        );
+    }
+
+    /// Removal exists to stop the dialling, so a retired node must leave the
+    /// peer list — even when a bootstrap seed still names it.
+    #[tokio::test]
+    async fn a_retired_node_is_not_a_gossip_target_even_as_a_seed() {
+        let reg = ShardRegistry::new(1, [(2, "seed:17001".to_string())]);
+        reg.merge_directory([(2, own("host:17001", "host:17000", 1))])
+            .await;
+        assert_eq!(reg.peers_excluding_self().await.len(), 1);
+
+        reg.retire(2).await;
+        assert!(reg.peers_excluding_self().await.is_empty());
+    }
+
+    /// Freeing the address is the point of the removal for tk-8d80: the reverse
+    /// lookup stops naming the retired id, so a different node can be added
+    /// there.
+    #[tokio::test]
+    async fn a_retired_nodes_address_is_free_for_another_id() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("host:17001", "host:17000", 1))])
+            .await;
+        assert_eq!(reg.node_id_at("host:17001").await, Some(2));
+
+        reg.retire(2).await;
+        assert_eq!(reg.node_id_at("host:17001").await, None);
+
+        reg.merge_directory([(3, own("host:17001", "host:17000", 1))])
+            .await;
+        assert_eq!(reg.node_id_at("host:17001").await, Some(3));
+        assert_eq!(reg.directory_addr(3).await, Some("host:17001".into()));
     }
 
     #[tokio::test]
@@ -494,6 +649,6 @@ mod tests {
         reg.merge_directory([(1, own("c1:17001", "c1:17000", 3))])
             .await;
         let (dir, _) = reg.snapshot_for_gossip().await;
-        assert_eq!(dir, vec![(1, own("c1:17001", "c1:17000", 3))]);
+        assert_eq!(dir, vec![(1, own("c1:17001", "c1:17000", 3).into())]);
     }
 }

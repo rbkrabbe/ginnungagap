@@ -99,6 +99,15 @@ just `ShardId(0)`. What exists today:
   unusable counter recovers its rank from the persisted directory's self-entry
   and fails the boot if that is unreadable too. Wiping the data dir loses both
   records: an address change made across a wipe needs a fresh node id.
+  A node leaves the directory only through a tombstone written by
+  `AdminService.RemoveNode`, which outranks every descriptor for that id at any
+  incarnation — a removal ordered by rank is one a stray copy undoes. It
+  therefore cannot be reversed: a retired id is never reused, though its address
+  is free at once. The call is forwarded to the target, the only node that can
+  say which shards it still belongs to and the only author of its own entry; a
+  target that does not answer is tombstoned on its behalf, which is the sole way
+  to retire hardware that is already gone (tk-ad1d gates that on the node being
+  demonstrably dead).
   `GgapNetwork` resolves its target through the directory on **every** RPC, so a
   node that moves is dialled on the next send with no new client; an id the
   directory cannot resolve fails the RPC, which openraft treats as an
@@ -113,7 +122,8 @@ shard is eventually consistent: `AdminService` answers for a non-hosted shard
 from gossiped `ShardEntry` copies, ageing rather than fabricating, and zeroes out
 consensus fields when it has never heard of a shard at all. Addresses are
 eventually consistent too, by design — a node that moves is reachable once its
-descriptor has propagated, and nothing removes a departed node's entry (tk-c47e).
+descriptor has propagated, and a departed node's entry goes away when an
+operator retires it rather than on its own.
 A placement driver (`ggap-pd`) for automatic rebalancing is future work.
 # Task tracking
 

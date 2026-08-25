@@ -21,7 +21,7 @@ use ggap_consensus::{
     GgapStateMachine, OpenRaftCluster, OpenRaftNode, ShardRegistry, ShardRouter, SplitCoordinator,
     SplitCoordinatorConfig,
 };
-use ggap_server::serve_cluster_with_listener;
+use ggap_server::{serve_cluster_with_listener, ClusterServiceConfig};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
 
@@ -102,7 +102,7 @@ async fn cors_preflight_returns_allow_origin() {
         split_coordinator,
         shard_map,
         registry,
-        vec![allowed_origin.to_string()],
+        ClusterServiceConfig::with_cors_origins(vec![allowed_origin.to_string()]),
     ));
 
     // Give the server a moment to start accepting.

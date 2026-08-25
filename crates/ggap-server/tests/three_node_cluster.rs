@@ -25,7 +25,7 @@ use ggap_consensus::{
 };
 use ggap_server::{
     serve_client_with_listener, serve_cluster_with_listener, AdminServiceForTesting,
-    KvServiceConfig,
+    ClusterServiceConfig, KvServiceConfig,
 };
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
@@ -36,7 +36,8 @@ use ggap_types::{
 
 use ggap_proto::v1::admin_service_server::AdminService;
 use ggap_proto::v1::{
-    AddLearnerRequest, ClusterStatusRequest, ListShardsRequest, NodeInfo, ShardInfoProto,
+    AddLearnerRequest, ClusterStatusRequest, ListShardsRequest, NodeInfo, RemoveNodeRequest,
+    ShardInfoProto,
 };
 
 // ---------------------------------------------------------------------------
@@ -168,7 +169,15 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
     let sm2 = shard_map.clone();
     let reg = registry.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, reg, vec![]).await
+        if let Err(e) = serve_cluster_with_listener(
+            cluster_listener,
+            r,
+            sc,
+            sm2,
+            reg,
+            ClusterServiceConfig::default(),
+        )
+        .await
         {
             eprintln!("node {id} cluster server: {e}");
         }
@@ -825,7 +834,7 @@ async fn add_learner_rpc_publishes_addresses_to_the_directory() {
     let desc = directory
         .iter()
         .find(|(id, _)| *id == 99)
-        .map(|(_, d)| d)
+        .and_then(|(_, entry)| entry.descriptor())
         .expect("node 99 is in the leader's directory");
     assert_eq!(
         desc.incarnation, 0,
@@ -1399,4 +1408,249 @@ async fn client_and_cluster_addrs_are_distinct_per_node() {
     assert_ne!(learned_client, learned_cluster);
 
     cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// RemoveNode — retiring a node from the directory (tk-c47e)
+// ---------------------------------------------------------------------------
+
+/// Wait until `node` holds a tombstone for `retired_id`, which gossip may take
+/// a round or two to deliver.
+async fn await_tombstone(node: &TestNode, retired_id: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !node.registry.is_retired(retired_id).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {}: never learned that node {retired_id} was retired",
+            node.id
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A node still in a shard's membership refuses to be retired, and says which
+/// shards it is still in. The refusal is the target's own: node 1 forwards the
+/// call, and node 3 answers from its own Raft membership rather than from
+/// anyone's gossiped view of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_node_is_refused_while_the_target_is_still_a_member() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+
+    let resp = cluster.nodes[0]
+        .admin
+        .remove_node(tonic::Request::new(RemoveNodeRequest { node_id: 3 }))
+        .await
+        .expect("remove_node is answered, not errored")
+        .into_inner();
+
+    assert!(!resp.ok, "a node in a membership must not be retired");
+    assert!(
+        resp.confirmed_by_node,
+        "the refusal must come from the target itself"
+    );
+    assert!(
+        resp.error.contains("shard(s) 0"),
+        "the error must name the shards that block it: {}",
+        resp.error
+    );
+    assert!(!cluster.nodes[0].registry.is_retired(3).await);
+    assert!(!cluster.nodes[2].registry.is_retired(3).await);
+}
+
+/// The acceptance case. A node in no membership retires itself, hands the
+/// tombstone to a peer before it stops, and the cluster forgets it: nothing
+/// resolves it, nothing gossips with it, and its address is free for another id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drained_node_retires_itself_and_the_cluster_forgets_it() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+
+    // Node 4 hosts shard 0 locally but was never initialised into any
+    // membership — the state a node is left in once it has been drained.
+    let drained = start_node(4, false).await;
+    let drained_addr = drained.cluster_addr.to_string();
+    let seed = vec![(
+        cluster.nodes[0].id,
+        NodeDescriptor::new(
+            NodeAddrs::new(
+                cluster.nodes[0].cluster_addr.to_string(),
+                cluster.nodes[0].advertised_client_addr.clone(),
+            ),
+            1,
+        ),
+    )];
+    drained.registry.merge_directory(seed).await;
+    for node in &cluster.nodes {
+        node.registry
+            .merge_directory([(
+                4u64,
+                NodeDescriptor::new(
+                    NodeAddrs::new(drained_addr.clone(), drained.advertised_client_addr.clone()),
+                    1,
+                ),
+            )])
+            .await;
+    }
+
+    let resp = cluster.nodes[0]
+        .admin
+        .remove_node(tonic::Request::new(RemoveNodeRequest { node_id: 4 }))
+        .await
+        .expect("remove_node is answered, not errored")
+        .into_inner();
+
+    assert!(resp.ok, "remove_node failed: {}", resp.error);
+    assert!(
+        resp.confirmed_by_node,
+        "the target answered, so it retired itself"
+    );
+
+    // The tombstone was handed to a peer before the answer came back, and
+    // gossip carries it to the rest.
+    for node in &cluster.nodes {
+        await_tombstone(node, 4).await;
+        assert_eq!(node.registry.directory_addr(4).await, None);
+        assert_eq!(node.registry.client_addr(4).await, None);
+        assert!(
+            !node
+                .registry
+                .peers_excluding_self()
+                .await
+                .iter()
+                .any(|(id, _)| *id == 4),
+            "a retired node must not stay a gossip target"
+        );
+    }
+
+    // The address it left behind belongs to whoever takes it next.
+    assert_eq!(
+        cluster.nodes[0].registry.node_id_at(&drained_addr).await,
+        None
+    );
+    cluster.nodes[0]
+        .registry
+        .merge_directory([(
+            5u64,
+            NodeDescriptor::new(NodeAddrs::new(drained_addr.clone(), "127.0.0.1:19998"), 1),
+        )])
+        .await;
+    assert_eq!(
+        cluster.nodes[0].registry.directory_addr(5).await,
+        Some(drained_addr)
+    );
+}
+
+/// A node that cannot be reached is the case the whole task exists for:
+/// decommissioned hardware has nobody left to author its own tombstone, so the
+/// node serving the call writes one on its behalf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_node_is_tombstoned_on_its_behalf() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+
+    // Nothing is listening there, and nothing ever was.
+    cluster.nodes[0]
+        .registry
+        .merge_directory([(
+            99u64,
+            NodeDescriptor::new(NodeAddrs::new("127.0.0.1:19999", "127.0.0.1:19998"), 1),
+        )])
+        .await;
+
+    let resp = cluster.nodes[0]
+        .admin
+        .remove_node(tonic::Request::new(RemoveNodeRequest { node_id: 99 }))
+        .await
+        .expect("remove_node is answered, not errored")
+        .into_inner();
+
+    assert!(resp.ok, "remove_node failed: {}", resp.error);
+    assert!(
+        !resp.confirmed_by_node,
+        "nobody answered, so nobody confirmed"
+    );
+    assert!(cluster.nodes[0].registry.is_retired(99).await);
+
+    // And the id stays retired: adding it back as a learner would put an
+    // unresolvable node into the membership.
+    let err = cluster.nodes[0]
+        .admin
+        .add_learner(tonic::Request::new(AddLearnerRequest {
+            shard_id: Some(0),
+            node: Some(NodeInfo {
+                node_id: 99,
+                cluster_addr: "127.0.0.1:19999".to_string(),
+                client_addr: "127.0.0.1:19998".to_string(),
+            }),
+        }))
+        .await
+        .expect_err("a retired id must not be added back");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// A node that reached none of its peers keeps running rather than retiring
+/// into a tombstone only it holds: the removal would vanish with the process,
+/// and nothing can take a removal back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_cannot_hand_over_its_tombstone_stays_in_the_cluster() {
+    let node = start_node(4, false).await;
+    // One peer, and it is not listening.
+    node.registry
+        .merge_directory([(
+            9u64,
+            NodeDescriptor::new(NodeAddrs::new("127.0.0.1:19999", "127.0.0.1:19998"), 1),
+        )])
+        .await;
+
+    let resp = node
+        .admin
+        .remove_node(tonic::Request::new(RemoveNodeRequest { node_id: 4 }))
+        .await
+        .expect("remove_node is answered, not errored")
+        .into_inner();
+
+    assert!(!resp.ok, "the removal reached nobody, so it must not stand");
+    assert!(
+        resp.error.contains("reached none"),
+        "unexpected error: {}",
+        resp.error
+    );
+    assert!(
+        !node.registry.is_retired(4).await,
+        "a node that stays in the cluster must not hold a tombstone for itself"
+    );
+}
+
+/// An entry mapping a second id to a node's own address is corruption, not a
+/// node: forwarding to it would dial ourselves, and retiring it would tombstone
+/// whoever really answers there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_node_refuses_an_entry_that_names_the_serving_nodes_own_address() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+    let node = &cluster.nodes[0];
+
+    node.registry
+        .merge_directory([(
+            77u64,
+            NodeDescriptor::new(
+                NodeAddrs::new(
+                    node.cluster_addr.to_string(),
+                    node.advertised_client_addr.clone(),
+                ),
+                1,
+            ),
+        )])
+        .await;
+
+    let err = node
+        .admin
+        .remove_node(tonic::Request::new(RemoveNodeRequest { node_id: 77 }))
+        .await
+        .expect_err("removing an entry pointing at ourselves must be refused");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(!node.registry.is_retired(77).await);
+    assert!(!node.registry.is_retired(node.id).await);
 }

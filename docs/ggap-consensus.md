@@ -134,5 +134,32 @@ The production `RaftNode` implementation. It:
   nodes in no membership that nobody will ever dial — the observer harness in
   `ggap-server/tests/three_node_cluster.rs`, and later `ggap-pd`.
 
-  **Still open:** nothing removes a departed node from the directory, and the
-  removal now outlives a restart (tk-c47e).
+  A node leaves the directory through a **tombstone**, `DirectoryEntry::Removed`,
+  written by `AdminService.RemoveNode`. It outranks every descriptor for its id
+  at any incarnation, in both directions: a copy a partitioned peer kept across
+  the removal loses to it, and so does the node's own publication after a
+  restart. Rank could not do this job — a peer may hold a copy at an incarnation
+  nobody else has seen — so the ordering is absolute rather than numeric, and
+  the consequence is that a retired id stays retired for the cluster's lifetime.
+  Reusing the hardware means a fresh node id; the *address* is free immediately,
+  which is what lets an operator re-add a decommissioned host.
+
+  Tombstones travel and persist exactly as descriptors do: `snapshot_for_gossip`
+  emits them, `DirectoryStore` writes them out, and a restart restores them — so
+  a removal is not undone by the first peer to gossip afterwards. A retired node
+  resolves to nothing (`directory_addr`, `client_addr` and `node_id_at` all skip
+  it) and is dropped from `peers_excluding_self` even when a bootstrap seed
+  still names it.
+
+  Who may write one is deliberately narrow. `RemoveNode` reaching any node is
+  forwarded to the target, because only the target can say authoritatively which
+  shards it still belongs to — it refuses while it belongs to any, naming them —
+  and only the target authors its own entry. It hands the tombstone to a peer
+  *before* recording it locally, since a removal cannot be taken back and one
+  that reached nobody would vanish with the process; a node that reaches none of
+  its peers stays in the cluster instead. A target that does not answer is the
+  one exception, and the only way to retire hardware that is already gone: the
+  node serving the call tombstones it on its behalf.
+
+  **Still open:** that fallback fires on a single failed dial, so a briefly
+  partitioned node can be retired as though it were dead (tk-ad1d).

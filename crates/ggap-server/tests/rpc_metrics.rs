@@ -28,7 +28,9 @@ use ggap_proto::v1::{
     raft_service_client::RaftServiceClient, AddLearnerRequest, CasRequest, ClusterStatusRequest,
     DeleteRequest, GetRequest, ListShardsRequest, NodeInfo, PutRequest, RaftMessage, ScanRequest,
 };
-use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
+use ggap_server::{
+    serve_client_with_listener, serve_cluster_with_listener, ClusterServiceConfig, KvServiceConfig,
+};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
 
@@ -114,7 +116,15 @@ async fn start_single_node() -> TestNode {
     let sc = split_coordinator;
     let sm2 = shard_map.clone();
     handles.push(tokio::spawn(async move {
-        let _ = serve_cluster_with_listener(cluster_listener, r, sc, sm2, registry, vec![]).await;
+        let _ = serve_cluster_with_listener(
+            cluster_listener,
+            r,
+            sc,
+            sm2,
+            registry,
+            ClusterServiceConfig::default(),
+        )
+        .await;
     }));
     let r = router.clone();
     handles.push(tokio::spawn(async move {

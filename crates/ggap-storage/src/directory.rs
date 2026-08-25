@@ -1,4 +1,4 @@
-//! Persisted copy of the node directory (`node_id -> NodeDescriptor`).
+//! Persisted copy of the node directory (`node_id -> DirectoryEntry`).
 //!
 //! The directory itself lives in `ggap-consensus`'s `ShardRegistry` and is
 //! rebuilt from gossip; this is a cache of it, written by the gossip task and
@@ -6,13 +6,18 @@
 //! is elected before any peer has gossiped to it can resolve its peers straight
 //! away instead of failing sends until someone dials it.
 //!
+//! Tombstones ride along with the descriptors, which is what makes a removal
+//! outlive a restart of every node that heard it: a directory rebuilt from
+//! gossip alone would come back tombstone-free only if no peer remembered
+//! either, and a peer that does re-seeds it within a round.
+//!
 //! Because it is a cache, [`DirectoryStore::load`] never fails. A missing,
 //! unreadable or corrupt record warns and yields an empty directory — the node
 //! recovers by being dialled, exactly as one with no record at all does.
 
 use std::sync::Arc;
 
-use ggap_types::{GgapError, NodeDescriptor};
+use ggap_types::{DirectoryEntry, GgapError};
 
 use crate::fjall::FjallStore;
 use crate::keys::node_key;
@@ -35,7 +40,7 @@ impl DirectoryStore {
 
     /// The persisted directory, or an empty one if there is nothing usable to
     /// read. Sorted by node id, as [`Self::save`] wrote it.
-    pub fn load(&self) -> Vec<(u64, NodeDescriptor)> {
+    pub fn load(&self) -> Vec<(u64, DirectoryEntry)> {
         match self.try_load() {
             Ok(Some(entries)) => entries,
             Ok(None) => Vec::new(),
@@ -55,7 +60,7 @@ impl DirectoryStore {
     /// from the self-entry here when its own record is corrupt, and a directory
     /// that exists but cannot be decoded means the rank is unknown rather than
     /// unset — a difference between a first boot and an unrankable one.
-    pub fn try_load(&self) -> Result<Option<Vec<(u64, NodeDescriptor)>>, GgapError> {
+    pub fn try_load(&self) -> Result<Option<Vec<(u64, DirectoryEntry)>>, GgapError> {
         let bytes = match self.store.node.get(directory_key()) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(None),
@@ -67,7 +72,7 @@ impl DirectoryStore {
     }
 
     /// Replace the persisted directory with `entries`.
-    pub fn save(&self, entries: &[(u64, NodeDescriptor)]) -> Result<(), GgapError> {
+    pub fn save(&self, entries: &[(u64, DirectoryEntry)]) -> Result<(), GgapError> {
         let bytes = bincode::serde::encode_to_vec(entries, bincode::config::standard())
             .map_err(|e| GgapError::Storage(e.to_string()))?;
         self.store
@@ -81,7 +86,7 @@ impl DirectoryStore {
 mod tests {
     use super::*;
 
-    use ggap_types::NodeAddrs;
+    use ggap_types::{NodeAddrs, NodeDescriptor};
     use tempfile::TempDir;
 
     fn store() -> (Arc<FjallStore>, TempDir) {
@@ -90,8 +95,11 @@ mod tests {
         (store, tempdir)
     }
 
-    fn desc(cluster: &str, client: &str, incarnation: u64) -> NodeDescriptor {
-        NodeDescriptor::new(NodeAddrs::new(cluster, client), incarnation)
+    fn desc(cluster: &str, client: &str, incarnation: u64) -> DirectoryEntry {
+        DirectoryEntry::Live(NodeDescriptor::new(
+            NodeAddrs::new(cluster, client),
+            incarnation,
+        ))
     }
 
     #[test]
@@ -135,6 +143,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(DirectoryStore::new(store).load(), vec![]);
+    }
+
+    /// A tombstone is the half of the directory a restart must not lose.
+    #[test]
+    fn round_trips_a_tombstone() {
+        let (store, _tempdir) = store();
+        let dir = DirectoryStore::new(store);
+        let entries = vec![
+            (2, DirectoryEntry::Removed),
+            (3, desc("c:17001", "c:17000", 4)),
+        ];
+
+        dir.save(&entries).unwrap();
+        assert_eq!(dir.load(), entries);
     }
 
     /// `try_load` exists to tell these two apart, which `load` cannot.

@@ -15,6 +15,7 @@ service AdminService {
   rpc AddLearner       (AddLearnerRequest)        returns (AddLearnerResponse);
   rpc ChangeMembership (ChangeMembershipRequest)  returns (ChangeMembershipResponse);
   rpc SplitShard       (SplitShardRequest)        returns (SplitShardResponse);
+  rpc RemoveNode       (RemoveNodeRequest)        returns (RemoveNodeResponse);
   rpc ListShards       (ListShardsRequest)        returns (ListShardsResponse);
 }
 
@@ -86,6 +87,28 @@ message SplitShardResponse {
   string error = 3;
 }
 
+// Retire a node: tombstone its directory entry cluster-wide, so no peer keeps
+// gossiping it, nothing dials it, and its address is free for a different node
+// id to use.
+//
+// Any node accepts this. Unless it *is* the target, it forwards the call to the
+// target, which is the only node that can say authoritatively which shards it
+// still belongs to; the target refuses while it belongs to any. Only a target
+// that cannot be reached is tombstoned on its behalf by the node serving the
+// call (tk-ad1d will gate that on the node being demonstrably dead, rather than
+// merely unreachable right now).
+message RemoveNodeRequest {
+  uint64 node_id = 1;
+}
+
+message RemoveNodeResponse {
+  bool ok = 1;
+  string error = 2;
+  // True when the target answered and retired itself, false when it could not
+  // be reached and the entry was tombstoned on its behalf.
+  bool confirmed_by_node = 3;
+}
+
 message ListShardsRequest {}
 
 message ShardInfoProto {
@@ -116,13 +139,11 @@ message ListShardsResponse {
 // discovery: a node learns about peers it doesn't directly co-host a shard with
 // by receiving their directory entries through gossip.
 //
-// The two addresses reach this node by different routes. `cluster_addr` also
-// travels in the Raft membership (openraft `BasicNode.addr`), so it is
-// re-derivable from consensus state; `client_addr` rides gossip alone and is
-// only ever originated by the node it describes. Either may be empty — an old
-// peer sends no `client_addr`, and a directory entry learned from Raft
-// membership has no client address to report — so receivers merge the two
-// fields independently and treat empty as "unknown", never as "cleared".
+// A descriptor is a whole value: a receiver replaces both address fields
+// together, so an entry sent with no `client_addr` clears a previously-known
+// one rather than leaving it in place. That is what lets an address be
+// retracted, and it is safe because a node is the sole author of its own
+// descriptor.
 message GossipNode {
   uint64 node_id = 1;
   string cluster_addr = 2;
@@ -133,6 +154,10 @@ message GossipNode {
   // node itself. Zero means the entry was written on the node's behalf rather
   // than by it, and is superseded by the node's own first publication.
   uint64 incarnation = 4;
+  // Tombstone: this node was removed from the cluster. Outranks every
+  // descriptor for the same id whatever its incarnation, so no peer's copy and
+  // no restart brings it back. Both address fields are empty when set.
+  bool removed = 5;
 }
 
 // One shard's placement + lightweight Raft status as known by some origin node.
