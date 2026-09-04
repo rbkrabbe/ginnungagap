@@ -1,6 +1,6 @@
 +++
 id = "tk-5a4b"
-title = "Two comments still say membership carries addresses"
+title = "Three comments still say membership carries addresses"
 kind = "task"
 status = "open"
 size = "s"
@@ -26,14 +26,23 @@ model from the code.
   all. The second half of the sentence is the whole truth now.
 - `crates/ggap-node/src/main.rs:192-195` — "Needed before any Raft group
   starts, because seed bootstrap puts the advertised address into the initial
-  membership". tk-abf8 made `bootstrap_members` an id set. `self_addrs` is
-  still needed before the registry is built, but for the descriptor this node
-  publishes, not for membership.
+  membership". tk-abf8 made `bootstrap_members` an id set, and seed bootstrap
+  builds `BTreeMap<u64, GgapNode{}>` at `main.rs:326`. `self_addrs` is still
+  needed early, but the real reason is stated correctly 60 lines below at
+  `main.rs:250`.
+- `crates/ggap-server/tests/three_node_cluster.rs:55` — `advertised_client_addr`
+  is documented as "what goes into Raft membership and, derived from it, the
+  directory", which inverts the model in both halves. Grep for that phrasing
+  returns this line alone.
+
+Together these falsify tk-10d8's ticked acceptance box, "No doc describes the
+directory as derived from membership".
 
 Comments only; no behaviour changes.
 
 ## Acceptance
 
-- [ ] Neither comment claims membership carries an address.
+- [ ] No comment claims membership carries an address, or the directory
+      derives from it.
 - [ ] `main.rs`'s comment states the real reason `self_addrs` is built early.
 - [ ] Full checklist green: fmt, clippy -D warnings, build, test.
