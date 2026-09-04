@@ -25,7 +25,9 @@ use ggap_consensus::{
     SplitCoordinatorConfig,
 };
 use ggap_proto::v1::{kv_service_client::KvServiceClient, PutRequest};
-use ggap_server::{serve_client_with_listener, serve_cluster_with_listener, KvServiceConfig};
+use ggap_server::{
+    serve_client_with_listener, serve_cluster_with_listener, ClusterServiceConfig, KvServiceConfig,
+};
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::ShardMap;
 use ggap_types::{NodeAddrs, NodeDescriptor};
@@ -111,7 +113,15 @@ async fn start_node(id: u64) -> BenchNode {
     let sm2 = shard_map.clone();
     let reg = registry.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = serve_cluster_with_listener(cluster_listener, r, sc, sm2, reg, vec![]).await
+        if let Err(e) = serve_cluster_with_listener(
+            cluster_listener,
+            r,
+            sc,
+            sm2,
+            reg,
+            ClusterServiceConfig::default(),
+        )
+        .await
         {
             eprintln!("node {id} cluster: {e}");
         }

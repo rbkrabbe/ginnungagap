@@ -18,7 +18,7 @@ use ggap_proto::v1::{
 };
 
 use ggap_storage::DirectoryStore;
-use ggap_types::{NodeAddrs, NodeDescriptor};
+use ggap_types::{DirectoryEntry, NodeAddrs, NodeDescriptor};
 
 use crate::registry::{ShardEntry, ShardRegistry};
 use crate::router::ShardRouter;
@@ -45,7 +45,7 @@ pub struct GossipTask {
     /// persistence — a registry built by hand in a test needs none.
     directory_store: Option<DirectoryStore>,
     /// What was last written, so an unchanged directory costs no write.
-    persisted_directory: Vec<(u64, NodeDescriptor)>,
+    persisted_directory: Vec<(u64, DirectoryEntry)>,
     /// Monotonic heartbeat counter bumped each time we publish local status.
     version: u64,
     /// Rotating cursor over the peer list (avoids a `rand` prod dependency).
@@ -228,30 +228,95 @@ impl GossipTask {
     }
 
     async fn exchange_with(&self, addr: &str) -> Result<(), String> {
-        let (dir, shards) = self.registry.snapshot_for_gossip().await;
-        let req = GossipState {
-            sender_node_id: self.self_node_id,
-            directory: dir.into_iter().map(node_to_proto).collect(),
-            shards: shards.into_iter().map(entry_to_proto).collect(),
-        };
-
-        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .map_err(|e| e.to_string())?;
-        let channel = tokio::time::timeout(self.rpc_timeout, endpoint.connect())
-            .await
-            .map_err(|_| "connect timed out".to_string())?
-            .map_err(|e| e.to_string())?;
-        let mut client = GossipServiceClient::new(channel);
-
-        let resp = tokio::time::timeout(self.rpc_timeout, client.exchange(req))
-            .await
-            .map_err(|_| "exchange timed out".to_string())?
-            .map_err(|e| e.to_string())?
-            .into_inner();
-
-        merge_gossip_state(&self.registry, resp).await;
-        Ok(())
+        exchange_once(&self.registry, self.self_node_id, addr, self.rpc_timeout).await
     }
+}
+
+/// One push-pull exchange with the peer at `addr`: send our whole view, merge
+/// what comes back.
+pub async fn exchange_once(
+    registry: &ShardRegistry,
+    self_node_id: u64,
+    addr: &str,
+    rpc_timeout: Duration,
+) -> Result<(), String> {
+    let req = gossip_request(registry, self_node_id, None).await;
+    send_exchange(registry, addr, req, rpc_timeout).await
+}
+
+/// This node's view as a `GossipState`, optionally with one id tombstoned in
+/// the copy that goes out. The override exists for a node retiring itself,
+/// which must not write the tombstone locally until a peer has taken it.
+async fn gossip_request(
+    registry: &ShardRegistry,
+    self_node_id: u64,
+    tombstone: Option<u64>,
+) -> GossipState {
+    let (mut dir, shards) = registry.snapshot_for_gossip().await;
+    if let Some(node_id) = tombstone {
+        dir.retain(|(id, _)| *id != node_id);
+        dir.push((node_id, DirectoryEntry::Removed));
+        dir.sort_by_key(|(id, _)| *id);
+    }
+    GossipState {
+        sender_node_id: self_node_id,
+        directory: dir.into_iter().map(node_to_proto).collect(),
+        shards: shards.into_iter().map(entry_to_proto).collect(),
+    }
+}
+
+async fn send_exchange(
+    registry: &ShardRegistry,
+    addr: &str,
+    req: GossipState,
+    rpc_timeout: Duration,
+) -> Result<(), String> {
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .map_err(|e| e.to_string())?;
+    let channel = tokio::time::timeout(rpc_timeout, endpoint.connect())
+        .await
+        .map_err(|_| "connect timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+    let mut client = GossipServiceClient::new(channel);
+
+    let resp = tokio::time::timeout(rpc_timeout, client.exchange(req))
+        .await
+        .map_err(|_| "exchange timed out".to_string())?
+        .map_err(|e| e.to_string())?
+        .into_inner();
+
+    merge_gossip_state(registry, resp).await;
+    Ok(())
+}
+
+/// Hand a tombstone for `removed_id` to every known peer, returning how many
+/// accepted it.
+///
+/// The gossip task's own rounds are round-robin over a fanout and happen on a
+/// timer; this is for the one caller that can neither wait for the next tick nor
+/// afford to miss it — a node retiring itself, which is about to stop. A
+/// tombstone that reaches no peer dies with the node that wrote it.
+///
+/// The tombstone is added to the copy that goes out, not to the local
+/// directory: the caller decides what to do when nothing gets through, and a
+/// removal recorded locally can never be taken back.
+pub async fn broadcast_removal(
+    registry: &ShardRegistry,
+    self_node_id: u64,
+    removed_id: u64,
+    rpc_timeout: Duration,
+) -> usize {
+    let req = gossip_request(registry, self_node_id, Some(removed_id)).await;
+    let mut delivered = 0;
+    for (peer_id, addr) in registry.peers_excluding_self().await {
+        match send_exchange(registry, &addr, req.clone(), rpc_timeout).await {
+            Ok(()) => delivered += 1,
+            Err(e) => {
+                tracing::debug!(node_id = self_node_id, peer_id, %addr, error = %e, "tombstone delivery failed")
+            }
+        }
+    }
+    delivered
 }
 
 /// Merge a received [`GossipState`] (directory + shard entries) into a registry.
@@ -266,28 +331,44 @@ pub async fn merge_gossip_state(registry: &ShardRegistry, state: GossipState) {
     }
 }
 
-pub fn node_to_proto((node_id, desc): (u64, NodeDescriptor)) -> GossipNode {
-    GossipNode {
-        node_id,
-        cluster_addr: desc.addrs.cluster_addr,
-        client_addr: desc.addrs.client_addr,
-        incarnation: desc.incarnation,
+pub fn node_to_proto((node_id, entry): (u64, DirectoryEntry)) -> GossipNode {
+    match entry {
+        DirectoryEntry::Live(desc) => GossipNode {
+            node_id,
+            cluster_addr: desc.addrs.cluster_addr,
+            client_addr: desc.addrs.client_addr,
+            incarnation: desc.incarnation,
+            removed: false,
+        },
+        // A tombstone says only that the node is gone; its addresses are no
+        // longer anyone's business, and carrying them would invite a receiver
+        // to use them.
+        DirectoryEntry::Removed => GossipNode {
+            node_id,
+            cluster_addr: String::new(),
+            client_addr: String::new(),
+            incarnation: 0,
+            removed: true,
+        },
     }
 }
 
 /// A member that advertises no client address sends the field as an empty
 /// string, which is also what prost decodes an absent proto3 scalar to. Both
 /// mean the same thing here: nothing can forward a client request to that node.
-pub fn node_from_proto(n: GossipNode) -> (u64, NodeDescriptor) {
+pub fn node_from_proto(n: GossipNode) -> (u64, DirectoryEntry) {
+    if n.removed {
+        return (n.node_id, DirectoryEntry::Removed);
+    }
     (
         n.node_id,
-        NodeDescriptor {
+        DirectoryEntry::Live(NodeDescriptor {
             addrs: NodeAddrs {
                 cluster_addr: n.cluster_addr,
                 client_addr: n.client_addr,
             },
             incarnation: n.incarnation,
-        },
+        }),
     )
 }
 
@@ -332,9 +413,19 @@ mod tests {
     #[test]
     fn proto_round_trip_preserves_both_addrs_and_incarnation() {
         let desc = NodeDescriptor::new(NodeAddrs::new("host:17001", "host:17000"), 5);
-        let (id, back) = node_from_proto(node_to_proto((7, desc.clone())));
+        let (id, back) = node_from_proto(node_to_proto((7, desc.clone().into())));
         assert_eq!(id, 7);
-        assert_eq!(back, desc);
+        assert_eq!(back, DirectoryEntry::Live(desc));
+    }
+
+    /// A tombstone has to survive the wire, or a removal stops at the node that
+    /// made it.
+    #[test]
+    fn proto_round_trip_preserves_a_tombstone() {
+        let wire = node_to_proto((7, DirectoryEntry::Removed));
+        assert!(wire.removed);
+        assert_eq!(wire.cluster_addr, "", "a tombstone carries no address");
+        assert_eq!(node_from_proto(wire), (7, DirectoryEntry::Removed));
     }
 
     /// A member advertising no client address round-trips as cluster-only.
@@ -345,11 +436,15 @@ mod tests {
             cluster_addr: "host:17001".into(),
             client_addr: String::new(),
             incarnation: 2,
+            removed: false,
         });
         assert_eq!(id, 7);
         assert_eq!(
             back,
-            NodeDescriptor::new(NodeAddrs::cluster_only("host:17001"), 2)
+            DirectoryEntry::Live(NodeDescriptor::new(
+                NodeAddrs::cluster_only("host:17001"),
+                2
+            ))
         );
     }
 
@@ -363,11 +458,14 @@ mod tests {
             cluster_addr: "host:17001".into(),
             client_addr: "host:17000".into(),
             incarnation: 0,
+            removed: false,
         });
-        assert_eq!(back.incarnation, 0);
         assert_eq!(
             back,
-            NodeDescriptor::hint(NodeAddrs::new("host:17001", "host:17000"))
+            DirectoryEntry::Live(NodeDescriptor::hint(NodeAddrs::new(
+                "host:17001",
+                "host:17000"
+            )))
         );
     }
 }

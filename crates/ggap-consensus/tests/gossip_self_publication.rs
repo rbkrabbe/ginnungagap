@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use ggap_consensus::{GossipTask, ShardRegistry, ShardRouter};
 use ggap_storage::fjall::FjallStore;
 use ggap_storage::shard_map::ShardMap;
-use ggap_types::{NodeAddrs, NodeDescriptor};
+use ggap_types::{DirectoryEntry, NodeAddrs, NodeDescriptor};
 
 /// A router hosting nothing: no shards are registered, so there is no
 /// membership for the directory to be derived from.
@@ -27,7 +27,7 @@ fn empty_router() -> (Arc<ShardRouter>, TempDir) {
 async fn eventually(
     registry: &ShardRegistry,
     what: &str,
-    f: impl Fn(&[(u64, NodeDescriptor)]) -> bool,
+    f: impl Fn(&[(u64, DirectoryEntry)]) -> bool,
 ) {
     for _ in 0..200 {
         let (dir, _) = registry.snapshot_for_gossip().await;
@@ -64,7 +64,10 @@ async fn a_node_hosting_no_shard_publishes_its_own_descriptor() {
     eventually(&registry, "self descriptor in the gossip snapshot", |dir| {
         dir == [(
             7,
-            NodeDescriptor::new(NodeAddrs::new("host:17001", "host:17000"), 3),
+            DirectoryEntry::Live(NodeDescriptor::new(
+                NodeAddrs::new("host:17001", "host:17000"),
+                3,
+            )),
         )]
     })
     .await;

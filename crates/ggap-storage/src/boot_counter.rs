@@ -126,11 +126,14 @@ impl BootCounter {
             tracing::warn!("no persisted directory either; treating this as a first boot");
             return Ok(0);
         };
+        // A tombstone for this node carries no rank to recover. It is a first
+        // boot as far as the counter is concerned; the node is refused a start
+        // for being retired long before the rank could matter.
         let recovered = entries
             .iter()
             .find(|(node_id, _)| *node_id == self.self_node_id)
-            .map(|(_, desc)| desc.incarnation)
-            .unwrap_or(0);
+            .and_then(|(_, entry)| entry.descriptor())
+            .map_or(0, |desc| desc.incarnation);
         tracing::warn!(
             node_id = self.self_node_id,
             recovered,
@@ -151,7 +154,7 @@ impl BootCounter {
 mod tests {
     use super::*;
 
-    use ggap_types::{NodeAddrs, NodeDescriptor};
+    use ggap_types::{DirectoryEntry, NodeAddrs, NodeDescriptor};
     use tempfile::TempDir;
 
     const SELF: u64 = 1;
@@ -170,8 +173,25 @@ mod tests {
         store.node.insert(counter_key(), b"seven".to_vec()).unwrap();
     }
 
-    fn desc(incarnation: u64) -> NodeDescriptor {
-        NodeDescriptor::new(NodeAddrs::new("node:17001", "node:17000"), incarnation)
+    fn desc(incarnation: u64) -> DirectoryEntry {
+        DirectoryEntry::Live(NodeDescriptor::new(
+            NodeAddrs::new("node:17001", "node:17000"),
+            incarnation,
+        ))
+    }
+
+    /// A tombstone records no rank, so recovery treats it as a first boot. The
+    /// node never gets that far in practice: `ggap-node` refuses to start a node
+    /// its own persisted directory says was retired.
+    #[test]
+    fn a_tombstoned_self_entry_recovers_no_rank() {
+        let (store, _tempdir) = store();
+        DirectoryStore::new(store.clone())
+            .save(&[(SELF, DirectoryEntry::Removed)])
+            .unwrap();
+        corrupt_the_counter(&store);
+
+        assert_eq!(counter(store).advance().unwrap(), 1);
     }
 
     #[test]

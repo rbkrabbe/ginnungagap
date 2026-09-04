@@ -41,6 +41,15 @@ production paths always supply both (`AddLearner` rejects an empty
 client API. A descriptor with neither address describes no node and the
 directory skips it.
 
+## `DirectoryEntry`
+
+What the directory holds for one node id: `Live(NodeDescriptor)`, or `Removed`
+once an operator has retired it. The tombstone carries no addresses and beats
+every descriptor for its id whatever the incarnation, so no peer's stale copy
+and no restart brings the node back. A retired id is therefore never reused —
+the address it leaves behind is free at once, the id is not. See
+`docs/ggap-consensus.md` for how a removal is issued and how it spreads.
+
 ## `KvEntry`
 
 The canonical in-memory and on-disk representation of a key-value record.

@@ -40,6 +40,7 @@ fn gossip_from(sender: u64, nodes: &[(u64, NodeDescriptor)]) -> GossipState {
                 cluster_addr: d.addrs.cluster_addr.clone(),
                 client_addr: d.addrs.client_addr.clone(),
                 incarnation: d.incarnation,
+                removed: false,
             })
             .collect(),
         shards: vec![],
@@ -220,4 +221,57 @@ async fn a_corrupt_record_starts_empty_and_still_converges() {
     )
     .await;
     assert_eq!(registry.directory_addr(2).await, Some("node2:17001".into()));
+}
+
+/// A removal has to outlive the restart of every node that heard it, and the
+/// peer that gossips its old copy afterwards is the reason: nothing in the
+/// system re-derives a tombstone, so a directory that came back without one
+/// would take the resurrected entry as news.
+#[tokio::test]
+async fn a_tombstone_survives_a_restart_and_the_gossip_that_follows_it() {
+    let tempdir = TempDir::new().unwrap();
+
+    {
+        let store = FjallStore::open(tempdir.path()).unwrap();
+        let registry = Arc::new(ShardRegistry::new(1, []));
+        merge_gossip_state(
+            &registry,
+            gossip_from(
+                2,
+                &[
+                    (2, desc("node2:17001", "node2:17000", 1)),
+                    (3, desc("node3:17001", "node3:17000", 1)),
+                ],
+            ),
+        )
+        .await;
+        registry.retire(3).await;
+        persist_directory(store, registry).await;
+    }
+
+    let store = FjallStore::open(tempdir.path()).unwrap();
+    let registry = ShardRegistry::new(1, []);
+    registry
+        .merge_directory(DirectoryStore::new(store).load())
+        .await;
+    assert!(
+        registry.is_retired(3).await,
+        "the restart must restore the tombstone, not just the descriptors"
+    );
+
+    // Node 2 was partitioned across the removal and still holds node 3's
+    // descriptor, at a rank the tombstone knows nothing about.
+    merge_gossip_state(
+        &registry,
+        gossip_from(2, &[(3, desc("node3:17001", "node3:17000", 9))]),
+    )
+    .await;
+
+    assert!(registry.is_retired(3).await);
+    assert_eq!(registry.directory_addr(3).await, None);
+    assert_eq!(
+        registry.peers_excluding_self().await,
+        vec![(2, "node2:17001".to_string())],
+        "a retired node must not come back as a gossip target"
+    );
 }

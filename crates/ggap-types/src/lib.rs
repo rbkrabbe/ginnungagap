@@ -124,6 +124,46 @@ impl NodeDescriptor {
     }
 }
 
+/// What the directory holds for one node id: either where it is, or that it is
+/// gone for good.
+///
+/// [`Self::Removed`] is an absolute tombstone. It outranks every descriptor for
+/// that id at any incarnation — a copy a partitioned peer still holds, and the
+/// node's own publication after a restart alike — because a removal that any
+/// incarnation could outbid is a removal gossip undoes. The consequence is that
+/// a retired id stays retired for the cluster's lifetime: reusing the hardware
+/// means a fresh node id, the same rule a wiped data dir already imposes.
+///
+/// A tombstone carries no addresses. Resolving one yields nothing, so a retired
+/// node is neither dialled nor gossiped with.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum DirectoryEntry {
+    /// Where the node says it is.
+    Live(NodeDescriptor),
+    /// The node has been removed from the cluster.
+    Removed,
+}
+
+impl DirectoryEntry {
+    /// The descriptor, or `None` for a tombstone.
+    pub fn descriptor(&self) -> Option<&NodeDescriptor> {
+        match self {
+            DirectoryEntry::Live(desc) => Some(desc),
+            DirectoryEntry::Removed => None,
+        }
+    }
+
+    pub fn is_removed(&self) -> bool {
+        matches!(self, DirectoryEntry::Removed)
+    }
+}
+
+impl From<NodeDescriptor> for DirectoryEntry {
+    fn from(desc: NodeDescriptor) -> Self {
+        DirectoryEntry::Live(desc)
+    }
+}
+
 /// Stored in last_applied metadata
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogId {

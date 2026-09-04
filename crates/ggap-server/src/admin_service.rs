@@ -1,15 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use ggap_consensus::gossip::broadcast_removal;
 use ggap_consensus::{OpenRaftNode, ShardEntry, ShardRegistry, ShardRouter, SplitCoordinator};
 use ggap_proto::v1::{
-    admin_service_server::AdminService, AddLearnerRequest, AddLearnerResponse,
-    ChangeMembershipRequest, ChangeMembershipResponse, ClusterStatusRequest, ClusterStatusResponse,
-    ListShardsRequest, ListShardsResponse, NodeInfo, ShardInfoProto, SplitShardRequest,
-    SplitShardResponse,
+    admin_service_client::AdminServiceClient, admin_service_server::AdminService,
+    AddLearnerRequest, AddLearnerResponse, ChangeMembershipRequest, ChangeMembershipResponse,
+    ClusterStatusRequest, ClusterStatusResponse, ListShardsRequest, ListShardsResponse, NodeInfo,
+    RemoveNodeRequest, RemoveNodeResponse, ShardInfoProto, SplitShardRequest, SplitShardResponse,
 };
 use ggap_storage::ShardMap;
 use ggap_types::NodeAddrs;
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::convert::ggap_to_status;
@@ -22,7 +25,16 @@ pub struct AdminServiceImpl {
     /// Cluster-wide gossiped view, used to answer status for shards this node
     /// does not host locally.
     registry: Arc<ShardRegistry>,
+    /// Cancelled when this node has retired itself, so the binary can shut the
+    /// process down. `None` in harnesses that have no process to end — they
+    /// observe the tombstone in the registry instead.
+    retired: Option<CancellationToken>,
 }
+
+/// How long `RemoveNode` waits on the node it is retiring, and on the peers it
+/// hands the tombstone to. An operator RPC, so a couple of seconds of patience
+/// costs nothing and a hang costs the call.
+const REMOVE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 // These helpers feed the tonic trait methods directly, so their error type is
 // `tonic::Status` whether we like it or not — 176 bytes against the lint's
@@ -40,7 +52,14 @@ impl AdminServiceImpl {
             split_coordinator,
             shard_map,
             registry,
+            retired: None,
         }
+    }
+
+    /// Give this service a token to cancel once the node has retired itself.
+    pub fn with_retire_token(mut self, retired: CancellationToken) -> Self {
+        self.retired = Some(retired);
+        self
     }
 
     async fn node_for_shard(&self, shard_id: u64) -> Result<Arc<OpenRaftNode>, Status> {
@@ -139,6 +158,15 @@ impl AdminServiceImpl {
             return Err(Status::invalid_argument("client_addr must not be empty"));
         }
 
+        // A retired id can never be resolved again, so a learner added under one
+        // would be in the membership and unreachable forever.
+        if self.registry.is_retired(node_info.node_id).await {
+            return Err(Status::failed_precondition(format!(
+                "node {} was removed from the cluster; a retired id is never reused",
+                node_info.node_id
+            )));
+        }
+
         let raft_node = self.node_for_shard(req.shard_id.unwrap_or(0)).await?;
         match raft_node
             .add_learner(
@@ -162,6 +190,178 @@ impl AdminServiceImpl {
                 }))
             }
         }
+    }
+
+    /// Retire a node from the directory, cluster-wide and for good.
+    ///
+    /// Whoever is asked either *is* the target or forwards to it: only the
+    /// target knows which shards it still belongs to, and only the target can
+    /// author its own descriptor. A target that cannot be reached is the sole
+    /// exception, and the only way to retire hardware that is already gone.
+    async fn do_remove_node(
+        &self,
+        req: RemoveNodeRequest,
+    ) -> Result<Response<RemoveNodeResponse>, Status> {
+        if req.node_id == 0 {
+            return Err(Status::invalid_argument("node_id must be > 0"));
+        }
+        if req.node_id == self.registry.self_node_id() {
+            return self.retire_self().await;
+        }
+        if self.registry.is_retired(req.node_id).await {
+            // Already done, and a removal is never undone — so say so rather
+            // than dialling an address the tombstone has already erased.
+            return Ok(Response::new(RemoveNodeResponse {
+                ok: true,
+                error: String::new(),
+                confirmed_by_node: false,
+            }));
+        }
+
+        // An entry that maps another id to this node's own address is the
+        // corruption tk-8d80's join check exists to prevent. Forwarding to it
+        // would dial ourselves and recurse until the timeouts collapse it, and
+        // tombstoning "on its behalf" would retire a stranger on the strength of
+        // a bad entry. Neither is a removal, so refuse and say what is wrong.
+        let self_addr = self
+            .registry
+            .directory_addr(self.registry.self_node_id())
+            .await;
+        if let (Some(target), Some(mine)) = (
+            self.registry.directory_addr(req.node_id).await,
+            self_addr.as_ref(),
+        ) {
+            if target == *mine {
+                return Err(Status::failed_precondition(format!(
+                    "node {}'s directory entry names this node's own address {target}; \
+                     the entry is wrong, and removing it would retire the wrong node",
+                    req.node_id
+                )));
+            }
+        }
+
+        match self.forward_removal(req.node_id).await {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(e) => {
+                // Unreachable. Tombstone on its behalf: this is what a
+                // decommissioned node's entry needs, and there is nobody left
+                // to write it. tk-ad1d gates this on the node being demonstrably
+                // dead rather than merely silent right now.
+                tracing::warn!(
+                    node_id = req.node_id,
+                    error = %e,
+                    "removal target did not answer; tombstoning it on its behalf"
+                );
+                self.registry.retire(req.node_id).await;
+                Ok(Response::new(RemoveNodeResponse {
+                    ok: true,
+                    error: String::new(),
+                    confirmed_by_node: false,
+                }))
+            }
+        }
+    }
+
+    /// Ask the target to retire itself. `Err` means it could not be asked, not
+    /// that it refused — a refusal comes back as an `ok: false` response.
+    async fn forward_removal(&self, node_id: u64) -> Result<RemoveNodeResponse, String> {
+        let addr = self
+            .registry
+            .directory_addr(node_id)
+            .await
+            .ok_or_else(|| format!("no directory entry for node {node_id}"))?;
+
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .map_err(|e| e.to_string())?;
+        let channel = tokio::time::timeout(REMOVE_RPC_TIMEOUT, endpoint.connect())
+            .await
+            .map_err(|_| "connect timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+
+        let resp = tokio::time::timeout(
+            REMOVE_RPC_TIMEOUT,
+            AdminServiceClient::new(channel).remove_node(RemoveNodeRequest { node_id }),
+        )
+        .await
+        .map_err(|_| "remove_node timed out".to_string())?
+        .map_err(|e| e.to_string())?
+        .into_inner();
+
+        Ok(resp)
+    }
+
+    /// The authoritative half: this node names the shards it still belongs to
+    /// from its own Raft membership, refuses while there are any, and otherwise
+    /// tombstones itself and pushes that out before it stops.
+    async fn retire_self(&self) -> Result<Response<RemoveNodeResponse>, Status> {
+        let self_id = self.registry.self_node_id();
+
+        let mut still_in: Vec<u64> = Vec::new();
+        for shard_id in self.router.local_shard_ids().await {
+            let Some(node) = self.router.get_node(shard_id).await else {
+                continue;
+            };
+            let status = node.cluster_status();
+            if status.voters.contains(&self_id) || status.learners.contains(&self_id) {
+                still_in.push(shard_id);
+            }
+        }
+        if !still_in.is_empty() {
+            still_in.sort_unstable();
+            let shards = still_in
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(Response::new(RemoveNodeResponse {
+                ok: false,
+                error: format!(
+                    "node {self_id} is still a member of shard(s) {shards}; \
+                     change membership to drop it before removing it"
+                ),
+                confirmed_by_node: true,
+            }));
+        }
+
+        // A tombstone nobody else has heard dies with this process, and this
+        // process is about to end — so hand it over before recording it. A
+        // removal cannot be taken back, so a node that reached nobody must not
+        // be left retired in its own directory and running.
+        //
+        // Delivery is counted by the response, so a peer that merged the
+        // tombstone and then failed to answer is counted as a miss: the node
+        // stays up and reports failure while the cluster has already retired it.
+        // Erring this way is deliberate — the operator retries and the node
+        // exits, where the opposite error leaves a node retired that nobody
+        // else believes is gone.
+        let peers = self.registry.peers_excluding_self().await.len();
+        let delivered =
+            broadcast_removal(&self.registry, self_id, self_id, REMOVE_RPC_TIMEOUT).await;
+        if delivered == 0 && peers > 0 {
+            return Ok(Response::new(RemoveNodeResponse {
+                ok: false,
+                error: format!(
+                    "node {self_id} reached none of its {peers} peer(s), so the removal \
+                     would be lost when it stops; it stays in the cluster"
+                ),
+                confirmed_by_node: true,
+            }));
+        }
+        self.registry.retire(self_id).await;
+
+        tracing::info!(
+            node_id = self_id,
+            delivered,
+            "retired from the directory; shutting down"
+        );
+        if let Some(retired) = &self.retired {
+            retired.cancel();
+        }
+        Ok(Response::new(RemoveNodeResponse {
+            ok: true,
+            error: String::new(),
+            confirmed_by_node: true,
+        }))
     }
 
     async fn do_change_membership(
@@ -332,6 +532,20 @@ impl AdminService for AdminServiceImpl {
         let result = self.do_add_learner(request.into_inner()).await;
         record(
             "ginnungagap.v1.AdminService/AddLearner",
+            &result,
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn remove_node(
+        &self,
+        request: Request<RemoveNodeRequest>,
+    ) -> Result<Response<RemoveNodeResponse>, Status> {
+        let start = tokio::time::Instant::now();
+        let result = self.do_remove_node(request.into_inner()).await;
+        record(
+            "ginnungagap.v1.AdminService/RemoveNode",
             &result,
             start.elapsed(),
         );

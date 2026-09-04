@@ -69,7 +69,18 @@ All implemented and served on the cluster-facing port:
   opaque bytes decoded inside `ggap-consensus`; the server never sees openraft
   types.
 - **`AdminService`** — `ClusterStatus`, `AddLearner`, `ChangeMembership`,
-  `SplitShard`, `ListShards`. Shard-aware, enriched with per-shard Raft state.
-  For shards a node does not host locally it zeroes out (never fabricates)
-  consensus fields — closing that gap needs the cluster-wide placement view.
+  `SplitShard`, `ListShards`, `RemoveNode`. Shard-aware, enriched with per-shard
+  Raft state. For shards a node does not host locally it zeroes out (never
+  fabricates) consensus fields — closing that gap needs the cluster-wide
+  placement view.
+
+  `RemoveNode` retires a node from the directory. Any node accepts the call and
+  forwards it to the target, which alone can name the shards it still belongs to
+  and alone authors its own entry; it refuses while it belongs to any, and
+  otherwise hands the tombstone to a peer before recording it and shutting down.
+  A target that does not answer is tombstoned on its behalf — the only way to
+  retire hardware that is already gone. The tombstone is absolute and a retired
+  id is never reused, so `AddLearner` refuses one. See `docs/ggap-consensus.md`
+  for the ordering rule. `ClusterServiceConfig::retired` is the token
+  `ggap-node` uses to stop the process afterwards.
 - **`GossipService`** — carries the shard-registry gossip between nodes.

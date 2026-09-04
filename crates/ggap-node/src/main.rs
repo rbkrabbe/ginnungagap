@@ -14,7 +14,7 @@ use ggap_consensus::{
     GgapStateMachine, GossipTask, OpenRaftCluster, OpenRaftNode, RaftMetricsTask, ShardRegistry,
     ShardRouter, SplitCoordinator, SplitCoordinatorConfig,
 };
-use ggap_server::{serve_client, serve_cluster, KvServiceConfig};
+use ggap_server::{serve_client, serve_cluster, ClusterServiceConfig, KvServiceConfig};
 use tokio_util::sync::CancellationToken;
 
 use ggap_storage::{
@@ -271,6 +271,19 @@ async fn main() -> anyhow::Result<()> {
         entries = persisted_directory.len(),
         "restored the persisted directory"
     );
+    // A node whose own entry is a tombstone was retired. Nothing it publishes
+    // can outrank that, so it would run as a zombie: in a membership, resolvable
+    // by nobody, dialled by nobody. Refuse the start and say what to do instead.
+    if persisted_directory
+        .iter()
+        .any(|(id, entry)| *id == cli.node_id && entry.is_removed())
+    {
+        anyhow::bail!(
+            "node {} was removed from the cluster; a retired id is never reused. \
+             Start this host under a fresh --node-id.",
+            cli.node_id
+        );
+    }
     registry.merge_directory(persisted_directory).await;
 
     // 5. Start a Raft group for each shard in the ShardMap.
@@ -423,6 +436,26 @@ async fn main() -> anyhow::Result<()> {
         watch_output_buffer: 128,
     };
 
+    // Cancelled by AdminService.RemoveNode once this node has tombstoned itself
+    // and handed the tombstone to a peer. Nothing can resolve it any more, so
+    // there is no work left to do.
+    let retired = CancellationToken::new();
+    tokio::spawn({
+        let retired = retired.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            retired.cancelled().await;
+            shutdown.cancel();
+            // Neither server has a graceful-stop path wired, so the process
+            // ends by exiting. Every fjall write is already durable, and the
+            // sleep gives the RemoveNode response time to reach the caller
+            // before the listeners go with the process.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tracing::info!("retired from the cluster; exiting");
+            std::process::exit(0);
+        }
+    });
+
     let shutdown_trigger = shutdown.clone();
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
@@ -457,7 +490,10 @@ async fn main() -> anyhow::Result<()> {
             split_coordinator,
             shard_map,
             registry,
-            config.server.cors_allowed_origins,
+            ClusterServiceConfig {
+                cors_origins: config.server.cors_allowed_origins,
+                retired: Some(retired),
+            },
         ),
     )?;
 

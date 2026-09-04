@@ -27,6 +27,7 @@ fn gossip_from(sender: u64, nodes: &[(u64, NodeDescriptor)]) -> GossipState {
                 cluster_addr: d.addrs.cluster_addr.clone(),
                 client_addr: d.addrs.client_addr.clone(),
                 incarnation: d.incarnation,
+                removed: false,
             })
             .collect(),
         shards: vec![],

@@ -60,6 +60,25 @@ impl Default for KvServiceConfig {
     }
 }
 
+/// Configuration for the cluster-facing services (Raft, Admin, Gossip).
+#[derive(Clone, Debug, Default)]
+pub struct ClusterServiceConfig {
+    pub cors_origins: Vec<String>,
+    /// Cancelled once this node has retired itself through
+    /// `AdminService.RemoveNode`, so the caller can stop the process. Left unset
+    /// by harnesses, which have no process to end.
+    pub retired: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl ClusterServiceConfig {
+    pub fn with_cors_origins(cors_origins: Vec<String>) -> Self {
+        ClusterServiceConfig {
+            cors_origins,
+            retired: None,
+        }
+    }
+}
+
 /// Build a CORS layer for the given allowed origins.
 ///
 /// An empty `origins` list produces a restrictive layer (no origins allowed),
@@ -159,15 +178,16 @@ pub async fn serve_cluster(
     split_coordinator: Arc<SplitCoordinator>,
     shard_map: Arc<ShardMap>,
     registry: Arc<ShardRegistry>,
-    cors_origins: Vec<String>,
+    config: ClusterServiceConfig,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
-    let cors = build_cors_layer(&cors_origins);
+    let cors = build_cors_layer(&config.cors_origins);
     tracing::info!(%addr, "cluster gRPC server starting");
-    let admin = AdminServiceImpl::new(
+    let admin = build_admin(
+        &config,
         router.clone(),
         split_coordinator,
         shard_map,
@@ -190,6 +210,20 @@ pub async fn serve_cluster(
         .map_err(Into::into)
 }
 
+fn build_admin(
+    config: &ClusterServiceConfig,
+    router: Arc<ShardRouter>,
+    split_coordinator: Arc<SplitCoordinator>,
+    shard_map: Arc<ShardMap>,
+    registry: Arc<ShardRegistry>,
+) -> AdminServiceImpl {
+    let admin = AdminServiceImpl::new(router, split_coordinator, shard_map, registry);
+    match &config.retired {
+        Some(token) => admin.with_retire_token(token.clone()),
+        None => admin,
+    }
+}
+
 /// Variant of [`serve_cluster`] that accepts a pre-bound [`TcpListener`].
 pub async fn serve_cluster_with_listener(
     listener: TcpListener,
@@ -197,14 +231,15 @@ pub async fn serve_cluster_with_listener(
     split_coordinator: Arc<SplitCoordinator>,
     shard_map: Arc<ShardMap>,
     registry: Arc<ShardRegistry>,
-    cors_origins: Vec<String>,
+    config: ClusterServiceConfig,
 ) -> anyhow::Result<()> {
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(ggap_proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build reflection service");
-    let cors = build_cors_layer(&cors_origins);
-    let admin = AdminServiceImpl::new(
+    let cors = build_cors_layer(&config.cors_origins);
+    let admin = build_admin(
+        &config,
         router.clone(),
         split_coordinator,
         shard_map,

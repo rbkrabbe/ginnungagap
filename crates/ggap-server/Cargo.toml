@@ -24,13 +24,13 @@ opentelemetry-http = { workspace = true }
 http           = { workspace = true }
 anyhow         = { workspace = true }
 metrics        = { workspace = true }
+tokio-util     = { workspace = true }
 
 [dev-dependencies]
 ggap-storage = { path = "../ggap-storage" }
 bincode       = { workspace = true }
 openraft      = { workspace = true }
 tempfile      = { workspace = true }
-tokio-util    = { workspace = true }
 futures       = { workspace = true }
 uuid          = { workspace = true }
 rand          = "0.10"
