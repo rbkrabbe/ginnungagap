@@ -25,10 +25,21 @@ the leader and return the leader's response verbatim.
 
 `LeaderForwarder` resolves the target from `GgapError::NotLeader.leader_id`
 (tk-3cd2 put it there precisely so the address is looked up fresh rather than
-trusted from the error), maps it through `registry.client_addr()`, dials a
-channel cached per node id, and replays once with `ggap-forwarded` set. Unknown
-leader_id, unknown client_addr, or a NotLeader from the target: fail fast with
-the original status (Q2).
+trusted from the error), maps it through `registry.client_addr()` **on every
+forward**, and replays once with `ggap-forwarded` set. Unknown leader_id,
+unknown client_addr, or a NotLeader from the target: fail fast with the
+original status (Q2).
+
+Resolution happens per forward, never once per node id. A channel may be held
+between forwards, but only as a re-dial saver keyed by the address it was
+dialled at: when the directory answers with a different address for the same
+id, the held channel is discarded and the new address dialled. `GgapNetwork`
+in `ggap-consensus/src/network.rs` is the worked example — `connect()` calls
+`resolve()` unconditionally and `needs_redial()` compares the answer against
+the address in hand. Mirror that shape rather than a bare
+`HashMap<u64, Channel>`: after tk-ef8d a node's address changes across a
+restart as a supported operation, so a cache keyed by id alone pins the
+forwarder to a dead address for the life of the process.
 
 The forward decision lives in the `KvService` trait impls, not inside the `do_*`
 methods: each leader-required method clones its message, calls `do_*` as today,
@@ -47,9 +58,10 @@ shard.
 ## Changes
 
 - `crates/ggap-server/src/forward.rs` (new) — `LeaderForwarder`: registry +
-  `RwLock<HashMap<u64, Channel>>`, lazy connect mirroring network.rs:71; sets
+  `RwLock<HashMap<u64, (String, Channel)>>` keyed by id and holding the address
+  dialled, lazy connect mirroring `GgapNetwork::connect`/`needs_redial`; sets
   `ggap-forwarded`, copies the inbound `grpc-timeout` verbatim, injects trace
-  context via the `MetadataInjector` pattern at network.rs:135.
+  context via `MetadataInjector`, both in `ggap-consensus/src/network.rs`.
 - `crates/ggap-server/src/kv_service.rs` — one `maybe_forward` helper plus its
   use in `put`, `delete`, `compare_and_swap`, `get` and `scan` (trait-impl layer,
   ~line 360-403). `do_scan` gains the hop-0-only NotLeader rule.
@@ -79,6 +91,8 @@ shard.
       and resuming from that token returns the rest.
 - [ ] Repeated forwards to one target dial once — assert the cache, not just the
       result.
+- [ ] A target whose directory address has changed is re-dialled at the new one
+      on the next forward, with no new forwarder and no process restart.
 - [ ] Forwarded requests are distinguishable from local ones in metrics/traces.
 - [ ] Watch still serves locally.
 - [ ] Full checklist green: fmt, clippy -D warnings, build, test.
@@ -92,10 +106,10 @@ shard.
 - The message clone is on the write path. Check `benches/kv_write.rs` before and
   after; if it registers, that is a reason to revisit the trait-impl-layer choice
   above, not to widen scope silently.
-- The channel cache is never invalidated. A leader that restarts leaves a dead
-  entry; tonic reconnects a broken `Channel` on its own, but a node whose
-  client_addr *changed* would be dialled at the old one until process restart.
-  Acceptable while addresses are StatefulSet-stable — say so in a comment rather
-  than leaving it implicit.
+- Stale directory data outlives a re-dial. Re-resolving per forward handles a
+  changed address, but a leader that moved and has not yet republished its
+  descriptor resolves to the old one and the forward fails — the same
+  fail-fast the client already retries through, not a new failure mode. Do not
+  reintroduce the id-keyed cache to smooth it over.
 - `serve_client`'s signature changes; `three_node_cluster.rs` and
   `trace_propagation.rs` both construct it.

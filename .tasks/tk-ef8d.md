@@ -9,9 +9,10 @@ blocked_by = []
 tags = []
 created = "2026-08-15T10:11:08+00:00"
 spec_approved = true
-review = "none"
+review = "fail"
 touched = []
 spec_approved_at = "2026-08-15T10:42:30+00:00"
+reviewed_at = "2026-09-04T18:23:21+00:00"
 +++
 ## Goal
 
@@ -140,3 +141,20 @@ tk-11b6 — which stops being vestigial and becomes required.
 - a) Fail the RPC and let openraft back off and retry — matches how an unreachable peer already behaves, so no new state machine; a cold node logs resolution failures until gossip converges
 - b) Block the send until the address is known, with a timeout — fewer spurious failures in the seconds after boot; risks holding openraft's send path on a lock or channel, which is a worse failure than a retry
 > Fail the RPC and let openraft back off and retry. An unresolvable node id behaves exactly like an unreachable peer, which openraft already handles, so this adds no new state machine and never holds its send path on a lock or channel.
+
+## Review 2026-09-04T18:23:21+00:00 — fail
+
+Whole-epic re-read of 71478ef..HEAD (11 commits, incl. the adjacent tk-c47e and tk-239e/tk-d9a8). Checklist run myself and green: fmt --check clean, clippy --all-targets --all-features -D warnings clean, cargo test --all --all-features all suites 0 failures. The epic's design contract is met — GgapNode is empty (config.rs:18), bootstrap/AddLearner/source_members all carry ids (main.rs:319-329, node.rs:190, split.rs:126-138), GgapNetwork re-resolves per RPC and only caches a channel keyed by the address it was dialled at (network.rs:96-133), not_leader resolves through the directory (node.rs:38-48), ids_to_node_infos is one path for hosted and non-hosted (admin_service.rs:124-140), Q3's fail-the-RPC and Q1's boot counter are both pinned by tests. Nothing anywhere reads or reconstructs an address out of membership. Failing on the following.
+
+1. Three source comments still assert the inverted invariant, which falsifies tk-10d8's ticked acceptance box 'No doc describes the directory as derived from membership':
+   - crates/ggap-consensus/src/network.rs:57 — 'Membership still carries addresses, but the network path takes none of them'. Written by tk-cc52 when that was true; tk-51b4 (35c97c3) deleted the addresses and left the comment. This is the first file a reader opens to understand resolution, and it states the opposite of the epic.
+   - crates/ggap-node/src/main.rs:194 — 'Needed before any Raft group starts, because seed bootstrap puts the advertised address into the initial membership.' Seed bootstrap builds BTreeMap<u64, GgapNode{}> at main.rs:326; no address enters it. The stated reason for the ordering is wrong (the real reason is the registry, given correctly 60 lines later at main.rs:250-256).
+   - crates/ggap-server/tests/three_node_cluster.rs:55-56 — 'The advertised form of client_addr — what goes into Raft membership and, derived from it, the directory.' This is the only surviving instance of the exact 'derived from membership' phrasing tk-10d8 claims to have eliminated; grep for it returns this line alone.
+
+2. A node that retires itself gracefully never persists its own tombstone, so the boot guard written for that case cannot fire on its primary path. admin_service.rs:326 calls registry.retire(self_id) then cancels the retire token; main.rs:428-441 reacts by calling shutdown.cancel() and exiting 500ms later. GossipTask::run (gossip.rs:104-117) selects on that cancel token before its next tick, so persist_directory never runs after the retire and DirectoryStore never sees DirectoryEntry::Removed for self. Restart that node and the check at main.rs:276-286 — 'A node whose own entry is a tombstone was retired... Refuse the start' — reads a persisted directory with no self-tombstone and lets it boot as a zombie: in nobody's directory, resolvable by nobody, refused only on the restart *after* gossip has re-taught it its own tombstone. tk-c47e's reviewer flagged this shape for the tombstoned-on-its-behalf path and parked it on tk-ad1d; it also applies to the self-retirement path, which is the one the guard was written for. Either persist before cancelling, or the guard is decoration. No test covers main.rs:276 at all.
+
+3. boot_counter.rs:74-88: advance() only warns when the counter write fails, on the reasoning that 'the self-publication wins ties back on the following tick'. merge_directory (registry.rs:170-174) gives ties to the *incoming* entry, and gossip_request re-snapshots the registry per exchange (gossip.rs:243), so between ticks the node forwards a peer's stale address about itself — which the module doc at boot_counter.rs:14-25 calls the unrecoverable failure that justifies failing the boot. Narrow (needs counter-write failure plus an address change), but the comment claims a guarantee the merge rule does not give. The same tie hole makes the wipe-plus-move caveat oscillate rather than simply lose when the peer's rank is equal; boot_incarnation.rs:176 only pins the strictly-higher case.
+
+Stated plainly, not a fail on its own: the epic's actual goal — an operator restarts a node at a new --cluster-addr and the cluster follows — is covered only in pieces. boot_incarnation.rs drives real FjallStore reopens and the real BootCounter but merges into bare ShardRegistry objects with no Raft; network.rs:409 proves one client re-dials a moved target against a live EchoRaft; three_node_cluster proves addresses are reported out of the directory. Nothing composes them: no test restarts a member of a running Raft cluster at a new address and shows replication resume. Given main.rs's startup path is untested by construction (tk-abf8's own acceptance box admits this for bootstrap_members), the operator-visible feature is inferred from three separately-verified halves.
+
+Accepted as-is: the storage-format break (KvCommand::Split source_members, shard map moving to the node keyspace, DirectoryEntry) is covered by the epic's on-disk-compatibility non-goal; the tombstone's absolute ordering, the delivered==0 refusal and the self-address guard in do_remove_node all match tk-c47e Q2/Q3; no test was deleted, skipped or loosened (split_carries_member_ids_to_new_shard gained a raw-bytes scan, client_addr_comes_from_membership_without_gossip was replaced by a stronger directory-sourced assertion); registry.rs:209 node_id_at still has no production caller but now earns its keep as tk-c47e's address-reuse assertion.
