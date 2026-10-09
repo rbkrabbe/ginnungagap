@@ -1,0 +1,16 @@
+# The toolchain every build uses, CI and local alike.
+#
+# Pinned rather than tracking `stable` because the four-check list in
+# CLAUDE.md is only meaningful if it means the same thing everywhere: clippy
+# gains lints between releases, and `-D warnings` turns each new one into a
+# build failure on code nobody wrote. `ggap-proto`'s tonic output is the
+# exposed surface — 17 `double_must_use` errors inside generated
+# `#[async_trait]` traits under clippy 0.1.99, from a `#[must_use]` prost and
+# tonic emit together. Nothing in this repo can fix those; only the pin makes
+# a green local run mean a green CI run.
+#
+# Raising it is a deliberate change: bump the version here, run the full
+# checklist, and fix whatever the new clippy finds in the same PR.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
