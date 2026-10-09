@@ -2,7 +2,7 @@
 id = "tk-ad4e"
 title = "CI tracks rustup stable, so a new clippy breaks every code PR on generated proto code"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "s"
 priority = 2
 blocked_by = []
@@ -14,6 +14,7 @@ touched = []
 discovered_from = "tk-92e0"
 resized_from = "m"
 base = "05c02c0f13ab3d6f09aba19e20deacb95be32642"
+closed = "2026-10-09T18:52:52+00:00"
 +++
 ## Context
 
@@ -49,4 +50,5 @@ new lint will not undo.
 - [x] CI and a local run use the same toolchain, named in one place.
 - [x] Full checklist green under the pin: fmt, clippy -D warnings, build,
       test (25 result lines, 0 failures).
-- [ ] A code-touching PR goes green on CI.
+- [x] A code-touching PR goes green on CI — this one, 3m21s, Rust steps
+      run (the diff touches `ci.yml`, so the skip path did not apply).
