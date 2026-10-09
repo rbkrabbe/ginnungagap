@@ -2,7 +2,7 @@
 id = "tk-5a4b"
 title = "Three comments still say membership carries addresses"
 kind = "task"
-status = "open"
+status = "in_progress"
 size = "s"
 priority = 2
 blocked_by = []
@@ -13,6 +13,7 @@ review = "none"
 touched = []
 discovered_from = "tk-0ae1"
 resized_from = "m"
+base = "05c02c0f13ab3d6f09aba19e20deacb95be32642"
 +++
 ## Context
 
@@ -42,7 +43,7 @@ Comments only; no behaviour changes.
 
 ## Acceptance
 
-- [ ] No comment claims membership carries an address, or the directory
+- [x] No comment claims membership carries an address, or the directory
       derives from it.
-- [ ] `main.rs`'s comment states the real reason `self_addrs` is built early.
-- [ ] Full checklist green: fmt, clippy -D warnings, build, test.
+- [x] `main.rs`'s comment states the real reason `self_addrs` is built early.
+- [x] Full checklist green: fmt, clippy -D warnings, build, test.
