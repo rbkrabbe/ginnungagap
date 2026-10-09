@@ -130,19 +130,29 @@ impl ShardRegistry {
         )
     }
 
-    /// Merge a batch of descriptors, ordered by incarnation: **highest wins**,
-    /// ties resolved in favour of the incoming entry.
+    /// Merge a batch of descriptors, ordered by incarnation: **strictly higher
+    /// wins**, so an equal rank keeps the entry already held.
     ///
     /// A descriptor is authored by the node it describes, so its incarnation is
     /// a clock over exactly one writer's publications and comparing two copies
     /// is unambiguous. That is what lets a node move: it restarts at a higher
-    /// incarnation and outbids every stale copy in flight.
+    /// incarnation and outbids every stale copy in flight. A rank is unique to
+    /// the boot that issued it — `BootCounter` refuses to start rather than
+    /// reissue one — so two ranked copies at one incarnation describe the same
+    /// node state, and keeping the one in hand costs nothing while denying a
+    /// late copy the chance to reinstate an address its sender has not yet
+    /// learned is gone.
     ///
-    /// Incarnation 0 is reserved for a descriptor written on a node's behalf:
-    /// `AddLearner` records where a joining node is before that node has said
-    /// so itself. A node's own publications start at 1 and therefore always
-    /// supersede such a hint. Ties go to the incoming entry, which keeps a feed
-    /// of hints last-write-wins among themselves.
+    /// **Incarnation 0 is not a rank; it is the absence of one.** It marks a
+    /// descriptor written on a node's behalf: `AddLearner` records where a
+    /// joining node is before that node has said so itself. Two such hints are
+    /// not two copies of one published fact but two separate assertions by an
+    /// operator, so the later one wins — which is the only way a join issued
+    /// with a mistyped address can be corrected, since the node named by it
+    /// cannot be dialled and so never publishes a rank of its own. A hint
+    /// still loses to any ranked descriptor, so a node's own publication at 1
+    /// or above supersedes it and authorship is never in doubt.
+    /// (`NodeDescriptor::hint` and this whole space go away with tk-8d80.)
     ///
     /// A descriptor is a whole value: merging one with no client address
     /// *clears* a previously-known one rather than treating the gap as
@@ -170,9 +180,23 @@ impl ShardRegistry {
                     if desc.addrs.cluster_addr.is_empty() && desc.addrs.client_addr.is_empty() {
                         continue;
                     }
-                    let outranked = existing
-                        .and_then(|e| e.descriptor())
-                        .is_some_and(|e| e.incarnation > desc.incarnation);
+                    // Strictly higher among ranked descriptors, so an equal
+                    // rank keeps the entry in hand: ranks are unique per boot,
+                    // so two ranked copies at one incarnation say the same
+                    // thing, and refusing the arriving one denies a peer that
+                    // has not heard of a move the chance to reinstate the
+                    // address it still holds.
+                    //
+                    // Rank 0 is exempt because it is not a rank (see the doc
+                    // comment): one hint replaces another, which is what makes
+                    // a mistyped `AddLearner` correctable by re-issuing it.
+                    let existing_rank =
+                        existing.and_then(|e| e.descriptor()).map(|e| e.incarnation);
+                    let outranked = match existing_rank {
+                        Some(held) if desc.incarnation == 0 => held > 0,
+                        Some(held) => held >= desc.incarnation,
+                        None => false,
+                    };
                     if !outranked {
                         dir.insert(node_id, entry);
                     }
@@ -506,14 +530,60 @@ mod tests {
         assert_eq!(reg.directory_addr(3).await, Some("c".into()));
     }
 
-    /// Whole-value replacement at equal incarnation: a descriptor overwrites
-    /// both fields together, never one at a time.
+    /// An equal rank keeps the entry already held. Ranks are unique per boot,
+    /// so the only way to reach this is a peer forwarding its copy of a node
+    /// at the rank already recorded — and a copy arriving late must not
+    /// displace the one in hand.
+    #[tokio::test]
+    async fn merge_directory_keeps_the_entry_it_holds_at_an_equal_rank() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("current:17001", "current:17000", 4))])
+            .await;
+        reg.merge_directory([(2, own("stale:17001", "stale:17000", 4))])
+            .await;
+
+        assert_eq!(reg.directory_addr(2).await, Some("current:17001".into()));
+        assert_eq!(reg.client_addr(2).await, Some("current:17000".into()));
+    }
+
+    /// A hint replaces a hint: rank 0 is not a rank, so the later assertion
+    /// wins. This is the correctable case — an `AddLearner` issued with the
+    /// wrong address, re-issued with the right one. The node it names cannot
+    /// be dialled, so it never publishes a rank of its own and nothing else
+    /// could ever supersede the mistake.
+    #[tokio::test]
+    async fn a_later_hint_replaces_an_earlier_one() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, hint(NodeAddrs::new("typo:17001", "typo:17000")))])
+            .await;
+        reg.merge_directory([(2, hint(NodeAddrs::new("right:17001", "right:17000")))])
+            .await;
+
+        assert_eq!(reg.directory_addr(2).await, Some("right:17001".into()));
+        assert_eq!(reg.client_addr(2).await, Some("right:17000".into()));
+    }
+
+    /// And a hint never unseats a rank: once the node has spoken for itself,
+    /// no descriptor written on its behalf can overwrite it.
+    #[tokio::test]
+    async fn a_hint_loses_to_a_node_that_has_published_for_itself() {
+        let reg = ShardRegistry::new(1, []);
+        reg.merge_directory([(2, own("self:17001", "self:17000", 1))])
+            .await;
+        reg.merge_directory([(2, hint(NodeAddrs::new("hint:17001", "hint:17000")))])
+            .await;
+
+        assert_eq!(reg.directory_addr(2).await, Some("self:17001".into()));
+    }
+
+    /// Whole-value replacement: a descriptor that outranks the entry in hand
+    /// overwrites both fields together, never one at a time.
     #[tokio::test]
     async fn merge_directory_replaces_whole_entry() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, hint(NodeAddrs::new("host:17001", "host:17000")))])
+        reg.merge_directory([(2, own("host:17001", "host:17000", 1))])
             .await;
-        reg.merge_directory([(2, hint(NodeAddrs::new("moved:17001", "moved:17000")))])
+        reg.merge_directory([(2, own("moved:17001", "moved:17000", 2))])
             .await;
 
         assert_eq!(reg.directory_addr(2).await, Some("moved:17001".into()));
@@ -529,10 +599,13 @@ mod tests {
     #[tokio::test]
     async fn merge_directory_clears_a_client_addr_the_new_entry_lacks() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, hint(NodeAddrs::new("host:17001", "host:17000")))])
+        reg.merge_directory([(2, own("host:17001", "host:17000", 1))])
             .await;
-        reg.merge_directory([(2, hint(NodeAddrs::cluster_only("host:17001")))])
-            .await;
+        reg.merge_directory([(
+            2,
+            NodeDescriptor::new(NodeAddrs::cluster_only("host:17001"), 2),
+        )])
+        .await;
 
         assert_eq!(reg.client_addr(2).await, None);
         assert_eq!(reg.directory_addr(2).await, Some("host:17001".into()));
@@ -546,10 +619,9 @@ mod tests {
     #[tokio::test]
     async fn merge_directory_clears_a_cluster_addr_the_new_entry_lacks() {
         let reg = ShardRegistry::new(1, []);
-        reg.merge_directory([(2, hint(NodeAddrs::new("host:17001", "host:17000")))])
+        reg.merge_directory([(2, own("host:17001", "host:17000", 1))])
             .await;
-        reg.merge_directory([(2, hint(NodeAddrs::new("", "host:17000")))])
-            .await;
+        reg.merge_directory([(2, own("", "host:17000", 2))]).await;
 
         assert_eq!(reg.directory_addr(2).await, None);
         assert_eq!(reg.client_addr(2).await, Some("host:17000".into()));

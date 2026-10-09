@@ -58,16 +58,32 @@ and remove the old id from each shard's membership, since nothing else will.
 
 ### `cannot establish this node's incarnation`
 
-The node refused to start because neither the boot counter nor the persisted
-directory could be read, so it cannot tell what rank it last published. Starting
-anyway would publish at 1, below whatever the peers hold, and the node would
-spend its life unable to correct its own address while looking healthy — so this
-is deliberately an outage rather than a silent one.
+The node refused to start because it could not settle on a rank to publish at.
+Two causes reach this message, and they are recovered differently. Both are
+deliberately an outage rather than a silent failure, because a node that starts
+anyway looks healthy while being unable to correct its own address.
+
+**1. Neither the boot counter nor the persisted directory could be read.** The
+node cannot tell what rank it last published; starting would publish at 1,
+below whatever its peers hold.
 
 Both records live in the `node` keyspace, so losing both points at the data dir
 rather than at one key. Recover by treating it as a wipe: clear the data dir and
 start the node under a fresh `--node-id`, removing the old id from each shard's
-membership.
+membership. The id is burned because the node cannot prove what it published
+before.
+
+**2. The rank could not be written back.** This boot would be ranked correctly;
+the next one is the problem, because it would read the stale counter and
+reissue the same number, and an equal rank keeps the entry already held — so an
+address changed between those two boots would never install, with no symptom
+but a move that did not happen.
+
+*Do not wipe anything.* Both records are intact and nothing was published at
+the refused rank — the counter still holds the previous value, and the next
+start takes the rank normally. The data directory is almost certainly full or
+read-only, which the Raft log will not survive either. Restore write access and
+restart; the node keeps its id, its data and its place in every membership.
 
 ## Known limitations
 

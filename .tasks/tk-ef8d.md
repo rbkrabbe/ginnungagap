@@ -158,3 +158,26 @@ Whole-epic re-read of 71478ef..HEAD (11 commits, incl. the adjacent tk-c47e and 
 Stated plainly, not a fail on its own: the epic's actual goal — an operator restarts a node at a new --cluster-addr and the cluster follows — is covered only in pieces. boot_incarnation.rs drives real FjallStore reopens and the real BootCounter but merges into bare ShardRegistry objects with no Raft; network.rs:409 proves one client re-dials a moved target against a live EchoRaft; three_node_cluster proves addresses are reported out of the directory. Nothing composes them: no test restarts a member of a running Raft cluster at a new address and shows replication resume. Given main.rs's startup path is untested by construction (tk-abf8's own acceptance box admits this for bootstrap_members), the operator-visible feature is inferred from three separately-verified halves.
 
 Accepted as-is: the storage-format break (KvCommand::Split source_members, shard map moving to the node keyspace, DirectoryEntry) is covered by the epic's on-disk-compatibility non-goal; the tombstone's absolute ordering, the delivered==0 refusal and the self-address guard in do_remove_node all match tk-c47e Q2/Q3; no test was deleted, skipped or loosened (split_carries_member_ids_to_new_shard gained a raw-bytes scan, client_addr_comes_from_membership_without_gossip was replaced by a stronger directory-sourced assertion); registry.rs:209 node_id_at still has no production caller but now earns its keep as tk-c47e's address-reuse assertion.
+
+## Findings from that review, as tasks (2026-10-09)
+
+The review's three numbered findings, plus the unnumbered "stated plainly"
+paragraph about missing end-to-end coverage, were filed rather than fixed in
+place. This section is the pointer; each task holds its own reasoning.
+
+- **tk-5a4b** — three source comments still asserting the inverted invariant.
+  Done (#86).
+- **tk-92e0** — no end-to-end test of this epic's goal. Done (#87): a member
+  of a running cluster restarts at a new address and the others resume
+  replicating to it.
+- **tk-d4b8** — `merge_directory` gave ties to the incoming entry. Landed, and
+  it **refines the Target design above**: "incarnation, highest wins" is now
+  *strictly* higher wins, with incarnation 0 treated as the absence of a rank
+  rather than a low one, so two `AddLearner` hints remain ordered by arrival.
+  The design text stands as approved; CLAUDE.md carries the current rule.
+  Its own follow-ups, both open: tk-19c0 (two surviving routes to a reissued
+  rank) and tk-9cdd (whether an unpersistable rank deserves a retry).
+- **tk-8c62** — graceful self-retirement never persists its own tombstone.
+  Open, with an unanswered Q1.
+
+This epic does not close until tk-8c62 lands and a fresh review passes.

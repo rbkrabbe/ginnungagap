@@ -52,9 +52,14 @@ async fn boot(dir: &TempDir, cluster: &str, client: &str) -> (u64, ShardRegistry
 /// give — the stale copy gossiped back at node 1 loses to what node 1 says
 /// about itself.
 ///
-/// Every assertion here turns on the second boot publishing *above* the first.
-/// A counter that stopped incrementing would leave both at incarnation 1, where
-/// ties go to the incoming entry and the stale copy wins at both ends.
+/// Every assertion here turns on the second boot publishing *above* the first,
+/// which is why the counter is the real counter rather than a literal. A
+/// counter that stopped incrementing would leave both boots at incarnation 1,
+/// and an equal rank keeps whichever entry is already held: the peer would
+/// keep `old`, because it had it first, and the node would keep `new` about
+/// itself for the same reason. The move would simply never reach the peer —
+/// no flapping, no arrival order to blame, and nothing in the node's own view
+/// to show it had gone wrong.
 #[tokio::test]
 async fn a_restarted_node_at_a_new_address_outranks_its_own_stale_copy() {
     let dir = TempDir::new().unwrap();

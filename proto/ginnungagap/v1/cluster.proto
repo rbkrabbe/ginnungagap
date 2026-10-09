@@ -150,9 +150,12 @@ message GossipNode {
   // Client-facing gRPC address (the KV API listener). Used to forward
   // leader-required requests to a shard's leader.
   string client_addr = 3;
-  // Orders descriptors for one node: highest wins. Bumped once per boot by the
-  // node itself. Zero means the entry was written on the node's behalf rather
-  // than by it, and is superseded by the node's own first publication.
+  // Orders descriptors for one node: strictly higher wins, so an equal
+  // incarnation keeps the entry already held. Bumped once per boot by the node
+  // itself, and unique to that boot. Zero is not a rank but its absence: the
+  // entry was written on the node's behalf rather than by it. It is superseded
+  // by the node's own first publication, and replaced by a later entry also at
+  // zero.
   uint64 incarnation = 4;
   // Tombstone: this node was removed from the cluster. Outranks every
   // descriptor for the same id whatever its incarnation, so no peer's copy and

@@ -27,11 +27,26 @@
 //!   like any other; one that is present and cannot be read leaves the rank
 //!   unknown, and the boot fails.
 //!
+//! A rank that cannot be *written* is refused for the same reason. Returning
+//! it would leave the next boot to read the stale counter and issue the same
+//! number again — and the directory keeps the entry it already holds when two
+//! ranks are equal, so the second of those boots could not install an address
+//! it had changed. The failure surfaces here, at the cause, rather than later
+//! as a move that quietly does not happen.
+//!
+//! That is what makes a rank unique to one boot, which is the property the
+//! directory's ordering rests on: two *ranked* copies at one incarnation
+//! describe one published state and can be used interchangeably. The exception
+//! is incarnation 0, which this counter never issues — it marks a descriptor
+//! written on a node's behalf, and those are ordered by arrival rather than by
+//! rank.
+//!
 //! **Wiping the data dir loses the count**, and no recovery covers it: both
 //! records go together, so the node restarts at 1 and cannot outbid peers still
 //! holding a higher incarnation for that id. A wipe combined with an address
 //! change needs a fresh node id.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ggap_types::GgapError;
@@ -48,6 +63,12 @@ fn counter_key() -> Vec<u8> {
 pub struct BootCounter {
     store: Arc<FjallStore>,
     self_node_id: u64,
+    /// Fault injection: when `true`, [`Self::write`] fails as though the
+    /// keyspace rejected it, so a test can reach the refusal in
+    /// [`Self::advance`]. Always present, armable only via
+    /// [`Self::arm_write_failure`] behind `#[cfg(any(test, feature =
+    /// "test-utils"))]`.
+    fail_write: AtomicBool,
 }
 
 impl BootCounter {
@@ -57,30 +78,38 @@ impl BootCounter {
         BootCounter {
             store,
             self_node_id,
+            fail_write: AtomicBool::new(false),
         }
+    }
+
+    /// Make the next counter write fail. Test builds and `test-utils` only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_write_failure(&self) {
+        self.fail_write.store(true, Ordering::SeqCst);
     }
 
     /// The incarnation for this boot: one above the last rank this node can
     /// establish for itself, persisted before it is returned.
     ///
-    /// Fails only when the counter is unusable *and* the persisted directory
-    /// cannot be read either — see the module docs for why that is a refusal to
-    /// start rather than a warning.
+    /// Fails when the rank cannot be established — the counter unusable *and*
+    /// the persisted directory unreadable — and when it cannot be persisted.
+    /// See the module docs for why both are a refusal to start.
     pub fn advance(&self) -> Result<u64, GgapError> {
         let incarnation = self.previous()?.saturating_add(1);
-        if let Err(e) = self.write(incarnation) {
-            // This boot is still correctly ranked; the debt falls on the next
-            // one, which will read the stale value and publish this incarnation
-            // again. That is a tie rather than a deficit — the self-publication
-            // wins ties back on the following tick — so it does not justify
-            // refusing to start.
-            tracing::warn!(
-                error = %e,
-                incarnation,
-                "cannot persist the boot counter; the next boot will publish at this \
-                 incarnation again"
-            );
-        }
+        // A rank this boot cannot persist is a rank the *next* boot will issue
+        // again, having read the stale value. Two boots at one rank is the one
+        // way a tie can carry conflicting addresses, and the directory settles
+        // ties in favour of the entry already held — so the second of those
+        // boots could never install an address it changed. Refuse here, where
+        // the cause is still visible, rather than at a move that silently
+        // does not take.
+        self.write(incarnation).map_err(|e| {
+            GgapError::Storage(format!(
+                "cannot persist the boot counter at incarnation {incarnation}: {e}. \
+                 A rank this node cannot record is one the next boot would reissue, \
+                 and an address changed across those two boots would never take."
+            ))
+        })?;
         Ok(incarnation)
     }
 
@@ -143,6 +172,9 @@ impl BootCounter {
     }
 
     fn write(&self, incarnation: u64) -> Result<(), GgapError> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(GgapError::Storage("injected write failure".into()));
+        }
         self.store
             .node
             .insert(counter_key(), incarnation.to_be_bytes().to_vec())
@@ -192,6 +224,45 @@ mod tests {
         corrupt_the_counter(&store);
 
         assert_eq!(counter(store).advance().unwrap(), 1);
+    }
+
+    /// The rank is refused rather than returned unpersisted. Returning it
+    /// would leave the next boot to reissue the same number, and a directory
+    /// tie is settled in favour of the entry already held — so an address
+    /// changed across those two boots would never install anywhere.
+    #[test]
+    fn a_rank_that_cannot_be_persisted_fails_the_boot() {
+        let (store, _tempdir) = store();
+        let counter = counter(store.clone());
+        counter.arm_write_failure();
+
+        let err = counter
+            .advance()
+            .expect_err("an unpersistable rank must not be returned");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boot counter"),
+            "the error should name the counter: {msg}"
+        );
+
+        // And nothing was recorded, so the refusal is not itself a half-write.
+        assert_eq!(store.node.get(counter_key()).unwrap(), None);
+    }
+
+    /// The refusal is about *this* boot's rank, not about the store: a counter
+    /// that can be written still advances past the failed attempt.
+    #[test]
+    fn a_boot_after_a_failed_write_still_advances() {
+        let (store, _tempdir) = store();
+        assert_eq!(counter(store.clone()).advance().unwrap(), 1);
+
+        let armed = counter(store.clone());
+        armed.arm_write_failure();
+        assert!(armed.advance().is_err());
+
+        // The rank the failed boot would have taken is still free, and the
+        // next boot takes it.
+        assert_eq!(counter(store).advance().unwrap(), 2);
     }
 
     #[test]

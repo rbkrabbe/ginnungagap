@@ -94,11 +94,22 @@ just `ShardId(0)`. What exists today:
   empty, since peers re-seed it within a gossip round.
   A node publishes its own descriptor at an incarnation taken from a boot
   counter in the same keyspace, incremented each start, so a restart at a new
-  address outranks every copy of the old one. A node that starts *below* the
-  rank its peers hold can never win back authorship of its own address, so an
-  unusable counter recovers its rank from the persisted directory's self-entry
-  and fails the boot if that is unreadable too. Wiping the data dir loses both
-  records: an address change made across a wipe needs a fresh node id.
+  address outranks every copy of the old one. Ranks are ordered **strictly**:
+  an equal incarnation keeps the entry already held, so a peer that has not
+  heard of a move cannot reinstate the address it still carries. That rule
+  depends on a rank being unique to one boot, which is why the counter fails
+  the boot rather than issue a number it cannot persist — the next start would
+  reissue it, and the move after that would never install. **Incarnation 0 is
+  exempt, because it is not a rank**: it marks a descriptor written on a node's
+  behalf by `AddLearner`, and two of those are competing operator assertions
+  rather than copies of one published fact, so the later wins. A node named by
+  a mistyped hint cannot be dialled and so never publishes a rank of its own —
+  re-issuing the call is the only way to correct it. A node that starts
+  *below* the rank its peers hold can never win back authorship of its own
+  address either, so an unusable counter recovers its rank from the persisted
+  directory's self-entry and fails the boot if that is unreadable too. Wiping
+  the data dir loses both records: an address change made across a wipe needs a
+  fresh node id.
   A node leaves the directory only through a tombstone written by
   `AdminService.RemoveNode`, which outranks every descriptor for that id at any
   incarnation — a removal ordered by rank is one a stray copy undoes. It
