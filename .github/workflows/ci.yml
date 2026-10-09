@@ -80,12 +80,14 @@ jobs:
         if: steps.changes.outputs.code != 'true'
         run: echo "Task files and markdown only — skipping fmt, clippy, build and test."
 
-      - name: Install Rust (stable)
+      # `rustup show` installs the toolchain named in rust-toolchain.toml,
+      # with its components. Do not pin a version here as well: one source for
+      # it is the point, and a second would drift from the one developers run.
+      - name: Install Rust (pinned by rust-toolchain.toml)
         if: steps.changes.outputs.code == 'true'
         run: |
-          rustup update stable
-          rustup default stable
-          rustup component add rustfmt clippy
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
 
       - name: Format check
         if: steps.changes.outputs.code == 'true'
