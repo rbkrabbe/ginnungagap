@@ -35,6 +35,19 @@ incarnation replaces the one in hand. Two consequences the epic did not intend:
 The fix in the comparison is one character. Which way it goes is not obvious,
 which is why Q1 below exists.
 
+## Confirmed from tk-92e0 (2026-10-09)
+
+The tie rule actively masks a dead boot counter, which is stronger than the
+"between its own ticks" window described above. tk-92e0 restarts a member of a
+live three-node cluster at a new address; with the boot counter mutated to
+return a constant 1 — i.e. never advancing — the move still succeeds and the
+test still passes. At equal rank the new descriptor wins on arrival, so
+nothing anywhere observes that the counter is dead.
+
+Whichever way Q1 lands, that is the case to pin: tk-92e0 cannot assert its own
+acceptance criterion "fails if the boot counter stops advancing" until ties
+stop going to the incoming entry.
+
 ## Blast radius
 
 `crates/ggap-consensus/src/registry.rs` (the comparison and its comment),
