@@ -69,7 +69,14 @@ this node publishes its own descriptor at for the rest of the process. Because a
 descriptor is authored by the node it describes, that counter is a complete clock
 over its publications — a node that restarts at a new address outranks every copy
 of the old one still in flight, including the copies its peers hold of *its own*
-entry, which ties would otherwise hand back to the stale side.
+entry.
+
+A rank must therefore be unique to the boot that issues it, which is why
+`advance` fails rather than return one it could not persist: the next boot would
+read the stale counter and issue the same number again, and `merge_directory`
+keeps the entry it already holds at an equal rank, so an address changed across
+those two boots would never install anywhere. The counter never issues 0, which
+`merge_directory` treats as the absence of a rank rather than a low one.
 
 Starting *low* is worse than not starting at all, which is what shapes the
 failure handling. A node that publishes below the rank its peers hold does not
@@ -88,14 +95,20 @@ it knows to be unfounded:
 | unusable | absent, or no entry for this node | 1 — a first boot |
 | unusable | holds this node's entry | one above the rank it records |
 | unusable | present and unreadable | **the boot fails** |
+| *any of the above* | — | **the boot fails** if the rank cannot be written |
 
 An *absent* counter deliberately does not consult the directory. A node
 re-seeded by its peers before it ever published has a directory entry it did not
 write, and adopting that as its own rank would invent a history.
 
-A counter that cannot be *written* is only a warning: this boot is still
-correctly ranked, and the next one re-uses this incarnation — a tie, which the
-self-publication wins back on the following tick, not a deficit.
+A counter that cannot be *written* fails the boot too, which is the last row
+above. This boot would still be correctly ranked; the next one is the problem,
+because it reads the stale value and issues this incarnation again. Two boots at
+one rank is a state the ordering rule has no answer for: `merge_directory` keeps
+the entry it already holds at an equal rank, so an address changed between those
+two boots never installs, and the node loses authorship of its own entry without
+any symptom but a move that did not happen. Refusing here puts the failure where
+its cause is.
 
 *Wiping the data dir loses the count*, and no recovery covers it: both records go
 together, so the node restarts at 1 and cannot outbid peers still holding a

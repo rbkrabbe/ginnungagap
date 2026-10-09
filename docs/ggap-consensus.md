@@ -88,10 +88,26 @@ The production `RaftNode` implementation. It:
   **Every node is the sole author of its own descriptor.** `refresh_local`
   publishes `(cluster_addr, client_addr, incarnation)` for this node each tick,
   whether or not it hosts a shard, and gossip carries it everywhere.
-  `merge_directory` orders copies by **incarnation, highest wins**: a node
-  restarted at a new address publishes at a higher incarnation and outbids every
-  stale copy in flight. The incarnation comes from a boot counter persisted in
-  the `node` keyspace and starts at 1.
+  `merge_directory` orders copies by **incarnation, strictly higher wins**: a
+  node restarted at a new address publishes at a higher incarnation and outbids
+  every stale copy in flight, while an equal rank keeps the entry already held.
+  The incarnation comes from a boot counter persisted in the `node` keyspace and
+  starts at 1.
+
+  Two *ranked* copies at one incarnation can only describe one published
+  state, because a rank is unique to a boot: `BootCounter` refuses to start
+  rather than issue a number it cannot persist, since the next boot would
+  otherwise reissue it. That is what lets ties go to the incumbent — and so
+  what stops a peer that has not yet heard of a move from reinstating the
+  address it still holds.
+
+  **Incarnation 0 is exempt from the tie rule, because it is not a rank.** It
+  marks a descriptor written on a node's behalf, and two of those are
+  competing assertions by an operator rather than copies of one fact, so the
+  later one wins. That is what keeps a mistyped `AddLearner` correctable: the
+  node a bad hint names cannot be dialled, so it never publishes a rank that
+  would supersede the mistake, and without last-write-wins among hints the
+  only exit would be the irreversible tombstone that burns the id.
 
   `AddLearner` is the one exception, and only in appearance. It still carries
   the joining node's addresses over the wire — they are how the cluster first

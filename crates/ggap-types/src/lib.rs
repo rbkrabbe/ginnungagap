@@ -95,14 +95,17 @@ impl NodeAddrs {
 ///
 /// Authored by exactly one node: the one it describes. `incarnation` is
 /// boot-scoped — addresses come from CLI flags, so they can only change across a
-/// restart, and a counter bumped once per start is a sufficient clock. Highest
-/// incarnation wins, which is what lets a node move and have the cluster
-/// converge on its new address.
+/// restart, and a counter bumped once per start is a sufficient clock. A
+/// strictly higher incarnation wins, which is what lets a node move and have
+/// the cluster converge on its new address; an equal one keeps the entry
+/// already held, which a rank being unique to its boot makes safe.
 ///
 /// Incarnation 0 means "published on this node's behalf, not by it":
-/// `AddLearner` records where a joining node is at that rank, before the node
-/// itself has said anything. A node's own publications start at 1, so they
-/// always supersede a descriptor someone else wrote for it.
+/// `AddLearner` records where a joining node is, before the node itself has
+/// said anything. It is the absence of a rank rather than a low one, so two of
+/// them are ordered by arrival — the later replaces the earlier, which is how
+/// a join made with a mistyped address is corrected. A node's own publications
+/// start at 1 and always supersede a descriptor someone else wrote for it.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct NodeDescriptor {
     pub addrs: NodeAddrs,

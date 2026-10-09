@@ -184,9 +184,13 @@ impl OpenRaftNode {
     /// That hint is how the cluster first learns where the joining node is —
     /// nothing can dial it otherwise — and the node's own first publication, at
     /// incarnation 1 or above, immediately supersedes it, so sole authorship
-    /// over its addresses is never in doubt. Publishing before the membership
-    /// change means the leader can already resolve the learner when replication
-    /// to it starts.
+    /// over its addresses is never in doubt. For the same reason the hint does
+    /// not land at all once that node has published for itself. Re-issuing
+    /// this call does replace an earlier hint, which is how a join made with a
+    /// mistyped address is corrected: the node named by one cannot be dialled,
+    /// so it never publishes a rank that would supersede it. Publishing before
+    /// the membership change means the leader can already resolve the learner
+    /// when replication to it starts.
     ///
     /// `addrs` is validated by the caller — `AdminService::add_learner` rejects
     /// an empty address of either kind.

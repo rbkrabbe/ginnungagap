@@ -225,7 +225,10 @@ async fn main() -> anyhow::Result<()> {
     //     This is the one piece of startup state whose loss is fatal: a node
     //     that publishes below the rank its peers hold cannot win back
     //     authorship of its own address and re-emits the stale one, so failing
-    //     here beats starting unrankable.
+    //     here beats starting unrankable. A rank that cannot be *persisted* is
+    //     fatal for the same reason one step out: the next boot would reissue
+    //     it, and an equal rank keeps the entry already held, so an address
+    //     changed across those two boots would never install.
     let self_incarnation = BootCounter::new(store.clone(), cli.node_id)
         .advance()
         .context("cannot establish this node's incarnation")?;
