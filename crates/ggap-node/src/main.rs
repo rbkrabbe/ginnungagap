@@ -190,9 +190,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // `--client-addr` is what other nodes dial to forward client requests here;
-    // `--client-listen-addr` is where the listener binds. Needed before any Raft
-    // group starts, because seed bootstrap puts the advertised address into the
-    // initial membership.
+    // `--client-listen-addr` is where the listener binds. Needed before the
+    // registry is built below, because it is this node's own directory
+    // descriptor that carries both addresses to its peers.
     let self_client_addr = cli.client_addr.clone();
     let self_addrs = NodeAddrs::new(cli.cluster_addr.clone(), self_client_addr.clone());
 

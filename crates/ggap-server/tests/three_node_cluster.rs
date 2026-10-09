@@ -52,8 +52,8 @@ struct TestNode {
     /// The address the client listener is actually bound to. The directory
     /// entry other nodes learn about this node must resolve to this.
     client_addr: SocketAddr,
-    /// The advertised form of `client_addr` — what goes into Raft membership
-    /// and, derived from it, the directory.
+    /// The advertised form of `client_addr` — what this node publishes in its
+    /// own directory descriptor, and what peers resolve its id to.
     advertised_client_addr: String,
     registry: Arc<ShardRegistry>,
     raft_node: Arc<OpenRaftNode>,

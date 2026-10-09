@@ -54,9 +54,9 @@ impl GgapNetworkFactory {
 impl RaftNetworkFactory<GgapTypeConfig> for GgapNetworkFactory {
     type Network = GgapNetwork;
 
-    /// The `GgapNode` is ignored. Membership still carries addresses, but the
-    /// network path takes none of them: the client holds the target's *id* and
-    /// resolves it through the directory on every send.
+    /// The `GgapNode` is ignored — it carries no addresses. The client holds
+    /// the target's *id* and resolves it through the directory on every send,
+    /// which is what lets a node that moved be dialled without a new client.
     async fn new_client(&mut self, target_id: u64, _node: &GgapNode) -> GgapNetwork {
         GgapNetwork {
             target_id,
