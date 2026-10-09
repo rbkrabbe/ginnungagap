@@ -27,8 +27,10 @@ use ggap_server::{
     serve_client_with_listener, serve_cluster_with_listener, AdminServiceForTesting,
     ClusterServiceConfig, KvServiceConfig,
 };
+use ggap_storage::directory::DirectoryStore;
 use ggap_storage::fjall::{FjallLogStorage, FjallStateMachine, FjallStore};
 use ggap_storage::traits::StateMachineStore;
+use ggap_storage::BootCounter;
 use ggap_storage::ShardMap;
 use ggap_types::{
     GgapError, KvCommand, KvResponse, NodeAddrs, NodeDescriptor, ReadMode, WriteMode,
@@ -57,21 +59,52 @@ struct TestNode {
     advertised_client_addr: String,
     registry: Arc<ShardRegistry>,
     raft_node: Arc<OpenRaftNode>,
+    /// Handed to the node that replaces this one on a restart. See
+    /// [`TestCluster::restart_at_new_address`] for why storage is passed over
+    /// as a live handle rather than reopened.
+    store: Arc<FjallStore>,
     /// In-process AdminService over the same router and registry the node's
     /// cluster server exposes, so tests can call admin RPCs without a client.
     admin: AdminServiceForTesting,
     // Kept alive so the servers stay running; aborted on drop via TestCluster::shutdown.
     _handles: Vec<tokio::task::JoinHandle<()>>,
     // Kept alive so the tempdir is not deleted while the node is running.
-    _tempdir: TempDir,
+    // Moved out, not dropped, when a node is restarted on its own data dir.
+    tempdir: TempDir,
 }
 
 /// `gossip = false` starts every server but the gossip task, so only Raft can
 /// reach the directory. Tests asserting membership is the source of truth for
 /// an address need that: with gossip running, the assertion passes either way.
 async fn start_node(id: u64, gossip: bool) -> TestNode {
-    let tempdir = TempDir::new().unwrap();
-    let store = FjallStore::open(tempdir.path()).unwrap();
+    start_node_reusing(id, gossip, None).await
+}
+
+/// As [`start_node`], but `reuse` carries over the storage of a node that has
+/// been shut down, so the node coming back reads the same boot counter, Raft
+/// log and state machine. Its listeners are always bound fresh, so a restart
+/// necessarily lands on different ports — the move
+/// [`TestCluster::restart_at_new_address`] exercises.
+async fn start_node_reusing(
+    id: u64,
+    gossip: bool,
+    reuse: Option<(TempDir, Arc<FjallStore>)>,
+) -> TestNode {
+    let (tempdir, store) = match reuse {
+        Some(pair) => pair,
+        None => {
+            let td = TempDir::new().unwrap();
+            let store = FjallStore::open(td.path()).unwrap();
+            (td, store)
+        }
+    };
+
+    // The real counter, not a constant: a fresh node boots at 1 exactly as the
+    // hardcoded value did, and a restart on the same data dir boots at 2, which
+    // is what ranks its new address above the copies peers still hold.
+    let incarnation = BootCounter::new(store.clone(), id)
+        .advance()
+        .unwrap_or_else(|e| panic!("node {id}: boot counter failed: {e}"));
 
     // ShardMap created before FSM so we can inject it.
     let shard_map = Arc::new(ShardMap::load(store.clone()).unwrap());
@@ -92,6 +125,12 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
     // The registry has to exist before Raft: every outbound Raft RPC resolves
     // its target's address through the directory.
     let registry = Arc::new(ShardRegistry::new(id, []));
+
+    // Restore the persisted directory before Raft starts, exactly as
+    // `ggap-node` does: it is how a node that restarts resolves its peers
+    // without waiting to be dialled at an address they no longer hold.
+    let directory_store = DirectoryStore::new(store.clone());
+    registry.merge_directory(directory_store.load()).await;
     let raft = Arc::new(
         GgapRaft::new(
             id,
@@ -124,8 +163,11 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
     router.add_shard(0, raft_node.clone(), cluster).await;
 
-    // Spawn background split handler.
-    tokio::spawn(run_split_handler(
+    let mut handles = Vec::new();
+
+    // Spawn background split handler. Held rather than detached so a restart
+    // can drop its `Arc<FjallStore>` before reopening the data dir.
+    handles.push(tokio::spawn(run_split_handler(
         split_rx,
         store.clone(),
         fsm.clone(),
@@ -133,7 +175,7 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
         id,
         raft_cfg,
         registry.clone(),
-    ));
+    )));
 
     let split_coordinator = Arc::new(SplitCoordinator::new(SplitCoordinatorConfig {
         router: router.clone(),
@@ -146,8 +188,6 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
     // one.
     let self_client_addr = client_addr.to_string();
 
-    let mut handles = Vec::new();
-
     if gossip {
         handles.push(tokio::spawn(
             GossipTask::new(
@@ -155,11 +195,12 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
                 registry.clone(),
                 id,
                 NodeAddrs::new(cluster_addr.to_string(), self_client_addr.clone()),
-                1,
+                incarnation,
                 CancellationToken::new(),
             )
             .with_interval(Duration::from_millis(50))
             .with_rpc_timeout(Duration::from_secs(1))
+            .with_directory_store(directory_store)
             .run(),
         ));
     }
@@ -208,8 +249,9 @@ async fn start_node(id: u64, gossip: bool) -> TestNode {
         ),
         registry,
         raft_node,
+        store,
         _handles: handles,
-        _tempdir: tempdir,
+        tempdir,
     }
 }
 
@@ -335,6 +377,57 @@ impl TestCluster {
         }
     }
 
+    /// Shut one node down and bring it back with the same id and storage at
+    /// freshly bound addresses — the operator move tk-ef8d exists for.
+    ///
+    /// Its peers are untouched and still hold its old descriptor, so recovery
+    /// depends entirely on the new one outranking it and on resolution being
+    /// per-address rather than per-id.
+    ///
+    /// Storage is handed over as a live `Arc<FjallStore>` rather than closed
+    /// and reopened, which is the one way this differs from a real restart.
+    /// It is not a shortcut: `ggap-server`'s `serve_*` functions take no
+    /// shutdown hook, so a test can only `abort` the server future, and
+    /// tonic's per-connection tasks outlive that holding a store clone — the
+    /// data dir stays `Locked` indefinitely (measured: still locked after
+    /// 15 s with peers connected). A true reopen needs graceful shutdown in
+    /// `ggap-server` first; see tk-bf4e. What the handover
+    /// preserves is everything this test asserts on: the same node id, the
+    /// same Raft log and state machine, and a boot counter that advances to
+    /// the next incarnation. `boot_incarnation.rs` covers the genuine reopen.
+    async fn restart_at_new_address(&mut self, idx: usize) -> (SocketAddr, SocketAddr) {
+        let node = self.nodes.remove(idx);
+        let id = node.id;
+        let old_cluster_addr = node.cluster_addr;
+
+        node.raft
+            .shutdown()
+            .await
+            .unwrap_or_else(|e| panic!("node {id}: shutdown failed: {e}"));
+
+        let TestNode {
+            tempdir,
+            store,
+            _handles,
+            ..
+        } = node;
+        for h in &_handles {
+            h.abort();
+        }
+        for h in _handles {
+            let _ = h.await;
+        }
+
+        let restarted = start_node_reusing(id, true, Some((tempdir, store))).await;
+        let new_cluster_addr = restarted.cluster_addr;
+        assert_ne!(
+            old_cluster_addr, new_cluster_addr,
+            "node {id} came back on the same port, so this proves nothing"
+        );
+        self.nodes.insert(idx, restarted);
+        (old_cluster_addr, new_cluster_addr)
+    }
+
     /// Gracefully shutdown all nodes and abort the server tasks.
     async fn shutdown(self) {
         for node in self.nodes {
@@ -352,6 +445,142 @@ impl TestCluster {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The goal in tk-ef8d's first sentence, end to end: an operator restarts a
+/// node at a new address and the cluster follows.
+///
+/// Every mechanism the epic built is covered on its own elsewhere — the boot
+/// counter against real fjall reopens in `boot_incarnation.rs`, one client
+/// re-dialling a moved target in `network.rs`, addresses coming from the
+/// directory above. None of those compose them, which is what this does: a
+/// voter of a live three-node cluster goes away, comes back on different
+/// ports, and replication has to resume with no restart of its peers.
+///
+/// Two ways for this to fail that no narrower test can see. If the boot counter
+/// stops advancing, the restarted node publishes at a rank its peers already
+/// hold and loses authorship of its own entry, so they keep the dead address.
+/// If `GgapNetwork` cached resolution per node id instead of per address, the
+/// peers' existing clients would keep dialling the old port forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_member_at_a_new_address_rejoins_the_cluster() {
+    let mut cluster = TestCluster::start(3).await;
+    let leader_idx = cluster.wait_for_leader().await;
+
+    // A write before the move, so the restarted node has a log to catch up from.
+    let before = cluster.nodes[leader_idx]
+        .raft
+        .client_write(KvCommand::Put {
+            key: "before-move".into(),
+            value: b"v1".to_vec(),
+            ttl_ns: None,
+            expect_version: 0,
+        })
+        .await
+        .expect("pre-move write failed");
+    assert!(matches!(before.data, KvResponse::Written { .. }));
+    cluster.wait_for_all_applied(before.log_id().index).await;
+
+    // Move a follower: the leader staying put keeps the test about address
+    // resolution rather than about re-election.
+    let moved_idx = (0..3)
+        .find(|i| *i != leader_idx)
+        .expect("a follower exists");
+    let moved_id = cluster.nodes[moved_idx].id;
+    let (old_addr, new_addr) = cluster.restart_at_new_address(moved_idx).await;
+
+    // Its peers learn the new address by rank alone — nothing told them.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut all_updated = true;
+        for (i, node) in cluster.nodes.iter().enumerate() {
+            if i == moved_idx {
+                continue;
+            }
+            let resolved = node.registry.directory_addr(moved_id).await;
+            if resolved.as_deref() != Some(new_addr.to_string().as_str()) {
+                all_updated = false;
+                break;
+            }
+        }
+        if all_updated {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "peers still resolve node {moved_id} to {old_addr} rather than {new_addr} \
+             after 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The point of the whole epic: replication resumes to the new address,
+    // through the clients the peers already had.
+    let leader_idx = cluster.wait_for_leader().await;
+    let after = cluster.nodes[leader_idx]
+        .raft
+        .client_write(KvCommand::Put {
+            key: "after-move".into(),
+            value: b"v2".to_vec(),
+            ttl_ns: None,
+            expect_version: 0,
+        })
+        .await
+        .expect("post-move write failed");
+    assert!(matches!(after.data, KvResponse::Written { .. }));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let moved = &cluster.nodes[moved_idx];
+        let replicated = moved.fsm.get(0, "after-move", 0).await.ok().flatten();
+        if replicated.map(|e| e.value) == Some(b"v2".to_vec()) {
+            // It caught up across the move, not just from it.
+            let earlier = moved
+                .fsm
+                .get(0, "before-move", 0)
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value);
+            assert_eq!(
+                earlier,
+                Some(b"v1".to_vec()),
+                "node {moved_id} lost the pre-move write"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {moved_id} never received the post-move write at {new_addr}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // And none of this put an address into consensus — not the old one, and
+    // not the new one the move just introduced. Asserting on the encoded form
+    // rather than on `GgapNode`'s fields: it is field-less, so comparing it to
+    // `GgapNode {}` is true by construction and would pass whatever happened.
+    let membership = cluster.nodes[leader_idx]
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .clone();
+    let encoded = bincode::serde::encode_to_vec(&membership, bincode::config::standard())
+        .expect("membership must encode");
+    for addr in [old_addr.to_string(), new_addr.to_string()] {
+        assert!(
+            !encoded.windows(addr.len()).any(|w| w == addr.as_bytes()),
+            "membership carries node {moved_id}'s address {addr} after the move"
+        );
+    }
+    assert_eq!(
+        membership.voter_ids().collect::<BTreeSet<u64>>(),
+        BTreeSet::from([1, 2, 3]),
+        "the move changed the voter set"
+    );
+
+    cluster.shutdown().await;
+}
 
 /// Verifies leader election, a write, and linearizable reads from all nodes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -434,7 +663,7 @@ async fn three_node_leader_failover() {
     for h in old_leader._handles {
         h.abort();
     }
-    drop(old_leader._tempdir);
+    drop(old_leader.tempdir);
 
     // A new leader should emerge from the remaining two nodes.
     let new_leader_idx = cluster.wait_for_leader().await;
