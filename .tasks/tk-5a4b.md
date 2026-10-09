@@ -2,7 +2,7 @@
 id = "tk-5a4b"
 title = "Three comments still say membership carries addresses"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "s"
 priority = 2
 blocked_by = []
@@ -14,6 +14,7 @@ touched = []
 discovered_from = "tk-0ae1"
 resized_from = "m"
 base = "05c02c0f13ab3d6f09aba19e20deacb95be32642"
+closed = "2026-10-09T18:23:56+00:00"
 +++
 ## Context
 
