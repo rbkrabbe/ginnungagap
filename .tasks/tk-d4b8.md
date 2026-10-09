@@ -2,7 +2,7 @@
 id = "tk-d4b8"
 title = "merge_directory gives ties to the incoming entry, so a node can forward a stale address about itself"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "m"
 priority = 2
 blocked_by = []
@@ -14,6 +14,7 @@ touched = ["CLAUDE.md"]
 discovered_from = "tk-ef8d"
 base = "4c36e59fa32d2876ea5392602bd36fc3cf68ddd9"
 reviewed_at = "2026-10-09T20:34:51+00:00"
+closed = "2026-10-09T20:35:37+00:00"
 +++
 ## Context
 
