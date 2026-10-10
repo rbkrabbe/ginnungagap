@@ -1,10 +1,13 @@
 //! Persisted copy of the node directory (`node_id -> DirectoryEntry`).
 //!
 //! The directory itself lives in `ggap-consensus`'s `ShardRegistry` and is
-//! rebuilt from gossip; this is a cache of it, written by the gossip task and
-//! read back at startup. Its only job is *immediacy*: a node that restarts and
-//! is elected before any peer has gossiped to it can resolve its peers straight
-//! away instead of failing sends until someone dials it.
+//! rebuilt from gossip; this is a cache of it. The registry owns this store and
+//! decides when to write — after each gossip round, and synchronously when it
+//! tombstones a node — while this module only encodes. Its job is *immediacy*:
+//! a node that restarts and is elected before any peer has gossiped to it can
+//! resolve its peers straight away instead of failing sends until someone dials
+//! it. The exception is a tombstone, which is written through because nothing
+//! re-derives a removal and the node recording one is usually about to exit.
 //!
 //! Tombstones ride along with the descriptors, which is what makes a removal
 //! outlive a restart of every node that heard it: a directory rebuilt from

@@ -252,7 +252,17 @@ impl AdminServiceImpl {
                     error = %e,
                     "removal target did not answer; tombstoning it on its behalf"
                 );
-                self.registry.retire(req.node_id).await;
+                if let Err(e) = self.registry.retire(req.node_id).await {
+                    // Recoverable here, unlike on the self-retirement path:
+                    // this node keeps running, so its next gossip round
+                    // persists the tombstone anyway.
+                    tracing::warn!(
+                        node_id = req.node_id,
+                        error = %e,
+                        "tombstone recorded but not persisted; the next gossip round \
+                         will write it"
+                    );
+                }
                 Ok(Response::new(RemoveNodeResponse {
                     ok: true,
                     error: String::new(),
@@ -347,7 +357,21 @@ impl AdminServiceImpl {
                 confirmed_by_node: true,
             }));
         }
-        self.registry.retire(self_id).await;
+        // Past the point of no return: the peers above have already recorded
+        // the removal, and it cannot be taken back. So a failed write is
+        // reported and the shutdown proceeds — refusing here would leave a node
+        // running that the cluster has already forgotten, which is the state
+        // this whole path exists to avoid. The cost of the failure is that a
+        // restart of this host under this id will not be refused by its boot
+        // guard until a peer has gossiped the tombstone back.
+        if let Err(e) = self.registry.retire(self_id).await {
+            tracing::error!(
+                node_id = self_id,
+                error = %e,
+                "retired from the cluster but could not persist the tombstone; do not \
+                 restart this node under this id"
+            );
+        }
 
         tracing::info!(
             node_id = self_id,

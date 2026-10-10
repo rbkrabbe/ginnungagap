@@ -124,13 +124,14 @@ async fn start_node_reusing(
     let raft_cfg = build_raft_config(50, 150, 300, 500);
     // The registry has to exist before Raft: every outbound Raft RPC resolves
     // its target's address through the directory.
-    let registry = Arc::new(ShardRegistry::new(id, []));
-
     // Restore the persisted directory before Raft starts, exactly as
     // `ggap-node` does: it is how a node that restarts resolves its peers
-    // without waiting to be dialled at an address they no longer hold.
+    // without waiting to be dialled at an address they no longer hold. The
+    // registry owns the store, so writing it back is its business too.
     let directory_store = DirectoryStore::new(store.clone());
-    registry.merge_directory(directory_store.load()).await;
+    let restored = directory_store.load();
+    let registry = Arc::new(ShardRegistry::new(id, []).with_directory_store(directory_store));
+    registry.merge_directory(restored).await;
     let raft = Arc::new(
         GgapRaft::new(
             id,
@@ -200,7 +201,6 @@ async fn start_node_reusing(
             )
             .with_interval(Duration::from_millis(50))
             .with_rpc_timeout(Duration::from_secs(1))
-            .with_directory_store(directory_store)
             .run(),
         ));
     }
@@ -1463,6 +1463,95 @@ async fn gossip_reports_remote_shard_status_from_non_hosting_node() {
     );
 
     observer.handle.abort();
+    cluster.shutdown().await;
+}
+
+/// The tombstone a node writes for itself is on disk before `RemoveNode`
+/// answers — not left for a gossip round that will never come.
+///
+/// A node that retires itself cancels its own process moments later
+/// (`ggap-node/src/main.rs` reacts to the retire token by exiting), and the
+/// gossip task selects on that cancellation before its next tick. So a
+/// tombstone recorded only in memory dies with the process: the node restarts,
+/// the boot guard at `main.rs:280` reads a persisted directory with no
+/// removal in it, and the node comes up as one the cluster has already
+/// forgotten — in no membership, resolvable by nobody, still serving its
+/// client port.
+///
+/// This asserts the durable half, which is what that guard has to read. The
+/// guard itself lives in `main`'s startup path and has no test; what is
+/// checkable here is that the record it depends on exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_self_retiring_node_persists_its_own_tombstone_before_answering() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+
+    // As in the drain test: hosting shard 0 locally, in nobody's membership.
+    let drained = start_node(4, false).await;
+    let drained_addr = drained.cluster_addr.to_string();
+    drained
+        .registry
+        .merge_directory([(
+            cluster.nodes[0].id,
+            NodeDescriptor::new(
+                NodeAddrs::new(
+                    cluster.nodes[0].cluster_addr.to_string(),
+                    cluster.nodes[0].advertised_client_addr.clone(),
+                ),
+                1,
+            ),
+        )])
+        .await;
+    for node in &cluster.nodes {
+        node.registry
+            .merge_directory([(
+                4u64,
+                NodeDescriptor::new(
+                    NodeAddrs::new(drained_addr.clone(), drained.advertised_client_addr.clone()),
+                    1,
+                ),
+            )])
+            .await;
+    }
+
+    // Nothing has been written for node 4 yet.
+    let on_disk = DirectoryStore::new(drained.store.clone());
+    assert!(
+        !on_disk
+            .load()
+            .iter()
+            .any(|(id, e)| *id == 4 && e.is_removed()),
+        "node 4 is not retired yet, so no tombstone should be on disk"
+    );
+
+    let resp = cluster.nodes[0]
+        .admin
+        .remove_node(tonic::Request::new(RemoveNodeRequest { node_id: 4 }))
+        .await
+        .expect("remove_node is answered, not errored")
+        .into_inner();
+    assert!(resp.ok, "remove_node failed: {}", resp.error);
+    assert!(resp.confirmed_by_node, "the target retired itself");
+
+    // No gossip round is awaited, and node 4's gossip task is not even running
+    // (`start_node(4, false)`): if the write did not happen inside the RPC, it
+    // did not happen at all.
+    assert!(
+        on_disk
+            .load()
+            .iter()
+            .any(|(id, e)| *id == 4 && e.is_removed()),
+        "node 4's own tombstone must be durable before RemoveNode answers, so a \
+         restart's boot guard can read it"
+    );
+
+    for node in &cluster.nodes {
+        await_tombstone(node, 4).await;
+    }
+
+    for h in &drained._handles {
+        h.abort();
+    }
     cluster.shutdown().await;
 }
 
