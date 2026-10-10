@@ -44,6 +44,22 @@ Note the freshness must come from gossip about the node, not from dialling it,
 so a node reachable by its peers but not by the node serving `RemoveNode` is
 still protected.
 
+## Trap set by tk-d4b8 (noted 2026-10-10)
+
+Record freshness **on receipt, before the rank comparison** — not as part of
+writing the entry.
+
+tk-d4b8 made `merge_directory` keep the entry it already holds at an equal
+rank. A stable node republishes the *same* incarnation every tick, because the
+rank only changes across a reboot, so in steady state every re-delivery of a
+descriptor is now rejected without touching the directory. Freshness coupled
+to the entry write would therefore stop advancing after a node's first
+publication, and every healthy node would look dead to the threshold below —
+turning this task's protection into the exact failure it exists to prevent.
+
+The acceptance item's "equal or higher incarnation" is right; it just cannot
+be implemented inside the branch that decides whether to insert.
+
 ## Acceptance
 
 - [ ] Directory entries carry a last-heard timestamp, refreshed when gossip
