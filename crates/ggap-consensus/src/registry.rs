@@ -4,9 +4,12 @@
 //! Its directory is the source of truth for node addresses: membership carries
 //! ids, and every send resolves one through here. Shard entries are a
 //! rebuildable cache and are never persisted; the directory is written out by
-//! the gossip task and read back at startup
-//! ([`ggap_storage::DirectoryStore`]) so a restarted node can resolve peers
-//! before anyone gossips to it — persistence buys immediacy, not authority.
+//! this registry — which owns the data, and so owns writing it — and read back
+//! at startup ([`ggap_storage::DirectoryStore`]) so a restarted node can
+//! resolve peers before anyone gossips to it. Persistence buys immediacy, not
+//! authority, with one exception: a tombstone is written through
+//! synchronously, because it is the one directory fact that must survive the
+//! process that recorded it.
 //!
 //! It lets any node answer `ListShards` / `ClusterStatus` for shards it does
 //! not host locally, degrading gracefully (entries simply age) when a peer is
@@ -15,10 +18,11 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 
-use ggap_types::{DirectoryEntry, ShardId};
+use ggap_storage::DirectoryStore;
+use ggap_types::{DirectoryEntry, GgapError, ShardId};
 
 /// One shard's placement + lightweight Raft status as last known to this node.
 ///
@@ -67,6 +71,13 @@ pub struct ShardRegistry {
     directory: RwLock<HashMap<u64, DirectoryEntry>>,
     /// Best-known entry per shard.
     shards: RwLock<HashMap<ShardId, ShardEntry>>,
+    /// Where the directory is cached for the next boot. `None` disables
+    /// persistence, which is what every in-process harness wants.
+    directory_store: Option<DirectoryStore>,
+    /// What was last written, so an unchanged directory is not rewritten every
+    /// gossip round. Held beside the store rather than inside it: the store is
+    /// a file, this is a memo about one.
+    persisted: Mutex<Vec<(u64, DirectoryEntry)>>,
 }
 
 impl ShardRegistry {
@@ -82,7 +93,55 @@ impl ShardRegistry {
             seed_peers: seed_peers.into_iter().collect(),
             directory: RwLock::new(HashMap::new()),
             shards: RwLock::new(HashMap::new()),
+            directory_store: None,
+            persisted: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Give the registry somewhere to cache its directory for the next boot.
+    pub fn with_directory_store(mut self, store: DirectoryStore) -> Self {
+        self.directory_store = Some(store);
+        self
+    }
+
+    /// Write the directory out if it has changed since the last write.
+    ///
+    /// Failing is not fatal and does not propagate: the cache only buys
+    /// immediacy on the next boot, and a node that starts without one is
+    /// re-seeded by the first peer to dial it. The exception is a tombstone —
+    /// see [`Self::retire`], which reports its own failure because nothing
+    /// re-derives a removal.
+    pub async fn persist_directory(&self) {
+        if let Err(e) = self.try_persist_directory().await {
+            tracing::warn!(
+                node_id = self.self_node_id,
+                error = %e,
+                "cannot persist the directory"
+            );
+        }
+    }
+
+    /// As [`Self::persist_directory`], but surfaces the write error.
+    pub async fn try_persist_directory(&self) -> Result<(), GgapError> {
+        let Some(store) = &self.directory_store else {
+            return Ok(());
+        };
+        // The lock comes first, and the snapshot is taken under it. Taking it
+        // outside would let a caller save a directory read before another
+        // caller's write: the later writer records its state and the earlier
+        // one then overwrites the file with its stale snapshot, leaving the
+        // memo agreeing with the file so nothing ever rewrites it. A `retire`
+        // that lost its tombstone that way would have reported durability and
+        // then exited the process, which is the failure this write-through
+        // exists to prevent.
+        let mut persisted = self.persisted.lock().await;
+        let dir = self.directory_snapshot().await;
+        if dir == *persisted {
+            return Ok(());
+        }
+        store.save(&dir)?;
+        *persisted = dir;
+        Ok(())
     }
 
     pub fn self_node_id(&self) -> u64 {
@@ -208,13 +267,22 @@ impl ShardRegistry {
     /// Tombstone a node's directory entry. Idempotent, and irreversible for as
     /// long as the cluster lives: see [`DirectoryEntry::Removed`].
     ///
-    /// This only writes it locally. Gossip carries it to every peer, and it
-    /// survives restarts through the persisted directory.
-    pub async fn retire(&self, node_id: u64) {
+    /// This records it on this node only; gossip carries it to every peer. The
+    /// directory is persisted here and now, before returning, so the tombstone
+    /// survives the process — see the body for why that cannot wait for the
+    /// next gossip round. An `Err` means it is in memory but not on disk.
+    pub async fn retire(&self, node_id: u64) -> Result<(), GgapError> {
         self.directory
             .write()
             .await
             .insert(node_id, DirectoryEntry::Removed);
+        // Written through rather than left to the next gossip round. A node
+        // retiring itself cancels its own process moments later, and a
+        // tombstone only in memory dies with it — the node then restarts, its
+        // boot guard sees no removal, and it runs as a node the cluster has
+        // already forgotten. Nothing re-derives a removal, so this is the one
+        // directory write whose failure the caller has to know about.
+        self.try_persist_directory().await
     }
 
     /// Whether this node holds a tombstone for `node_id`.
@@ -297,9 +365,11 @@ impl ShardRegistry {
     }
 
     /// The whole directory, tombstones included, sorted by node id. Gossip
-    /// pushes it to peers and the gossip task persists it; both want a stable
-    /// order, and both must carry tombstones — a removal spreads and survives
-    /// restarts by exactly the same route a descriptor does.
+    /// pushes it to peers and [`Self::persist_directory`] writes it out; both
+    /// want a stable order, and both must carry tombstones — a removal spreads
+    /// and survives restarts by exactly the same route a descriptor does. The
+    /// stable order is also what makes the unchanged-since-last-write check
+    /// there a plain comparison.
     pub async fn directory_snapshot(&self) -> Vec<(u64, DirectoryEntry)> {
         let mut dir: Vec<(u64, DirectoryEntry)> = self
             .directory
@@ -442,7 +512,7 @@ mod tests {
         reg.merge_directory([(2, own("old:17001", "old:17000", 3))])
             .await;
 
-        reg.retire(2).await;
+        reg.retire(2).await.unwrap();
         assert!(reg.is_retired(2).await);
         assert_eq!(reg.directory_addr(2).await, None);
         assert_eq!(reg.client_addr(2).await, None);
@@ -478,7 +548,7 @@ mod tests {
         let reg = ShardRegistry::new(1, []);
         reg.merge_directory([(2, own("host:17001", "host:17000", 1))])
             .await;
-        reg.retire(2).await;
+        reg.retire(2).await.unwrap();
 
         assert_eq!(
             reg.directory_snapshot().await,
@@ -495,7 +565,7 @@ mod tests {
             .await;
         assert_eq!(reg.peers_excluding_self().await.len(), 1);
 
-        reg.retire(2).await;
+        reg.retire(2).await.unwrap();
         assert!(reg.peers_excluding_self().await.is_empty());
     }
 
@@ -509,7 +579,7 @@ mod tests {
             .await;
         assert_eq!(reg.node_id_at("host:17001").await, Some(2));
 
-        reg.retire(2).await;
+        reg.retire(2).await.unwrap();
         assert_eq!(reg.node_id_at("host:17001").await, None);
 
         reg.merge_directory([(3, own("host:17001", "host:17000", 1))])

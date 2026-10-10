@@ -64,7 +64,6 @@ async fn persist_directory(store: Arc<FjallStore>, registry: Arc<ShardRegistry>)
         )
         .with_interval(Duration::from_millis(10))
         .with_rpc_timeout(Duration::from_millis(10))
-        .with_directory_store(DirectoryStore::new(store.clone()))
         .run(),
     );
 
@@ -94,7 +93,9 @@ async fn a_restarted_node_resolves_every_peer_before_any_gossip() {
 
     {
         let store = FjallStore::open(tempdir.path()).unwrap();
-        let registry = Arc::new(ShardRegistry::new(1, []));
+        let registry = Arc::new(
+            ShardRegistry::new(1, []).with_directory_store(DirectoryStore::new(store.clone())),
+        );
         merge_gossip_state(
             &registry,
             gossip_from(
@@ -141,7 +142,9 @@ async fn a_restored_entry_keeps_its_incarnation() {
 
     {
         let store = FjallStore::open(tempdir.path()).unwrap();
-        let registry = Arc::new(ShardRegistry::new(1, []));
+        let registry = Arc::new(
+            ShardRegistry::new(1, []).with_directory_store(DirectoryStore::new(store.clone())),
+        );
         merge_gossip_state(
             &registry,
             gossip_from(2, &[(2, desc("moved:17001", "moved:17000", 4))]),
@@ -194,7 +197,9 @@ async fn a_corrupt_record_starts_empty_and_still_converges() {
 
     {
         let store = FjallStore::open(tempdir.path()).unwrap();
-        let registry = Arc::new(ShardRegistry::new(1, []));
+        let registry = Arc::new(
+            ShardRegistry::new(1, []).with_directory_store(DirectoryStore::new(store.clone())),
+        );
         merge_gossip_state(
             &registry,
             gossip_from(2, &[(2, desc("node2:17001", "node2:17000", 1))]),
@@ -233,7 +238,9 @@ async fn a_tombstone_survives_a_restart_and_the_gossip_that_follows_it() {
 
     {
         let store = FjallStore::open(tempdir.path()).unwrap();
-        let registry = Arc::new(ShardRegistry::new(1, []));
+        let registry = Arc::new(
+            ShardRegistry::new(1, []).with_directory_store(DirectoryStore::new(store.clone())),
+        );
         merge_gossip_state(
             &registry,
             gossip_from(
@@ -245,8 +252,17 @@ async fn a_tombstone_survives_a_restart_and_the_gossip_that_follows_it() {
             ),
         )
         .await;
-        registry.retire(3).await;
-        persist_directory(store, registry).await;
+        // No gossip round: `retire` writes the directory through, which is the
+        // only reason a tombstone outlives the process that recorded one — the
+        // node retiring itself exits before another round can happen.
+        registry.retire(3).await.unwrap();
+        assert!(
+            DirectoryStore::new(store.clone())
+                .load()
+                .iter()
+                .any(|(id, e)| *id == 3 && e.is_removed()),
+            "retire must have persisted the tombstone itself"
+        );
     }
 
     let store = FjallStore::open(tempdir.path()).unwrap();

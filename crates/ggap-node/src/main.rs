@@ -266,9 +266,14 @@ async fn main() -> anyhow::Result<()> {
     //     resolves its peers straight away instead of failing sends until it is
     //     dialled. It is a cache of gossip: a missing or corrupt record starts
     //     the node with an empty directory rather than failing the boot.
-    let registry = Arc::new(ShardRegistry::new(cli.node_id, []));
+    //
+    //     The registry keeps the store and does the writing — the gossip task
+    //     asks it to after each round, and `retire` writes a tombstone through
+    //     immediately, which is the one case that cannot wait for a round.
     let directory_store = DirectoryStore::new(store.clone());
     let persisted_directory = directory_store.load();
+    let registry =
+        Arc::new(ShardRegistry::new(cli.node_id, []).with_directory_store(directory_store));
     tracing::info!(
         node_id = cli.node_id,
         entries = persisted_directory.len(),
@@ -427,7 +432,6 @@ async fn main() -> anyhow::Result<()> {
             self_incarnation,
             shutdown.child_token(),
         )
-        .with_directory_store(directory_store)
         .run(),
     );
 

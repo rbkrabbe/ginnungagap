@@ -53,11 +53,13 @@ still spans it: a split commits data movement, `last_applied`, both shard map
 records and `bootstrap_members` together or not at all.
 
 **The persisted directory (`directory.rs`).** `DirectoryStore` writes the whole
-`node_id -> NodeDescriptor` map as one record and reads it back at startup. It is
-a cache of gossip whose only job is immediacy: a node that restarts and is
-elected before any peer has gossiped to it resolves its peers straight away
-instead of failing sends until it is dialled. `load` therefore never fails — a
-missing, unreadable or corrupt record warns and yields an empty directory, and
+`node_id -> NodeDescriptor` map as one record and reads it back at startup. The
+store is held by `ShardRegistry`, which decides when to write; this module only
+does the encoding. It is a cache of gossip whose only job is immediacy: a node
+that restarts and is elected before any peer has gossiped to it resolves its
+peers straight away instead of failing sends until it is dialled. `load`
+therefore never fails — a missing, unreadable or corrupt record warns and
+yields an empty directory, and
 the node re-learns it from the first peer that dials it. `try_load` is the same
 read without that collapse — `Ok(None)` for absent, `Err` for present-and-
 unreadable — because the boot counter's recovery needs to tell a first boot from

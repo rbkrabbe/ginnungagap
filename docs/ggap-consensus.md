@@ -132,8 +132,10 @@ The production `RaftNode` implementation. It:
   publishes a cluster-only descriptor on purpose.
 
   The directory is also **cached on disk** (`ggap-storage`'s `DirectoryStore`,
-  one `node` record). The gossip task writes it out after each round when it has
-  changed, and `ggap-node` seeds the registry from it before starting the task.
+  one `node` record). The registry owns that store — it owns the data, so it
+  owns writing it — and `ShardRegistry::persist_directory` writes the map out
+  when it has changed; the gossip task calls it after each round and once more
+  on its way out, and `ggap-node` seeds the registry from the store at startup.
   This buys immediacy, not capability: peers re-seed a restarted node within a
   gossip round anyway, but a node that restarts and is elected before that
   happens can resolve its peers straight away. Incarnations are persisted with
@@ -160,9 +162,15 @@ The production `RaftNode` implementation. It:
   Reusing the hardware means a fresh node id; the *address* is free immediately,
   which is what lets an operator re-add a decommissioned host.
 
-  Tombstones travel and persist exactly as descriptors do: `snapshot_for_gossip`
-  emits them, `DirectoryStore` writes them out, and a restart restores them — so
-  a removal is not undone by the first peer to gossip afterwards. A retired node
+  Tombstones travel as descriptors do — `snapshot_for_gossip` emits them and a
+  restart restores them, so a removal is not undone by the first peer to gossip
+  afterwards — but they are **written through** rather than left to the next
+  round. `ShardRegistry::retire` persists the directory before returning,
+  because a node retiring itself ends its own process moments later and the
+  gossip task is cancelled before its next tick: a tombstone only in memory
+  would die with the process, and the node would restart as one the cluster had
+  already forgotten. It is the one directory write whose failure the caller is
+  told about, since nothing re-derives a removal. A retired node
   resolves to nothing (`directory_addr`, `client_addr` and `node_id_at` all skip
   it) and is dropped from `peers_excluding_self` even when a bootstrap seed
   still names it.
