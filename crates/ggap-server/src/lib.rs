@@ -36,9 +36,32 @@ pub use kv_service::KvServiceImpl as KvServiceForTesting;
 // (e.g. to assert gossip-derived consensus state for a non-hosted shard).
 pub use admin_service::AdminServiceImpl as AdminServiceForTesting;
 
+/// Refuses every request to the service it wraps while `retired` is cancelled.
+///
+/// Applied per *service*, not per method: a method added to a gated service
+/// later is covered without anyone remembering, which a flag read inside each
+/// handler would not be. Gossip is deliberately left ungated — a retired node
+/// has to keep spreading its own tombstone, and that is the one thing it is
+/// still good for.
+///
+/// `None` never gates, which is what in-process harnesses want.
+fn retired_gate(
+    retired: Option<tokio_util::sync::CancellationToken>,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |req| match &retired {
+        Some(token) if token.is_cancelled() => Err(tonic::Status::unavailable(
+            "this node was retired from the cluster and serves gossip only",
+        )),
+        _ => Ok(req),
+    }
+}
+
 /// Configuration for the client-facing KV service.
 #[derive(Clone, Debug)]
 pub struct KvServiceConfig {
+    /// Cancelled once this node has been retired. While it is, the KV service
+    /// refuses every request: see [`retired_gate`].
+    pub retired: Option<tokio_util::sync::CancellationToken>,
     pub max_key_bytes: usize,
     pub max_value_bytes: usize,
     /// Optional watch broadcast channel. When set, `Watch` RPCs are served;
@@ -56,6 +79,7 @@ impl Default for KvServiceConfig {
             max_value_bytes: 1_048_576,
             watch_tx: None,
             watch_output_buffer: 128,
+            retired: None,
         }
     }
 }
@@ -65,8 +89,9 @@ impl Default for KvServiceConfig {
 pub struct ClusterServiceConfig {
     pub cors_origins: Vec<String>,
     /// Cancelled once this node has retired itself through
-    /// `AdminService.RemoveNode`, so the caller can stop the process. Left unset
-    /// by harnesses, which have no process to end.
+    /// `AdminService.RemoveNode`, or at startup when the persisted directory
+    /// already held its tombstone. While it is cancelled every service but
+    /// gossip refuses: see [`retired_gate`].
     pub retired: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -127,14 +152,19 @@ pub async fn serve_client(
         .accept_http1(true)
         .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(tonic_web::enable(KvServiceServer::new(KvServiceImpl::new(
-            router,
-            node_id,
-            config.max_key_bytes,
-            config.max_value_bytes,
-            config.watch_tx,
-            config.watch_output_buffer,
-        ))))
+        .add_service(tonic_web::enable(
+            tonic::service::interceptor::InterceptedService::new(
+                KvServiceServer::new(KvServiceImpl::new(
+                    router,
+                    node_id,
+                    config.max_key_bytes,
+                    config.max_value_bytes,
+                    config.watch_tx,
+                    config.watch_output_buffer,
+                )),
+                retired_gate(config.retired),
+            ),
+        ))
         .add_service(reflection)
         .serve(addr)
         .await
@@ -158,14 +188,19 @@ pub async fn serve_client_with_listener(
         .accept_http1(true)
         .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(tonic_web::enable(KvServiceServer::new(KvServiceImpl::new(
-            router,
-            node_id,
-            config.max_key_bytes,
-            config.max_value_bytes,
-            config.watch_tx,
-            config.watch_output_buffer,
-        ))))
+        .add_service(tonic_web::enable(
+            tonic::service::interceptor::InterceptedService::new(
+                KvServiceServer::new(KvServiceImpl::new(
+                    router,
+                    node_id,
+                    config.max_key_bytes,
+                    config.max_value_bytes,
+                    config.watch_tx,
+                    config.watch_output_buffer,
+                )),
+                retired_gate(config.retired),
+            ),
+        ))
         .add_service(reflection)
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await
@@ -197,10 +232,18 @@ pub async fn serve_cluster(
         .accept_http1(true)
         .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(tonic_web::enable(RaftServiceServer::new(
-            RaftServiceImpl::new(router),
-        )))
-        .add_service(tonic_web::enable(AdminServiceServer::new(admin)))
+        .add_service(tonic_web::enable(
+            tonic::service::interceptor::InterceptedService::new(
+                RaftServiceServer::new(RaftServiceImpl::new(router)),
+                retired_gate(config.retired.clone()),
+            ),
+        ))
+        .add_service(tonic_web::enable(
+            tonic::service::interceptor::InterceptedService::new(
+                AdminServiceServer::new(admin),
+                retired_gate(config.retired.clone()),
+            ),
+        ))
         .add_service(tonic_web::enable(GossipServiceServer::new(
             GossipServiceImpl::new(registry),
         )))
@@ -249,10 +292,18 @@ pub async fn serve_cluster_with_listener(
         .accept_http1(true)
         .layer(cors)
         .layer(OtelServerLayer)
-        .add_service(tonic_web::enable(RaftServiceServer::new(
-            RaftServiceImpl::new(router),
-        )))
-        .add_service(tonic_web::enable(AdminServiceServer::new(admin)))
+        .add_service(tonic_web::enable(
+            tonic::service::interceptor::InterceptedService::new(
+                RaftServiceServer::new(RaftServiceImpl::new(router)),
+                retired_gate(config.retired.clone()),
+            ),
+        ))
+        .add_service(tonic_web::enable(
+            tonic::service::interceptor::InterceptedService::new(
+                AdminServiceServer::new(admin),
+                retired_gate(config.retired.clone()),
+            ),
+        ))
         .add_service(tonic_web::enable(GossipServiceServer::new(
             GossipServiceImpl::new(registry),
         )))

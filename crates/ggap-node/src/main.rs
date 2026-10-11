@@ -280,22 +280,48 @@ async fn main() -> anyhow::Result<()> {
         "restored the persisted directory"
     );
     // A node whose own entry is a tombstone was retired. Nothing it publishes
-    // can outrank that, so it would run as a zombie: in a membership, resolvable
-    // by nobody, dialled by nobody. Refuse the start and say what to do instead.
+    // can outrank that, so it has no useful work left: it is in no membership,
+    // resolvable by nobody, and dialled by nobody. It comes up *quiesced*
+    // rather than refusing to start — refusing would be a non-zero exit, and
+    // under a supervisor that only permits `restartPolicy: Always` (a
+    // StatefulSet pod) that is a crash loop for as long as the pod exists,
+    // which scaling down cannot remove without taking healthy nodes with it.
+    //
+    // Quiesced is the same state `RemoveNode` leaves a running node in, by the
+    // same token: gossip keeps serving so the tombstone keeps spreading, and
+    // every other service refuses. Reaching it here as well is what makes a
+    // reschedule — drain, OOM, node failure — harmless rather than a loop.
+    let retired = CancellationToken::new();
     if persisted_directory
         .iter()
         .any(|(id, entry)| *id == cli.node_id && entry.is_removed())
     {
-        anyhow::bail!(
-            "node {} was removed from the cluster; a retired id is never reused. \
-             Start this host under a fresh --node-id.",
-            cli.node_id
+        tracing::warn!(
+            node_id = cli.node_id,
+            "this node was retired from the cluster; starting quiesced — gossip only, \
+             no Raft, no KV, no admin. A retired id is never reused: to put this host \
+             back in service, start it under a fresh --node-id."
         );
+        retired.cancel();
     }
+    // Registered either way, so the series exists on a healthy node and an
+    // operator can tell a quiesced pod from a serving one by scraping it. The
+    // `raft_*` gauges cannot answer that: retirement stops the task that
+    // publishes them, so they freeze at their last values and a retired node
+    // scrapes identically to an idle healthy one.
+    metrics::gauge!("ggap_node_retired").set(if retired.is_cancelled() { 1.0 } else { 0.0 });
     registry.merge_directory(persisted_directory).await;
+
+    // Everything a retired node has no use for hangs off this: each shard's Raft
+    // group, its TTL GC task and its metrics task. A child of `shutdown`, so a
+    // real shutdown stops them too — while cancelling it on retirement leaves
+    // the gossip task, which hangs off `shutdown` directly, still running.
+    let shard_tasks = shutdown.child_token();
 
     // 5. Start a Raft group for each shard in the ShardMap.
     let shards = shard_map.all_shards().await;
+    // Kept so retirement can stop them; a quiesced node holds no Raft group.
+    let mut rafts: Vec<(u64, Arc<GgapRaft>)> = Vec::new();
     let raft_cfg = build_raft_config(
         config.raft.heartbeat_interval_ms,
         config.raft.election_timeout_min_ms,
@@ -303,7 +329,12 @@ async fn main() -> anyhow::Result<()> {
         config.raft.snapshot_threshold,
     );
 
-    for shard_info in &shards {
+    // A node that was already retired when it started skips this entirely: it
+    // is in no membership, so every group would campaign against nobody and
+    // hold storage open for nothing, and the gate on the Raft service refuses
+    // the peers that have not yet heard. A node retired *while* running took
+    // this path already — the retire handler below stops what it started.
+    for shard_info in shards.iter().filter(|_| !retired.is_cancelled()) {
         let shard_id = shard_info.shard_id;
         let log_store = GgapLogStorage::new(FjallLogStorage(store.clone()), shard_id);
         let sm = GgapStateMachine::new(fsm.clone(), shard_id);
@@ -381,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
         // Spawn TTL GC task for this shard.
         let (ttl_tx, mut ttl_rx) = tokio::sync::mpsc::channel(256);
         tokio::spawn(
-            TtlGcTask::new(fsm.clone(), shard_id, ttl_tx, shutdown.child_token())
+            TtlGcTask::new(fsm.clone(), shard_id, ttl_tx, shard_tasks.child_token())
                 .with_watch(watch_tx.clone())
                 .run(),
         );
@@ -394,7 +425,8 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        tokio::spawn(RaftMetricsTask::new(raft.clone(), shard_id, shutdown.child_token()).run());
+        tokio::spawn(RaftMetricsTask::new(raft.clone(), shard_id, shard_tasks.child_token()).run());
+        rafts.push((shard_id, raft.clone()));
 
         tracing::info!(shard_id, "started Raft group");
     }
@@ -441,25 +473,50 @@ async fn main() -> anyhow::Result<()> {
         max_value_bytes: config.storage.max_value_bytes,
         watch_tx: Some(watch_tx),
         watch_output_buffer: 128,
+        retired: Some(retired.clone()),
     };
 
-    // Cancelled by AdminService.RemoveNode once this node has tombstoned itself
-    // and handed the tombstone to a peer. Nothing can resolve it any more, so
-    // there is no work left to do.
-    let retired = CancellationToken::new();
+    // `retired` is cancelled either above, when the persisted directory already
+    // held this node's tombstone, or by AdminService.RemoveNode once the node
+    // has tombstoned itself and handed that over. Both reach the same state and
+    // the process stays up: the gate on KV, Admin and Raft refuses everything,
+    // while gossip keeps running so the tombstone reaches peers that were
+    // unreachable when it was written.
+    //
+    // It does not exit. Under a supervisor an exit is a restart, and the restart
+    // would read the tombstone and quiesce anyway — so exiting buys nothing and
+    // costs a pod flap. An operator removes the host when convenient; until
+    // then it answers UNAVAILABLE rather than refusing connections, which is
+    // easier to diagnose than a closed port.
     tokio::spawn({
         let retired = retired.clone();
-        let shutdown = shutdown.clone();
+        let shard_tasks = shard_tasks.clone();
+        let router = router.clone();
         async move {
             retired.cancelled().await;
-            shutdown.cancel();
-            // Neither server has a graceful-stop path wired, so the process
-            // ends by exiting. Every fjall write is already durable, and the
-            // sleep gives the RemoveNode response time to reach the caller
-            // before the listeners go with the process.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            tracing::info!("retired from the cluster; exiting");
-            std::process::exit(0);
+
+            // Stop serving a cluster this node is no longer part of. The gate
+            // already refuses the RPCs; this stops the work nobody asked for —
+            // TTL GC proposing deletes into a membership it left, the metrics
+            // tasks, and the Raft groups themselves. Dropping the shards from
+            // the router also stops `refresh_local` publishing `ShardEntry`
+            // for them: its version rises every tick and wins at peers on
+            // version alone, so a retired node left publishing would keep
+            // overwriting the live view of a shard it no longer hosts.
+            metrics::gauge!("ggap_node_retired").set(1.0);
+            shard_tasks.cancel();
+            for (shard_id, raft) in rafts {
+                router.remove_shard(shard_id).await;
+                if let Err(e) = raft.shutdown().await {
+                    tracing::warn!(shard_id, error = %e, "raft shutdown on retirement");
+                }
+            }
+
+            tracing::warn!(
+                "retired from the cluster; serving gossip only, so the tombstone \
+                 reaches peers that have not heard. This node will not rejoin: a \
+                 retired id is never reused."
+            );
         }
     });
 

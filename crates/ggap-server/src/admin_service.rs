@@ -25,9 +25,10 @@ pub struct AdminServiceImpl {
     /// Cluster-wide gossiped view, used to answer status for shards this node
     /// does not host locally.
     registry: Arc<ShardRegistry>,
-    /// Cancelled when this node has retired itself, so the binary can shut the
-    /// process down. `None` in harnesses that have no process to end — they
-    /// observe the tombstone in the registry instead.
+    /// Cancelled when this node has retired itself. The binary quiesces on it:
+    /// KV, Admin and Raft stop answering, the Raft groups and their background
+    /// tasks stop, and gossip keeps running. `None` where nothing is listening
+    /// for it — harnesses observe the tombstone in the registry instead.
     retired: Option<CancellationToken>,
 }
 
@@ -302,7 +303,7 @@ impl AdminServiceImpl {
 
     /// The authoritative half: this node names the shards it still belongs to
     /// from its own Raft membership, refuses while there are any, and otherwise
-    /// tombstones itself and pushes that out before it stops.
+    /// pushes the tombstone out, records it, and quiesces.
     async fn retire_self(&self) -> Result<Response<RemoveNodeResponse>, Status> {
         let self_id = self.registry.self_node_id();
 
@@ -333,17 +334,20 @@ impl AdminServiceImpl {
             }));
         }
 
-        // A tombstone nobody else has heard dies with this process, and this
-        // process is about to end — so hand it over before recording it. A
-        // removal cannot be taken back, so a node that reached nobody must not
-        // be left retired in its own directory and running.
+        // Hand the tombstone over before recording it. A removal cannot be
+        // taken back, and recording one locally is itself a commit: the
+        // directory is persisted and `snapshot_for_gossip` carries tombstones,
+        // so a local record spreads on its own. Refusing while nothing has
+        // heard is what makes "nobody received it" mean "it did not happen"
+        // (tk-1dfe revisits how strict that still needs to be now that a
+        // retired node stays up and keeps gossiping).
         //
         // Delivery is counted by the response, so a peer that merged the
         // tombstone and then failed to answer is counted as a miss: the node
-        // stays up and reports failure while the cluster has already retired it.
-        // Erring this way is deliberate — the operator retries and the node
-        // exits, where the opposite error leaves a node retired that nobody
-        // else believes is gone.
+        // keeps serving and reports failure while the cluster has already
+        // retired it. Erring this way is deliberate — the operator retries,
+        // where the opposite error leaves a node retired that nobody else
+        // believes is gone.
         let peers = self.registry.peers_excluding_self().await.len();
         let delivered =
             broadcast_removal(&self.registry, self_id, self_id, REMOVE_RPC_TIMEOUT).await;
@@ -351,32 +355,33 @@ impl AdminServiceImpl {
             return Ok(Response::new(RemoveNodeResponse {
                 ok: false,
                 error: format!(
-                    "node {self_id} reached none of its {peers} peer(s), so the removal \
-                     would be lost when it stops; it stays in the cluster"
+                    "node {self_id} reached none of its {peers} peer(s); a removal \
+                     nobody has heard is one that has not happened, and it cannot be \
+                     taken back once recorded. It stays in the cluster — retry when a \
+                     peer is reachable."
                 ),
                 confirmed_by_node: true,
             }));
         }
         // Past the point of no return: the peers above have already recorded
-        // the removal, and it cannot be taken back. So a failed write is
-        // reported and the shutdown proceeds — refusing here would leave a node
-        // running that the cluster has already forgotten, which is the state
-        // this whole path exists to avoid. The cost of the failure is that a
-        // restart of this host under this id will not be refused by its boot
-        // guard until a peer has gossiped the tombstone back.
+        // the removal, and it cannot be taken back. A failed write is therefore
+        // reported rather than refused — and recoverable, since this node stays
+        // up: its next gossip round persists the directory, exactly as the
+        // on-behalf path above relies on (tk-d08b folds the two together).
         if let Err(e) = self.registry.retire(self_id).await {
-            tracing::error!(
+            tracing::warn!(
                 node_id = self_id,
                 error = %e,
-                "retired from the cluster but could not persist the tombstone; do not \
-                 restart this node under this id"
+                "retired from the cluster but could not persist the tombstone; the next \
+                 gossip round will write it"
             );
         }
 
-        tracing::info!(
+        tracing::warn!(
             node_id = self_id,
             delivered,
-            "retired from the directory; shutting down"
+            "retired from the directory; quiescing — gossip only, no Raft, no KV, no \
+             admin. This node will not rejoin: a retired id is never reused."
         );
         if let Some(retired) = &self.retired {
             retired.cancel();

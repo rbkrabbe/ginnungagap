@@ -131,9 +131,9 @@ impl ShardRegistry {
         // caller's write: the later writer records its state and the earlier
         // one then overwrites the file with its stale snapshot, leaving the
         // memo agreeing with the file so nothing ever rewrites it. A `retire`
-        // that lost its tombstone that way would have reported durability and
-        // then exited the process, which is the failure this write-through
-        // exists to prevent.
+        // that lost its tombstone that way would have reported durability it
+        // does not have, which is the failure this write-through exists to
+        // prevent.
         let mut persisted = self.persisted.lock().await;
         let dir = self.directory_snapshot().await;
         if dir == *persisted {
@@ -276,12 +276,13 @@ impl ShardRegistry {
             .write()
             .await
             .insert(node_id, DirectoryEntry::Removed);
-        // Written through rather than left to the next gossip round. A node
-        // retiring itself cancels its own process moments later, and a
-        // tombstone only in memory dies with it — the node then restarts, its
-        // boot guard sees no removal, and it runs as a node the cluster has
-        // already forgotten. Nothing re-derives a removal, so this is the one
-        // directory write whose failure the caller has to know about.
+        // Written through rather than left to the next gossip round. Nothing
+        // re-derives a removal, and a node can lose its process without
+        // passing through the retirement path at all — a reschedule, a crash.
+        // A tombstone only in memory dies with it, and the node then comes
+        // back with its boot guard seeing no removal, serving as a node the
+        // cluster has already forgotten. So this is the one directory write
+        // whose failure the caller has to know about.
         self.try_persist_directory().await
     }
 

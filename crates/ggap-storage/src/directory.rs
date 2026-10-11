@@ -7,7 +7,8 @@
 //! a node that restarts and is elected before any peer has gossiped to it can
 //! resolve its peers straight away instead of failing sends until someone dials
 //! it. The exception is a tombstone, which is written through because nothing
-//! re-derives a removal and the node recording one is usually about to exit.
+//! re-derives a removal and a node can lose its process at any moment without
+//! passing through the retirement path at all.
 //!
 //! Tombstones ride along with the descriptors, which is what makes a removal
 //! outlive a restart of every node that heard it: a directory rebuilt from

@@ -35,12 +35,46 @@ configuration. They do not flow through `figment`.
    see "Changing a node's address".
 6. Create the shared state machine + Watch broadcast channel and the split-event
    channel, then build the `ShardRouter`.
+6b. Restore the persisted directory. **If it holds this node's own tombstone,
+   the node comes up quiesced** — see "A retired node" below.
 7. For every shard in the `ShardMap`, start an `OpenRaftNode` (`GgapRaft`) over
    the fjall log store and state machine. On first boot each shard initialises
    its membership from persisted `bootstrap_members` (split-created shards), as a
-   single-voter seed (`--seed`), or stays uninitialised to be joined later.
+   single-voter seed (`--seed`), or stays uninitialised to be joined later. A
+   quiesced node starts none.
 8. `tokio::try_join!` the gRPC servers (client + cluster). Either server failing
    causes the process to exit; `shutdown` is broadcast to background tasks.
+
+## A retired node
+
+A node retired through `AdminService.RemoveNode` **does not exit**. It quiesces:
+KV, Admin and Raft answer `UNAVAILABLE`, no Raft group runs, and gossip keeps
+serving so the tombstone reaches peers that were unreachable when it was
+written. The process stays up and idle until an operator removes the host.
+
+Exiting would accomplish nothing. Under a supervisor an exit is a restart —
+a StatefulSet pod may only have `restartPolicy: Always` — and the restart would
+find the tombstone in its persisted directory and quiesce anyway. Exiting only
+adds a pod flap, or a crash loop if the restart refuses instead. Scaling the
+StatefulSet down does not help either: it removes the *highest* ordinal, so a
+retired middle node cannot be dropped without taking healthy nodes with it.
+
+Both routes into the state are the same state: `RemoveNode` on a running node,
+and a restart that reads its own tombstone. That is deliberate — a pod
+rescheduled for any reason (drain, OOM, node failure) lands in the same place
+rather than looping.
+
+**A quiesced node looks healthy to a probe.** It holds its PVC and its
+ordinal, and it answers its metrics endpoint — that is on neither gRPC
+listener, so retirement does not affect it.
+
+Scrape `ggap_node_retired`: `1` on a quiesced node, `0` on a serving one. Do
+not read the `raft_*` gauges for this. Retirement stops the task that
+publishes them, so they freeze at their last values and a retired node looks
+exactly like an idle healthy one.
+
+To put the host back in service, start it under a fresh `--node-id`: a retired
+id is never reused.
 
 ## Changing a node's address
 

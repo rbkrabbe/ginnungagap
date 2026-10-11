@@ -77,10 +77,18 @@ All implemented and served on the cluster-facing port:
   `RemoveNode` retires a node from the directory. Any node accepts the call and
   forwards it to the target, which alone can name the shards it still belongs to
   and alone authors its own entry; it refuses while it belongs to any, and
-  otherwise hands the tombstone to a peer before recording it and shutting down.
+  otherwise hands the tombstone to a peer before recording it and quiescing.
   A target that does not answer is tombstoned on its behalf — the only way to
   retire hardware that is already gone. The tombstone is absolute and a retired
   id is never reused, so `AddLearner` refuses one. See `docs/ggap-consensus.md`
-  for the ordering rule. `ClusterServiceConfig::retired` is the token
-  `ggap-node` uses to stop the process afterwards.
+  for the ordering rule.
+
+  `ClusterServiceConfig::retired` and `KvServiceConfig::retired` carry the
+  token that marks a node retired, and `retired_gate` wraps `KvService`,
+  `AdminService` and `RaftService` with an interceptor that answers
+  `UNAVAILABLE` while it is cancelled. `GossipService` is deliberately
+  **ungated**: a retired node's one remaining job is to keep spreading its own
+  tombstone to peers that were unreachable when it was written. The gate is per
+  *service* rather than per method, so a method added later is covered without
+  anyone remembering.
 - **`GossipService`** — carries the shard-registry gossip between nodes.

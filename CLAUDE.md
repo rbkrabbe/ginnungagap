@@ -118,7 +118,16 @@ just `ShardId(0)`. What exists today:
   say which shards it still belongs to and the only author of its own entry; a
   target that does not answer is tombstoned on its behalf, which is the sole way
   to retire hardware that is already gone (tk-ad1d gates that on the node being
-  demonstrably dead).
+  demonstrably dead). The tombstone is **written through** before `RemoveNode`
+  answers, because nothing re-derives a removal.
+  A retired node **quiesces; it does not exit**. KV, Admin and Raft answer
+  `UNAVAILABLE` through one interceptor per service, no Raft group runs, and
+  gossip keeps serving so the tombstone reaches peers that missed it. A restart
+  that finds its own tombstone reaches the same state rather than refusing to
+  start: under a supervisor an exit is a restart, so exiting would only flap the
+  pod or loop it. New cluster-facing services must be gated too — the
+  interceptor is per service, so adding one opts into serving while retired
+  unless it is wrapped.
   `GgapNetwork` resolves its target through the directory on **every** RPC, so a
   node that moves is dialled on the next send with no new client; an id the
   directory cannot resolve fails the RPC, which openraft treats as an

@@ -91,9 +91,10 @@ impl GossipTask {
                 _ = self.cancel.cancelled() => {
                     tracing::info!(node_id = self.self_node_id, "gossip task shutting down");
                     // Whatever this node learned since the last round would
-                    // otherwise go with the process. Cheap, and unnecessary for
-                    // a tombstone, which `ShardRegistry::retire` has already
-                    // written through by the time anything cancels this task.
+                    // otherwise go with the process. Cheap, and usually
+                    // redundant for a tombstone — `ShardRegistry::retire`
+                    // writes one through — but not always: a `retire` whose
+                    // write failed leaves it to a later round, and this is one.
                     self.registry.persist_directory().await;
                     return;
                 }
@@ -264,8 +265,9 @@ async fn send_exchange(
 ///
 /// The gossip task's own rounds are round-robin over a fanout and happen on a
 /// timer; this is for the one caller that can neither wait for the next tick nor
-/// afford to miss it — a node retiring itself, which is about to stop. A
-/// tombstone that reaches no peer dies with the node that wrote it.
+/// afford to miss it — a node retiring itself, which must know before it
+/// answers whether anyone received the removal, because a removal nobody has
+/// heard is one it must refuse to make.
 ///
 /// The tombstone is added to the copy that goes out, not to the local
 /// directory: the caller decides what to do when nothing gets through, and a

@@ -166,22 +166,38 @@ The production `RaftNode` implementation. It:
   restart restores them, so a removal is not undone by the first peer to gossip
   afterwards — but they are **written through** rather than left to the next
   round. `ShardRegistry::retire` persists the directory before returning,
-  because a node retiring itself ends its own process moments later and the
-  gossip task is cancelled before its next tick: a tombstone only in memory
-  would die with the process, and the node would restart as one the cluster had
-  already forgotten. It is the one directory write whose failure the caller is
-  told about, since nothing re-derives a removal. A retired node
+  because nothing re-derives a removal and a node can lose its process without
+  passing through the retirement path at all — a reschedule, a crash. A
+  tombstone only in memory dies with it, and the node comes back with its boot
+  guard seeing no removal, serving as one the cluster has already forgotten.
+  It is the one directory write whose failure the caller is told about. A retired node
   resolves to nothing (`directory_addr`, `client_addr` and `node_id_at` all skip
   it) and is dropped from `peers_excluding_self` even when a bootstrap seed
   still names it.
+
+  A retired node **quiesces rather than exiting**: its KV, Admin and Raft
+  services answer `UNAVAILABLE` while gossip keeps serving, and no Raft group
+  runs. It reaches that state either from `RemoveNode`, which stops the groups
+  it had started along with their TTL GC and metrics tasks, or after a restart
+  from finding its own tombstone in the persisted directory, in which case it
+  starts none to begin with. The two end in the same place, which is what keeps
+  a reschedule from becoming a crash loop under a supervisor that always
+  restarts. Quiescing is safe because the
+  tombstone is absolute locally too: `refresh_local` publishes this node's own
+  descriptor every tick and loses to it, so the node gossips the removal rather
+  than its address and cannot re-announce itself.
 
   Who may write one is deliberately narrow. `RemoveNode` reaching any node is
   forwarded to the target, because only the target can say authoritatively which
   shards it still belongs to — it refuses while it belongs to any, naming them —
   and only the target authors its own entry. It hands the tombstone to a peer
-  *before* recording it locally, since a removal cannot be taken back and one
-  that reached nobody would vanish with the process; a node that reaches none of
-  its peers stays in the cluster instead. A target that does not answer is the
+  *before* recording it locally, since a removal cannot be taken back and
+  recording one is itself a commit — the directory is persisted and gossip
+  carries tombstones, so a local record spreads on its own. Refusing while
+  nothing has heard is what makes "nobody received it" mean "it did not
+  happen", and a node that reaches none of its peers stays in the cluster
+  instead (tk-1dfe revisits how strict that must remain now that a retired node
+  keeps gossiping). A target that does not answer is the
   one exception, and the only way to retire hardware that is already gone: the
   node serving the call tombstones it on its behalf.
 
