@@ -191,15 +191,19 @@ The production `RaftNode` implementation. It:
   forwarded to the target, because only the target can say authoritatively which
   shards it still belongs to — it refuses while it belongs to any, naming them —
   and only the target authors its own entry. It hands the tombstone to a peer
-  *before* recording it locally, since a removal cannot be taken back and
-  recording one is itself a commit — the directory is persisted and gossip
-  carries tombstones, so a local record spreads on its own. Refusing while
-  nothing has heard is what makes "nobody received it" mean "it did not
-  happen", and a node that reaches none of its peers stays in the cluster
-  instead (tk-1dfe revisits how strict that must remain now that a retired node
-  keeps gossiping). A target that does not answer is the
-  one exception, and the only way to retire hardware that is already gone: the
-  node serving the call tombstones it on its behalf.
+  *before* recording it locally, and refuses if nobody took it. Not because the
+  removal would otherwise be lost — recording one is itself a commit, since the
+  directory is persisted and gossip carries tombstones, so a local record
+  spreads on its own. It refuses for two other reasons. It keeps the removal
+  **attended**: recording regardless would answer `ok` while no other node
+  knows for minutes, handing the operator a success they cannot verify. And
+  reaching one peer **falsifies total partition** before an irreversible act —
+  the membership check above it reads this node's own Raft state, which a node
+  cut off from every peer cannot be trusted to hold accurately.
+
+  A target that does not answer is the one exception, and the only way to
+  retire hardware that is already gone: the node serving the call tombstones it
+  on its behalf.
 
   **Still open:** that fallback fires on a single failed dial, so a briefly
   partitioned node can be retired as though it were dead (tk-ad1d).

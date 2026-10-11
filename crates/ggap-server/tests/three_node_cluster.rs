@@ -261,12 +261,17 @@ async fn start_node_reusing(
         cluster_addr,
         client_addr,
         advertised_client_addr: self_client_addr,
+        // Given the retire token, as `ggap-node` gives it, so a retirement
+        // driven through this service reaches the gate on the gRPC servers —
+        // without it a test could assert "still serving" against a node
+        // nothing could have stopped.
         admin: AdminServiceForTesting::new(
             router.clone(),
             split_coordinator.clone(),
             shard_map.clone(),
             registry.clone(),
-        ),
+        )
+        .with_retire_token(retired.clone()),
         registry,
         raft_node,
         retired,
@@ -2041,12 +2046,18 @@ async fn an_unreachable_node_is_tombstoned_on_its_behalf() {
 }
 
 /// A node that reached none of its peers keeps serving rather than retiring
-/// into a tombstone only it holds. Recording one locally is itself a commit —
-/// it is persisted, and gossip carries tombstones — so refusing while nothing
-/// has heard is what makes "nobody received it" mean "it did not happen". That
-/// is deliberately conservative now that a retired node stays up and would
-/// deliver the tombstone eventually; tk-1dfe revisits how strict it needs to
-/// be.
+/// into a tombstone only it holds.
+///
+/// A quiesced node would deliver that tombstone eventually, so this is not
+/// about losing the removal. It is about keeping it **attended** — answering
+/// `ok` while no other node knows for minutes would hand the operator a
+/// success they cannot verify — and about **falsifying total partition**
+/// before an irreversible act, since the membership check that precedes it
+/// reads this node's own Raft state and a node cut off from every peer cannot
+/// be trusted to hold that accurately.
+///
+/// "It did not happen" is asserted at the strongest observable point: the node
+/// is still serving afterwards, not merely missing a tombstone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_that_cannot_hand_over_its_tombstone_stays_in_the_cluster() {
     let node = start_node(4, false).await;
@@ -2075,6 +2086,24 @@ async fn a_node_that_cannot_hand_over_its_tombstone_stays_in_the_cluster() {
         !node.registry.is_retired(4).await,
         "a node that stays in the cluster must not hold a tombstone for itself"
     );
+
+    // And it is still serving — the refusal means the retirement did not
+    // happen, not merely that a record is absent. Asserted over real gRPC,
+    // because the gate that would refuse is a layer the in-process service
+    // never sees. Admin rather than KV: this node is drained and in no
+    // membership, so a KV write fails as "not the leader" whether it is
+    // retired or not, and would prove nothing either way.
+    let mut admin = AdminServiceClient::connect(format!("http://{}", node.cluster_addr))
+        .await
+        .expect("cluster listener is up");
+    admin
+        .cluster_status(tonic::Request::new(ClusterStatusRequest { shard_id: None }))
+        .await
+        .expect("a node whose removal was refused must still serve admin");
+
+    for h in &node._handles {
+        h.abort();
+    }
 }
 
 /// An entry mapping a second id to a node's own address is corruption, not a

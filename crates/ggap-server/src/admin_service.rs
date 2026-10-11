@@ -253,17 +253,7 @@ impl AdminServiceImpl {
                     error = %e,
                     "removal target did not answer; tombstoning it on its behalf"
                 );
-                if let Err(e) = self.registry.retire(req.node_id).await {
-                    // Recoverable here, unlike on the self-retirement path:
-                    // this node keeps running, so its next gossip round
-                    // persists the tombstone anyway.
-                    tracing::warn!(
-                        node_id = req.node_id,
-                        error = %e,
-                        "tombstone recorded but not persisted; the next gossip round \
-                         will write it"
-                    );
-                }
+                self.retire_locally(req.node_id).await;
                 Ok(Response::new(RemoveNodeResponse {
                     ok: true,
                     error: String::new(),
@@ -301,6 +291,24 @@ impl AdminServiceImpl {
         Ok(resp)
     }
 
+    /// Tombstone `node_id` in this node's own directory.
+    ///
+    /// A failed write is reported and not fatal, on both paths that reach here
+    /// and for the same reason: the node doing the writing keeps running, so
+    /// its next gossip round persists the directory. `retire` writes through
+    /// precisely because nothing re-derives a removal — this covers only the
+    /// case where that write did not land.
+    async fn retire_locally(&self, node_id: u64) {
+        if let Err(e) = self.registry.retire(node_id).await {
+            tracing::warn!(
+                node_id,
+                error = %e,
+                "tombstone recorded but not persisted; the next gossip round will \
+                 write it"
+            );
+        }
+    }
+
     /// The authoritative half: this node names the shards it still belongs to
     /// from its own Raft membership, refuses while there are any, and otherwise
     /// pushes the tombstone out, records it, and quiesces.
@@ -334,13 +342,22 @@ impl AdminServiceImpl {
             }));
         }
 
-        // Hand the tombstone over before recording it. A removal cannot be
-        // taken back, and recording one locally is itself a commit: the
-        // directory is persisted and `snapshot_for_gossip` carries tombstones,
-        // so a local record spreads on its own. Refusing while nothing has
-        // heard is what makes "nobody received it" mean "it did not happen"
-        // (tk-1dfe revisits how strict that still needs to be now that a
-        // retired node stays up and keeps gossiping).
+        // Hand the tombstone over before recording it, and refuse if nobody
+        // took it. A quiesced node would deliver it eventually — it is durable
+        // and gossip carries tombstones — so this is no longer about losing
+        // the removal. Two things it does do:
+        //
+        // It keeps the removal **attended**. Recording regardless would answer
+        // `ok` while no other node knows for minutes; refusing makes the
+        // outcome what the operator sees, and a retry when connectivity
+        // returns is theirs to make.
+        //
+        // And it **falsifies total partition** before an irreversible act. The
+        // check above reads local Raft state, and a node cut off from every
+        // peer has by definition a possibly-stale view of whether it is still
+        // a voter. A peer accepting the tombstone does not verify that view —
+        // it merges blindly — but it does prove this node is not isolated,
+        // which is the condition under which the view is least trustworthy.
         //
         // Delivery is counted by the response, so a peer that merged the
         // tombstone and then failed to answer is counted as a miss: the node
@@ -364,18 +381,8 @@ impl AdminServiceImpl {
             }));
         }
         // Past the point of no return: the peers above have already recorded
-        // the removal, and it cannot be taken back. A failed write is therefore
-        // reported rather than refused — and recoverable, since this node stays
-        // up: its next gossip round persists the directory, exactly as the
-        // on-behalf path above relies on (tk-d08b folds the two together).
-        if let Err(e) = self.registry.retire(self_id).await {
-            tracing::warn!(
-                node_id = self_id,
-                error = %e,
-                "retired from the cluster but could not persist the tombstone; the next \
-                 gossip round will write it"
-            );
-        }
+        // the removal, and it cannot be taken back.
+        self.retire_locally(self_id).await;
 
         tracing::warn!(
             node_id = self_id,
