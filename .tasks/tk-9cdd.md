@@ -2,7 +2,7 @@
 id = "tk-9cdd"
 title = "A boot counter write that fails transiently now refuses the start with no retry"
 kind = "task"
-status = "open"
+status = "dropped"
 size = "s"
 priority = 2
 blocked_by = []
@@ -41,3 +41,24 @@ already the right one and this task closes as a no-op with that recorded.
       from a terminal one, in the version pinned here.
 - [ ] Either a bounded retry before the refusal, or this task closed with the
       finding that there is nothing to retry on.
+
+## Dropped (2026-10-11)
+
+Answered in one grep rather than researched, which is the sign it should never
+have been a task.
+
+`fjall::Error` (`fjall-3.0.3/src/error.rs:12`) has no retryable class.
+`Poisoned` carries fjall's own instruction — *"At this point, it's best to let
+the application crash and try to recover"* — and the rest are format, journal
+or decompression failures. The only candidate is `Io(std::io::Error)`, and a
+failed write of eight bytes onto the same disk as the Raft log is not a
+transient class worth looping on.
+
+And the argument that settles it without reference to fjall at all: **the
+supervisor is the retry.** tk-4822 established that an exit under a
+StatefulSet is a restart, so a refused boot is already retried automatically
+with backoff. An in-process retry adds nothing a restart does not, and a
+crash loop is the more honest signal for a disk that cannot take a `u64`.
+
+The lesson is about the filing, not the answer: a task whose deliverable is
+knowledge I can obtain in thirty seconds is a lookup I declined to do.
