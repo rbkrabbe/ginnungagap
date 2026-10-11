@@ -100,6 +100,7 @@ async fn start_watch_node(broadcast_capacity: usize) -> TestNode {
         max_value_bytes: 1_048_576,
         watch_tx: Some(watch_tx.clone()),
         watch_output_buffer: 128,
+        retired: None,
     };
 
     let mut handles = Vec::new();

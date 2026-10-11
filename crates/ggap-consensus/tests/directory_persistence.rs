@@ -252,9 +252,10 @@ async fn a_tombstone_survives_a_restart_and_the_gossip_that_follows_it() {
             ),
         )
         .await;
-        // No gossip round: `retire` writes the directory through, which is the
-        // only reason a tombstone outlives the process that recorded one — the
-        // node retiring itself exits before another round can happen.
+        // No gossip round: `retire` writes the directory through. Nothing
+        // re-derives a removal, and a node can lose its process without
+        // passing through `RemoveNode` at all — a reschedule, a crash — so the
+        // record cannot wait for a round that may not come.
         registry.retire(3).await.unwrap();
         assert!(
             DirectoryStore::new(store.clone())

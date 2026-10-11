@@ -155,9 +155,11 @@ impl BootCounter {
             tracing::warn!("no persisted directory either; treating this as a first boot");
             return Ok(0);
         };
-        // A tombstone for this node carries no rank to recover. It is a first
-        // boot as far as the counter is concerned; the node is refused a start
-        // for being retired long before the rank could matter.
+        // A tombstone for this node carries no rank to recover, so this is a
+        // first boot as far as the counter is concerned. The rank does not
+        // matter in that case: the node quiesces once `ggap-node` reads the
+        // same tombstone, and its own tombstone outranks any descriptor it
+        // would publish, so it gossips the removal rather than an address.
         let recovered = entries
             .iter()
             .find(|(node_id, _)| *node_id == self.self_node_id)
@@ -212,9 +214,11 @@ mod tests {
         ))
     }
 
-    /// A tombstone records no rank, so recovery treats it as a first boot. The
-    /// node never gets that far in practice: `ggap-node` refuses to start a node
-    /// its own persisted directory says was retired.
+    /// A tombstone records no rank, so recovery treats it as a first boot —
+    /// rank 1. That does happen: `advance` runs before `ggap-node` reads the
+    /// directory, so a retired node takes a rank and then quiesces. Harmless,
+    /// because the descriptor it would publish at that rank loses to its own
+    /// tombstone, and a quiesced node publishes the removal instead.
     #[test]
     fn a_tombstoned_self_entry_recovers_no_rank() {
         let (store, _tempdir) = store();

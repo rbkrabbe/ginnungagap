@@ -36,6 +36,12 @@ use ggap_types::{
     GgapError, KvCommand, KvResponse, NodeAddrs, NodeDescriptor, ReadMode, WriteMode,
 };
 
+use ggap_proto::v1::{
+    admin_service_client::AdminServiceClient, gossip_service_client::GossipServiceClient,
+    kv_service_client::KvServiceClient, raft_service_client::RaftServiceClient, GetRequest,
+    GossipState, PutRequest, RaftMessage,
+};
+
 use ggap_proto::v1::admin_service_server::AdminService;
 use ggap_proto::v1::{
     AddLearnerRequest, ClusterStatusRequest, ListShardsRequest, NodeInfo, RemoveNodeRequest,
@@ -59,6 +65,11 @@ struct TestNode {
     advertised_client_addr: String,
     registry: Arc<ShardRegistry>,
     raft_node: Arc<OpenRaftNode>,
+    /// Cancelled when this node is retired. Carried into both serve configs,
+    /// so cancelling it gates KV, Admin and Raft while leaving gossip up —
+    /// the same state `ggap-node` reaches at startup from a persisted
+    /// tombstone.
+    retired: CancellationToken,
     /// Handed to the node that replaces this one on a restart. See
     /// [`TestCluster::restart_at_new_address`] for why storage is passed over
     /// as a live handle rather than reopened.
@@ -164,6 +175,8 @@ async fn start_node_reusing(
     let router = Arc::new(ShardRouter::new(shard_map.clone()));
     router.add_shard(0, raft_node.clone(), cluster).await;
 
+    let retired = CancellationToken::new();
+
     let mut handles = Vec::new();
 
     // Spawn background split handler. Held rather than detached so a restart
@@ -209,6 +222,7 @@ async fn start_node_reusing(
     let sc = split_coordinator.clone();
     let sm2 = shard_map.clone();
     let reg = registry.clone();
+    let retired_cluster = retired.clone();
     handles.push(tokio::spawn(async move {
         if let Err(e) = serve_cluster_with_listener(
             cluster_listener,
@@ -216,7 +230,10 @@ async fn start_node_reusing(
             sc,
             sm2,
             reg,
-            ClusterServiceConfig::default(),
+            ClusterServiceConfig {
+                cors_origins: vec![],
+                retired: Some(retired_cluster),
+            },
         )
         .await
         {
@@ -225,10 +242,13 @@ async fn start_node_reusing(
     }));
 
     let r = router.clone();
+    let retired_kv = retired.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) =
-            serve_client_with_listener(client_listener, r, id, KvServiceConfig::default(), vec![])
-                .await
+        let kv_config = KvServiceConfig {
+            retired: Some(retired_kv),
+            ..KvServiceConfig::default()
+        };
+        if let Err(e) = serve_client_with_listener(client_listener, r, id, kv_config, vec![]).await
         {
             eprintln!("node {id} client server: {e}");
         }
@@ -249,6 +269,7 @@ async fn start_node_reusing(
         ),
         registry,
         raft_node,
+        retired,
         store,
         _handles: handles,
         tempdir,
@@ -1466,21 +1487,132 @@ async fn gossip_reports_remote_shard_status_from_non_hosting_node() {
     cluster.shutdown().await;
 }
 
+/// A retired node answers gossip and nothing else, over the wire.
+///
+/// It does not exit, because under a supervisor an exit is a restart: a
+/// StatefulSet pod may only have `restartPolicy: Always`, so exiting turns a
+/// retirement into a crash loop that scaling down cannot clear without taking
+/// healthy nodes with it. So the process stays up with every service refusing
+/// except the one that still has work — gossip, which carries the tombstone to
+/// peers that were unreachable when it was written.
+///
+/// Asserted through real gRPC rather than in-process, because the gate is a
+/// layer on the service and an in-process call would skip it entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retired_node_serves_gossip_and_refuses_everything_else() {
+    let cluster = TestCluster::start(3).await;
+    cluster.wait_for_leader().await;
+    let node = &cluster.nodes[0];
+
+    let client_endpoint = format!("http://{}", node.client_addr);
+    let cluster_endpoint = format!("http://{}", node.cluster_addr);
+
+    // Before: KV answers.
+    let mut kv = KvServiceClient::connect(client_endpoint.clone())
+        .await
+        .expect("client listener is up");
+    kv.put(tonic::Request::new(PutRequest {
+        key: "before-retire".into(),
+        value: b"v".to_vec(),
+        expect_version: 0,
+        ttl_secs: 0,
+        quorum: 0,
+    }))
+    .await
+    .expect("a live node serves KV");
+
+    node.retired.cancel();
+
+    // After: KV is refused, with a reason rather than a dropped connection.
+    let err = kv
+        .get(tonic::Request::new(GetRequest {
+            key: "before-retire".into(),
+            at_version: 0,
+            consistency: 0,
+        }))
+        .await
+        .expect_err("a retired node must not serve KV");
+    assert_eq!(err.code(), tonic::Code::Unavailable, "got {err:?}");
+    assert!(
+        err.message().contains("retired"),
+        "the refusal should say why: {}",
+        err.message()
+    );
+
+    // A fresh connection is refused the same way: the listener is still up, so
+    // this is a gRPC status and not a connection error.
+    let mut kv2 = KvServiceClient::connect(client_endpoint)
+        .await
+        .expect("the client listener stays bound; only the service refuses");
+    let err = kv2
+        .get(tonic::Request::new(GetRequest {
+            key: "before-retire".into(),
+            at_version: 0,
+            consistency: 0,
+        }))
+        .await
+        .expect_err("a retired node must not serve KV");
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+
+    // Admin is refused too — including the RPC that retires a node, which must
+    // not be reachable on one that already is.
+    let mut admin = AdminServiceClient::connect(cluster_endpoint.clone())
+        .await
+        .expect("cluster listener is up");
+    let err = admin
+        .cluster_status(tonic::Request::new(ClusterStatusRequest { shard_id: None }))
+        .await
+        .expect_err("a retired node must not serve admin");
+    assert_eq!(err.code(), tonic::Code::Unavailable, "got {err:?}");
+
+    // Raft too — the third gated service, and the one a peer that has not yet
+    // heard of the removal will keep dialling.
+    let mut raft = RaftServiceClient::connect(cluster_endpoint.clone())
+        .await
+        .expect("cluster listener is up");
+    let err = raft
+        .vote(tonic::Request::new(RaftMessage {
+            shard_id: 0,
+            data: vec![],
+        }))
+        .await
+        .expect_err("a retired node must not serve Raft");
+    assert_eq!(err.code(), tonic::Code::Unavailable, "got {err:?}");
+
+    // And gossip still works, which is the whole point of staying up.
+    let mut gossip = GossipServiceClient::connect(cluster_endpoint)
+        .await
+        .expect("cluster listener is up");
+    let resp = gossip
+        .exchange(tonic::Request::new(GossipState {
+            sender_node_id: 99,
+            directory: vec![],
+            shards: vec![],
+        }))
+        .await
+        .expect("a retired node must keep serving gossip");
+    assert_eq!(
+        resp.into_inner().sender_node_id,
+        node.id,
+        "the responder identifies itself"
+    );
+
+    cluster.shutdown().await;
+}
+
 /// The tombstone a node writes for itself is on disk before `RemoveNode`
-/// answers — not left for a gossip round that will never come.
+/// answers, rather than left to the next gossip round.
 ///
-/// A node that retires itself cancels its own process moments later
-/// (`ggap-node/src/main.rs` reacts to the retire token by exiting), and the
-/// gossip task selects on that cancellation before its next tick. So a
-/// tombstone recorded only in memory dies with the process: the node restarts,
-/// the boot guard at `main.rs:280` reads a persisted directory with no
-/// removal in it, and the node comes up as one the cluster has already
-/// forgotten — in no membership, resolvable by nobody, still serving its
-/// client port.
+/// The record is what a restart reads: `ggap-node` quiesces a node whose
+/// persisted directory holds its own tombstone, so without the durable write
+/// a rescheduled pod would come back serving, as a node the cluster has
+/// already forgotten. Writing it through also means it does not depend on the
+/// node living long enough for another round — it is retired, and nothing it
+/// does after this matters to the cluster.
 ///
-/// This asserts the durable half, which is what that guard has to read. The
-/// guard itself lives in `main`'s startup path and has no test; what is
-/// checkable here is that the record it depends on exists.
+/// This asserts the durable half. The guard that reads it is in `main`'s
+/// startup path and is reachable only by running the binary (tk-d2bb); what
+/// is checkable from here is that the record exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_self_retiring_node_persists_its_own_tombstone_before_answering() {
     let cluster = TestCluster::start(3).await;
@@ -1777,8 +1909,9 @@ async fn remove_node_is_refused_while_the_target_is_still_a_member() {
 }
 
 /// The acceptance case. A node in no membership retires itself, hands the
-/// tombstone to a peer before it stops, and the cluster forgets it: nothing
-/// resolves it, nothing gossips with it, and its address is free for another id.
+/// tombstone to a peer before recording it, and the cluster forgets it:
+/// nothing resolves it, nothing gossips with it, and its address is free for
+/// another id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_drained_node_retires_itself_and_the_cluster_forgets_it() {
     let cluster = TestCluster::start(3).await;
@@ -1907,9 +2040,13 @@ async fn an_unreachable_node_is_tombstoned_on_its_behalf() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// A node that reached none of its peers keeps running rather than retiring
-/// into a tombstone only it holds: the removal would vanish with the process,
-/// and nothing can take a removal back.
+/// A node that reached none of its peers keeps serving rather than retiring
+/// into a tombstone only it holds. Recording one locally is itself a commit —
+/// it is persisted, and gossip carries tombstones — so refusing while nothing
+/// has heard is what makes "nobody received it" mean "it did not happen". That
+/// is deliberately conservative now that a retired node stays up and would
+/// deliver the tombstone eventually; tk-1dfe revisits how strict it needs to
+/// be.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_that_cannot_hand_over_its_tombstone_stays_in_the_cluster() {
     let node = start_node(4, false).await;
