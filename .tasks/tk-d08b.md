@@ -2,7 +2,7 @@
 id = "tk-d08b"
 title = "do_remove_node's two retire failure paths can now be one"
 kind = "task"
-status = "open"
+status = "done"
 size = "s"
 priority = 2
 blocked_by = []
@@ -14,6 +14,8 @@ touched = []
 discovered_from = "tk-4822"
 resized_from = "m"
 reviewed_at = "2026-10-11T19:31:44+00:00"
+base = "d83b5fa0d36ced3b2877e606d9a03f58686c8ded"
+closed = "2026-10-11T19:44:07+00:00"
 +++
 ## Context
 

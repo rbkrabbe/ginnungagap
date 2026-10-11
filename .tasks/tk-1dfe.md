@@ -2,7 +2,7 @@
 id = "tk-1dfe"
 title = "RemoveNode still refuses when no peer heard, but a quiesced node would deliver it anyway"
 kind = "task"
-status = "in_progress"
+status = "done"
 size = "s"
 priority = 2
 blocked_by = []
@@ -15,6 +15,7 @@ discovered_from = "tk-4822"
 resized_from = "m"
 base = "5e81ffbc3c06c9eeace727279a9538c8b9fb10d9"
 reviewed_at = "2026-10-11T19:41:13+00:00"
+closed = "2026-10-11T19:44:07+00:00"
 +++
 ## Context
 
