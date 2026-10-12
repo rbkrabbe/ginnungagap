@@ -59,12 +59,14 @@ impl DirectoryStore {
     /// `Ok(None)` is a record that was never written, `Err` one that is there
     /// and cannot be read.
     ///
-    /// [`Self::load`] collapses both into an empty directory, which is right
-    /// for a cache. [`crate::BootCounter`] cannot: it recovers this node's rank
-    /// from the self-entry here when its own record is corrupt, and a directory
-    /// that exists but cannot be decoded means the rank is unknown rather than
-    /// unset — a difference between a first boot and an unrankable one.
-    pub fn try_load(&self) -> Result<Option<Vec<(u64, DirectoryEntry)>>, GgapError> {
+    /// Private, and only [`Self::load`] calls it. It was public for
+    /// [`crate::BootCounter`], which recovered this node's rank from the
+    /// self-entry here when its own record was corrupt and so needed to tell a
+    /// first boot from an unrankable one. That fallback is gone — the record
+    /// lags, so a recovered rank could be one this node had already published
+    /// at — and nothing outside this module needs the distinction now. Kept
+    /// because `load`'s collapse is built on it.
+    fn try_load(&self) -> Result<Option<Vec<(u64, DirectoryEntry)>>, GgapError> {
         let bytes = match self.store.node.get(directory_key()) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(None),
@@ -163,7 +165,9 @@ mod tests {
         assert_eq!(dir.load(), entries);
     }
 
-    /// `try_load` exists to tell these two apart, which `load` cannot.
+    /// `try_load` tells these two apart, which `load` deliberately does not.
+    /// Nothing outside this module needs that any more, but `load` is built on
+    /// it, so the distinction is still worth pinning.
     #[test]
     fn try_load_separates_an_absent_record_from_an_unreadable_one() {
         let (store, _tempdir) = store();

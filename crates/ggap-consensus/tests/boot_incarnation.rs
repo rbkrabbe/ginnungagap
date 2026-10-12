@@ -114,62 +114,55 @@ async fn a_restarted_node_at_a_new_address_outranks_its_own_stale_copy() {
     );
 }
 
-/// A corrupt counter must not cost the node its rank while the directory still
-/// records it. The node restarts at a new address with an unreadable counter,
-/// recovers what it last published from the persisted directory, and still
-/// outranks the copy its peer holds.
+/// A corrupt counter fails the boot; it is not recovered from the directory.
 ///
-/// The directory here is written by the node itself across the earlier boots,
-/// not planted by the test: recovery reads back what the running system left.
+/// That fallback existed and was removed: the directory is written by the
+/// gossip task, so it lags, and a node whose counter rotted before that task
+/// had persisted this boot's entry would recover a rank it had already
+/// published at and reissue it. Since an equal rank keeps the entry already
+/// held, the move would never install and the node would lose authorship of
+/// its own address permanently — so a fallback that is usually right and
+/// occasionally wrong forever is worse than none.
+///
+/// The unit test in `boot_counter.rs` pins the refusal and its message. What
+/// this adds is that it holds where a real store and a real `BootCounter`
+/// meet, across reopens, with a directory that *would* have served a fallback.
 #[tokio::test]
-async fn a_corrupt_counter_recovers_its_rank_and_still_outranks_a_peer() {
+async fn a_corrupt_counter_fails_the_boot_rather_than_recovering_a_rank() {
     let dir = TempDir::new().unwrap();
 
-    // Two boots at the old address, each persisting a directory containing this
-    // node's own entry at the rank it published.
-    let mut last = 0;
-    for _ in 0..2 {
-        let (incarnation, registry) = boot(&dir, "old:17001", "old:17000").await;
-        let store = FjallStore::open(dir.path()).unwrap();
-        DirectoryStore::new(store)
-            .save(&registry.directory_snapshot().await)
-            .unwrap();
-        last = incarnation;
-    }
-    assert_eq!(last, 2, "two boots must reach rank 2");
-
-    // A peer holding what that second boot published.
-    let peer = ShardRegistry::new(2, []);
-    merge_gossip_state(
-        &peer,
-        gossip_from(1, &[(1, desc("old:17001", "old:17000", last))]),
-    )
-    .await;
-
-    // The counter rots; the directory does not.
+    // One real boot, so a counter and a directory both exist on disk.
+    let (first, registry) = boot(&dir, "old:17001", "old:17000").await;
+    assert_eq!(first, 1);
     let store = FjallStore::open(dir.path()).unwrap();
+    DirectoryStore::new(store.clone())
+        .save(&registry.directory_snapshot().await)
+        .unwrap();
+
+    // The counter rots; the directory still records rank 1 for this node, so a
+    // fallback would have had something to read.
     store
         .node
         .insert(ggap_storage::keys::node_key("boot_counter"), b"xx".to_vec())
         .unwrap();
-    drop(store);
-
-    let (recovered, _) = boot(&dir, "new:17001", "new:17000").await;
+    let recorded = DirectoryStore::new(store.clone())
+        .load()
+        .iter()
+        .find(|(id, _)| *id == 1)
+        .and_then(|(_, e)| e.descriptor())
+        .map(|d| d.incarnation);
     assert_eq!(
-        recovered,
-        last + 1,
-        "the rank must be recovered from the directory, not restarted at 1"
+        recorded,
+        Some(first),
+        "the directory must still hold this node's rank, or this proves nothing"
     );
 
-    merge_gossip_state(
-        &peer,
-        gossip_from(1, &[(1, desc("new:17001", "new:17000", recovered))]),
-    )
-    .await;
-    assert_eq!(
-        peer.directory_addr(1).await,
-        Some("new:17001".into()),
-        "a recovered rank must still outrank the copy the peer holds"
+    let err = BootCounter::new(store, 1)
+        .advance()
+        .expect_err("a corrupt counter must fail the boot, not fall back");
+    assert!(
+        err.to_string().contains("unreadable"),
+        "unexpected error: {err}"
     );
 }
 

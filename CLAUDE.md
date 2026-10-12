@@ -106,10 +106,15 @@ just `ShardId(0)`. What exists today:
   a mistyped hint cannot be dialled and so never publishes a rank of its own —
   re-issuing the call is the only way to correct it. A node that starts
   *below* the rank its peers hold can never win back authorship of its own
-  address either, so an unusable counter recovers its rank from the persisted
-  directory's self-entry and fails the boot if that is unreadable too. Wiping
-  the data dir loses both records: an address change made across a wipe needs a
-  fresh node id.
+  address either, so the counter has exactly three outcomes: absent is a first
+  boot at 1, readable is one above it, and **unreadable fails the boot**. There
+  is no recovery from the persisted directory — that record is written by the
+  gossip task and lags, so a recovered rank could be one this node had already
+  published at. The write is flushed to disk, not just to the OS, for the same
+  reason by another route. Those make a rank unique to its boot with no
+  residual window, which is what the tie rule above rests on. Wiping the data
+  dir loses the count: an address change made across a wipe needs a fresh node
+  id, and so does a corrupt counter, since wiping is the only way to clear one.
   A node leaves the directory only through a tombstone written by
   `AdminService.RemoveNode`, which outranks every descriptor for that id at any
   incarnation — a removal ordered by rank is one a stray copy undoes. It
