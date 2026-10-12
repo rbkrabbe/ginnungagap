@@ -97,15 +97,17 @@ Two causes reach this message, and they are recovered differently. Both are
 deliberately an outage rather than a silent failure, because a node that starts
 anyway looks healthy while being unable to correct its own address.
 
-**1. Neither the boot counter nor the persisted directory could be read.** The
-node cannot tell what rank it last published; starting would publish at 1,
-below whatever its peers hold.
+**1. The boot counter is present and cannot be read.** The node cannot tell
+what rank it last published; starting at 1 would publish below whatever its
+peers hold, and it would never win authorship of its own address back.
 
-Both records live in the `node` keyspace, so losing both points at the data dir
-rather than at one key. Recover by treating it as a wipe: clear the data dir and
-start the node under a fresh `--node-id`, removing the old id from each shard's
-membership. The id is burned because the node cannot prove what it published
-before.
+Nothing recovers this. The rank is not read back from the persisted directory —
+that record lags, so it could name a rank this node has already published at.
+Recover by treating it as a wipe: clear the data dir and start the host under a
+fresh `--node-id`, removing the old id from each shard's membership. **Wiping
+alone is not enough**: the count restarts at 1, which loses to the ranks the
+peers hold, so the id has to change with it. The id is burned because the node
+cannot prove what it published before.
 
 **2. The rank could not be written back.** This boot would be ranked correctly;
 the next one is the problem, because it would read the stale counter and
@@ -113,11 +115,17 @@ reissue the same number, and an equal rank keeps the entry already held — so a
 address changed between those two boots would never install, with no symptom
 but a move that did not happen.
 
-*Do not wipe anything.* Both records are intact and nothing was published at
-the refused rank — the counter still holds the previous value, and the next
-start takes the rank normally. The data directory is almost certainly full or
-read-only, which the Raft log will not survive either. Restore write access and
-restart; the node keeps its id, its data and its place in every membership.
+*Do not wipe anything.* Nothing was published at the refused rank, and the
+next start establishes one normally. Which rank it takes depends on how far the
+write got, and neither case needs your attention: if it failed before
+recording, the counter still holds the previous value and the next boot takes
+the rank that was refused; if it recorded and then failed to flush, the counter
+holds the new value and the next boot takes one *above* it, skipping a rank.
+Skipping is harmless — ranks only have to increase.
+
+The data directory is almost certainly full or read-only, which the Raft log
+will not survive either. Restore write access and restart; the node keeps its
+id, its data and its place in every membership.
 
 ## Known limitations
 

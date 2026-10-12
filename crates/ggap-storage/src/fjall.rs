@@ -92,6 +92,22 @@ impl FjallStore {
             node,
         }))
     }
+
+    /// Flush writes made so far to the disk, not merely to the OS.
+    ///
+    /// An ordinary insert is durable against this process dying and no more:
+    /// it can be acknowledged and then lost to power loss or an OS crash.
+    /// Call this where a record must survive that too — see
+    /// [`crate::BootCounter`], whose rank is worthless if the next boot can
+    /// read a stale one.
+    ///
+    /// `fdatasync` rather than `fsync`: the data has to reach the disk, and
+    /// the file metadata is not what the next boot reads.
+    pub fn sync_to_disk(&self) -> Result<(), GgapError> {
+        self.db
+            .persist(fjall::PersistMode::SyncData)
+            .map_err(fjall_err)
+    }
 }
 
 // ---------------------------------------------------------------------------

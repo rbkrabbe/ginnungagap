@@ -60,10 +60,10 @@ that restarts and is elected before any peer has gossiped to it resolves its
 peers straight away instead of failing sends until it is dialled. `load`
 therefore never fails — a missing, unreadable or corrupt record warns and
 yields an empty directory, and
-the node re-learns it from the first peer that dials it. `try_load` is the same
-read without that collapse — `Ok(None)` for absent, `Err` for present-and-
-unreadable — because the boot counter's recovery needs to tell a first boot from
-an unrankable one.
+the node re-learns it from the first peer that dials it. The uncollapsed read
+that `load` is built on — `Ok(None)` for absent, `Err` for present-and-
+unreadable — is private: it was public for the boot counter's recovery, which
+no longer exists.
 
 **The boot counter (`boot_counter.rs`).** `BootCounter::advance` reads the
 `u64` at `"boot_counter"`, writes back one more, and returns it: the incarnation
@@ -87,24 +87,32 @@ self-publication loses the same comparison every gossip tick, and since the
 gossip round re-snapshots the directory per peer, the node forwards the stale
 address about itself. It cannot recover, and it looks healthy while doing it.
 
-So `advance` reads in this order, and fails the boot rather than return a rank
-it knows to be unfounded:
+So `advance` has three outcomes, and fails the boot rather than return a rank
+it cannot stand behind:
 
-| Counter | Directory | Result |
-|---|---|---|
-| absent | *not consulted* | 1 — a first boot |
-| readable | *not consulted* | one above it |
-| unusable | absent, or no entry for this node | 1 — a first boot |
-| unusable | holds this node's entry | one above the rank it records |
-| unusable | present and unreadable | **the boot fails** |
-| *any of the above* | — | **the boot fails** if the rank cannot be written |
+| Counter | Result |
+|---|---|
+| absent | 1 — a first boot |
+| readable | one above it, written back durably |
+| present and unreadable | **the boot fails** |
+| *either of the first two* | **the boot fails** if the rank cannot be written |
 
-An *absent* counter deliberately does not consult the directory. A node
-re-seeded by its peers before it ever published has a directory entry it did not
-write, and adopting that as its own rank would invent a history.
+An unreadable counter is **not** recovered from the persisted directory. It
+could be — the directory holds this node's own last-published descriptor — and
+it was, until the lag in that record made it unsafe: the directory is written
+by the gossip task, so a node whose counter rotted before that task had
+persisted this boot's entry would recover a rank it had already published at
+and reissue it. Since `merge_directory` keeps the entry it already holds at an
+equal rank, the move would never install. A fallback that is usually right and
+occasionally wrong forever is worse than none, and a corrupt key is not a
+condition to recover from: it means something is wrong that recovering would
+hide.
 
 A counter that cannot be *written* fails the boot too, which is the last row
-above. This boot would still be correctly ranked; the next one is the problem,
+above, and the write is flushed to the disk rather than only to the OS
+(`FjallStore::sync_to_disk`) — an acknowledged write lost to power loss would
+leave the next boot reading a stale counter, which is the same defect by
+another route. This boot would still be correctly ranked; the next one is the problem,
 because it reads the stale value and issues this incarnation again. Two boots at
 one rank is a state the ordering rule has no answer for: `merge_directory` keeps
 the entry it already holds at an equal rank, so an address changed between those
@@ -112,10 +120,16 @@ two boots never installs, and the node loses authorship of its own entry without
 any symptom but a move that did not happen. Refusing here puts the failure where
 its cause is.
 
-*Wiping the data dir loses the count*, and no recovery covers it: both records go
-together, so the node restarts at 1 and cannot outbid peers still holding a
-higher incarnation for its id. **An address change made across a wipe needs a
-fresh node id.**
+*Wiping the data dir loses the count*, and nothing recovers it: the node
+restarts at 1 and cannot outbid peers still holding a higher incarnation for
+its id. **An address change made across a wipe needs a fresh node id** — and so
+does a corrupt counter, since wiping is the only way to clear one and that puts
+the node back at 1.
+
+Together, the refusals and the flush make a rank **unique to the boot that
+issued it, with no residual window**. That is what lets `merge_directory` treat
+two ranked copies at one incarnation as interchangeable, which is the premise
+its tie rule rests on.
 
 **TTL index sort order.** Sorting by `expires_at_ns` first means the GC task can
 find the next-to-expire key with a single prefix scan, taking only the first
